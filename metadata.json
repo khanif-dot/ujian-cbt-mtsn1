@@ -1,0 +1,6 @@
+{
+  "name": "Nusantara CBT",
+  "description": "Aplikasi Computer-Based Test (CBT) berbasis web dengan arsitektur Local-First dan integrasi database cloud Supabase untuk hingga 1.000 peserta serentak.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

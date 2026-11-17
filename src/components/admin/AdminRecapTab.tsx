@@ -1,0 +1,606 @@
+import React, { useMemo, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  FileDown,
+  FileSpreadsheet,
+  Search,
+  ShieldAlert,
+  Trash2,
+  X,
+} from 'lucide-react';
+import {
+  ALL_CLASSES,
+  type ExamResult,
+  type ExamSchedule,
+  type SchoolProfile,
+} from '@/src/types/cbt';
+import { exportExamResultsExcel, exportExamResultsPdf } from '@/src/lib/importers';
+
+interface AdminRecapTabProps {
+  profile: SchoolProfile;
+  schedules: ExamSchedule[];
+  results: ExamResult[];
+  allowedSubjects?: string[];
+  onDeleteResults: (resultIds: string[]) => Promise<void>;
+}
+
+type RecapDeleteScope =
+  | { kind: 'single'; target: ExamResult }
+  | { kind: 'selected'; targets: ExamResult[] }
+  | { kind: 'filtered'; targets: ExamResult[] }
+  | { kind: 'all'; targets: ExamResult[] };
+
+export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
+  profile,
+  schedules,
+  results,
+  allowedSubjects,
+  onDeleteResults,
+}) => {
+  const isRestrictedBySubject = Boolean(allowedSubjects && allowedSubjects.length > 0);
+  const normalizedAllowed = useMemo(
+    () => (allowedSubjects || []).map((s) => s.trim().toLowerCase()),
+    [allowedSubjects]
+  );
+
+  const [subjectFilter, setSubjectFilter] = useState<string>('ALL');
+  const [classFilter, setClassFilter] = useState<string>('ALL');
+  const [searchQuery, setSearchQuery] = useState('');
+
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [showDeleteMenu, setShowDeleteMenu] = useState(false);
+  const [deleteScope, setDeleteScope] = useState<RecapDeleteScope | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [feedback, setFeedback] = useState('');
+
+  const subjects = useMemo(() => {
+    if (isRestrictedBySubject && allowedSubjects) {
+      return [...allowedSubjects].sort();
+    }
+    const set = new Set<string>(schedules.map((s) => s.subject));
+    results.forEach((r) => {
+      if (r.subject) set.add(r.subject);
+    });
+    return Array.from(set).sort();
+  }, [schedules, results, isRestrictedBySubject, allowedSubjects]);
+
+  const effectiveSubjectFilter = useMemo(() => {
+    if (isRestrictedBySubject && subjects.length === 1) {
+      return subjects[0];
+    }
+    if (subjectFilter !== 'ALL' && !subjects.includes(subjectFilter)) {
+      return 'ALL';
+    }
+    return subjectFilter;
+  }, [isRestrictedBySubject, subjects, subjectFilter]);
+
+  const allAllowedCompletedResults = useMemo(() => {
+    return results.filter((r) => {
+      if (r.status === 'in_progress') return false;
+      if (
+        isRestrictedBySubject &&
+        !normalizedAllowed.includes((r.subject || '').trim().toLowerCase())
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [results, isRestrictedBySubject, normalizedAllowed]);
+
+  const completedResults = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return allAllowedCompletedResults.filter((r) => {
+      if (effectiveSubjectFilter !== 'ALL' && r.subject !== effectiveSubjectFilter) return false;
+      if (classFilter !== 'ALL' && r.className !== classFilter) return false;
+      if (
+        q &&
+        !r.studentName.toLowerCase().includes(q) &&
+        !r.participantNumber.toLowerCase().includes(q)
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [
+    allAllowedCompletedResults,
+    effectiveSubjectFilter,
+    classFilter,
+    searchQuery,
+  ]);
+
+  const getKkm = (subject: string): number => {
+    const match = schedules.find(
+      (s) => s.subject.toLowerCase() === (subject || '').toLowerCase()
+    );
+    return match ? match.kkm : 75;
+  };
+
+  const summary = useMemo(() => {
+    const total = completedResults.length;
+    const passed = completedResults.filter((r) => r.score >= getKkm(r.subject)).length;
+    const avg =
+      total > 0 ? completedResults.reduce((acc, r) => acc + r.score, 0) / total : 0;
+    const highest =
+      total > 0 ? Math.max(...completedResults.map((r) => r.score)) : 0;
+    return { total, passed, avg, highest };
+  }, [completedResults, schedules]);
+
+  const activeSelectedIds = useMemo(() => {
+    const allowedSet = new Set(allAllowedCompletedResults.map((r) => r.id));
+    return selectedIds.filter((id) => allowedSet.has(id));
+  }, [allAllowedCompletedResults, selectedIds]);
+
+  const selectedRecords = useMemo(() => {
+    const selectedSet = new Set(activeSelectedIds);
+    return allAllowedCompletedResults.filter((r) => selectedSet.has(r.id));
+  }, [allAllowedCompletedResults, activeSelectedIds]);
+
+  const allVisibleSelected =
+    completedResults.length > 0 &&
+    completedResults.every((r) => activeSelectedIds.includes(r.id));
+
+  const toggleSelectAllVisible = () => {
+    if (allVisibleSelected) {
+      const visibleSet = new Set(completedResults.map((r) => r.id));
+      setSelectedIds((prev) => prev.filter((id) => !visibleSet.has(id)));
+    } else {
+      const merged = new Set([...activeSelectedIds, ...completedResults.map((r) => r.id)]);
+      setSelectedIds(Array.from(merged));
+    }
+  };
+
+  const toggleSelectOne = (id: string) => {
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteScope) return;
+    setIsDeleting(true);
+    setFeedback('');
+    try {
+      const targets =
+        deleteScope.kind === 'single' ? [deleteScope.target] : deleteScope.targets;
+      const ids = targets.map((r) => r.id);
+      await onDeleteResults(ids);
+      const removedSet = new Set(ids);
+      setSelectedIds((prev) => prev.filter((id) => !removedSet.has(id)));
+
+      if (deleteScope.kind === 'single') {
+        const t = deleteScope.target;
+        setFeedback(
+          `Rekap nilai ${t.subject || '-'} untuk ${t.studentName} (${t.participantNumber}) berhasil dihapus.`
+        );
+      } else if (deleteScope.kind === 'all') {
+        setFeedback(
+          `Keseluruhan rekap nilai (${ids.length} data) berhasil dihapus dari penyimpanan lokal dan cloud.`
+        );
+      } else {
+        setFeedback(
+          `${ids.length} data rekap nilai berhasil dihapus dari penyimpanan lokal dan cloud.`
+        );
+      }
+      setDeleteScope(null);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="font-display text-2xl font-bold text-slate-900 tracking-tight">
+            Rekap Nilai Hasil Ujian
+          </h1>
+          <p className="text-sm text-slate-600 mt-0.5">
+            Rekapitulasi nilai akhir beserta perbandingan KKM per mata pelajaran. Filter, unduh laporan (.xlsx / PDF), atau bersihkan riwayat rekap nilai.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2.5">
+          {selectedRecords.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setDeleteScope({ kind: 'selected', targets: selectedRecords })}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-900 text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>Hapus Terpilih ({selectedRecords.length})</span>
+            </button>
+          )}
+
+          {allAllowedCompletedResults.length > 0 && (
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowDeleteMenu((prev) => !prev)}
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-rose-300 bg-white hover:bg-rose-50 text-rose-800 text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>Hapus Rekap Nilai</span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+
+              {showDeleteMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-20"
+                    onClick={() => setShowDeleteMenu(false)}
+                  />
+                  <div className="absolute right-0 mt-2 w-72 bg-white rounded-xl border border-slate-200 shadow-xl z-30 p-1.5 space-y-1">
+                    <button
+                      type="button"
+                      disabled={completedResults.length === 0}
+                      onClick={() => {
+                        setShowDeleteMenu(false);
+                        setDeleteScope({ kind: 'filtered', targets: completedResults });
+                      }}
+                      className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      <div className="text-xs font-bold text-slate-900">
+                        Hapus Rekap Sesuai Filter ({completedResults.length})
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        Hanya data yang tampil pada filter mapel &amp; kelas saat ini
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowDeleteMenu(false);
+                        setDeleteScope({ kind: 'all', targets: allAllowedCompletedResults });
+                      }}
+                      className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-rose-50 cursor-pointer border-t border-slate-100"
+                    >
+                      <div className="text-xs font-bold text-rose-800">
+                        Hapus Semua Data Rekap Nilai ({allAllowedCompletedResults.length})
+                      </div>
+                      <div className="text-[11px] text-rose-700/80 mt-0.5">
+                        {isRestrictedBySubject
+                          ? 'Bersihkan semua rekap nilai pada mata pelajaran Anda'
+                          : 'Bersihkan seluruh rekap nilai semua mapel & semua kelas'}
+                      </div>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          <button
+            type="button"
+            disabled={completedResults.length === 0}
+            onClick={() =>
+              exportExamResultsExcel(completedResults, schedules, profile.schoolName)
+            }
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-sm font-semibold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
+            <span>Unduh Excel (.xlsx)</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={completedResults.length === 0}
+            onClick={() =>
+              exportExamResultsPdf(completedResults, schedules, profile, {
+                subject: effectiveSubjectFilter,
+                className: classFilter,
+              })
+            }
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-sm font-semibold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
+          >
+            <FileDown className="w-4 h-4" />
+            <span>Unduh PDF</span>
+          </button>
+        </div>
+      </div>
+
+      {feedback && (
+        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+            <span>{feedback}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFeedback('')}
+            className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Recap Summary Strip */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5">
+          <div className="text-xs font-medium text-slate-500">Total Hasil Selesai</div>
+          <div className="font-mono text-3xl font-bold text-slate-900 tabular-nums mt-1.5">
+            {summary.total}
+          </div>
+          <div className="text-xs text-slate-500 mt-1">Sesuai filter aktif</div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5">
+          <div className="text-xs font-medium text-slate-500">Tuntas KKM</div>
+          <div className="font-mono text-3xl font-bold text-emerald-700 tabular-nums mt-1.5">
+            {summary.passed}
+          </div>
+          <div className="text-xs text-slate-500 mt-1">
+            {summary.total > 0
+              ? `${Math.round((summary.passed / summary.total) * 100)}% ketuntasan`
+              : 'Belum ada data'}
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5">
+          <div className="text-xs font-medium text-slate-500">Rata-rata Nilai</div>
+          <div className="font-mono text-3xl font-bold text-[#064e3b] tabular-nums mt-1.5">
+            {summary.avg.toFixed(1)}
+          </div>
+          <div className="text-xs text-slate-500 mt-1">Skala 0 – 100</div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5">
+          <div className="text-xs font-medium text-slate-500">Nilai Tertinggi</div>
+          <div className="font-mono text-3xl font-bold text-slate-900 tabular-nums mt-1.5">
+            {summary.highest.toFixed(1)}
+          </div>
+          <div className="text-xs text-slate-500 mt-1">Pada filter saat ini</div>
+        </div>
+      </div>
+
+      {/* Filters & Recap Table */}
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+        <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+          <div className="relative flex-1 max-w-md">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Cari nama peserta atau nomor peserta..."
+              className="w-full pl-10 pr-4 py-2 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <select
+              value={effectiveSubjectFilter}
+              onChange={(e) => setSubjectFilter(e.target.value)}
+              disabled={isRestrictedBySubject && subjects.length <= 1}
+              className="px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-700 disabled:bg-slate-100"
+            >
+              {(!isRestrictedBySubject || subjects.length > 1) && (
+                <option value="ALL">
+                  {isRestrictedBySubject ? 'Semua Mapel Saya' : 'Semua Mata Pelajaran'}
+                </option>
+              )}
+              {subjects.map((subj) => (
+                <option key={subj} value={subj}>
+                  {subj}
+                </option>
+              ))}
+            </select>
+
+            <select
+              value={classFilter}
+              onChange={(e) => setClassFilter(e.target.value)}
+              className="px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+            >
+              <option value="ALL">Semua Kelas (7A–9I)</option>
+              {ALL_CLASSES.map((cls) => (
+                <option key={cls} value={cls}>
+                  Kelas {cls}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+                <th className="py-3 px-4 w-10">
+                  <input
+                    type="checkbox"
+                    aria-label="Pilih semua rekap yang tampil"
+                    checked={allVisibleSelected}
+                    onChange={toggleSelectAllVisible}
+                    className="w-4 h-4 accent-[#064e3b] cursor-pointer"
+                  />
+                </th>
+                <th className="py-3 px-4">Nomor Peserta</th>
+                <th className="py-3 px-4">Nama Peserta</th>
+                <th className="py-3 px-4">Kelas</th>
+                <th className="py-3 px-4">Mata Pelajaran</th>
+                <th className="py-3 px-4 text-right">Benar</th>
+                <th className="py-3 px-4 text-right">KKM</th>
+                <th className="py-3 px-4 text-right">Nilai Akhir</th>
+                <th className="py-3 px-4">Ketuntasan</th>
+                <th className="py-3 px-4 text-right">Hapus</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-sm">
+              {completedResults.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="py-10 px-4 text-center text-slate-500">
+                    Belum ada hasil ujian selesai yang sesuai dengan filter mapel atau kelas.
+                  </td>
+                </tr>
+              ) : (
+                completedResults.map((res) => {
+                  const kkm = getKkm(res.subject);
+                  const passed = res.score >= kkm;
+                  const isChecked = activeSelectedIds.includes(res.id);
+                  return (
+                    <tr key={res.id} className="hover:bg-slate-50/70 transition-colors">
+                      <td className="py-3 px-4">
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => toggleSelectOne(res.id)}
+                          aria-label={`Pilih rekap ${res.studentName}`}
+                          className="w-4 h-4 accent-[#064e3b] cursor-pointer"
+                        />
+                      </td>
+                      <td className="py-3 px-4 font-mono font-semibold text-slate-900 whitespace-nowrap">
+                        {res.participantNumber}
+                      </td>
+                      <td className="py-3 px-4 font-medium text-slate-900">{res.studentName}</td>
+                      <td className="py-3 px-4 font-mono font-semibold text-slate-700">
+                        {res.className}
+                      </td>
+                      <td className="py-3 px-4 text-slate-700">{res.subject || '-'}</td>
+                      <td className="py-3 px-4 font-mono text-right tabular-nums text-slate-700">
+                        {res.correctCount}/{res.totalQuestions}
+                      </td>
+                      <td className="py-3 px-4 font-mono text-right tabular-nums text-slate-500">
+                        {kkm}
+                      </td>
+                      <td className="py-3 px-4 font-mono text-right font-bold tabular-nums text-slate-900">
+                        {res.score.toFixed(1)}
+                      </td>
+                      <td className="py-3 px-4 text-xs whitespace-nowrap">
+                        <span
+                          className={`font-semibold ${
+                            passed ? 'text-emerald-700' : 'text-red-700'
+                          }`}
+                        >
+                          {passed ? 'Tuntas' : 'Belum Tuntas'}
+                        </span>
+                        {res.status === 'flagged' && (
+                          <>
+                            <span aria-hidden="true" className="mx-1.5 text-slate-300">
+                              ·
+                            </span>
+                            <span className="inline-flex items-center gap-1 text-amber-700 font-medium">
+                              <ShieldAlert className="w-3 h-3" />
+                              {res.tabSwitchCount}x Tab
+                            </span>
+                          </>
+                        )}
+                      </td>
+                      <td className="py-3 px-4 text-right whitespace-nowrap">
+                        <button
+                          type="button"
+                          onClick={() => setDeleteScope({ kind: 'single', target: res })}
+                          title={`Hapus rekap nilai ${res.studentName}`}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-700 hover:bg-rose-50 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Confirmation Modal for Deleting Recap Results */}
+      {deleteScope && (
+        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-2xl overflow-hidden">
+            <div className="px-5 py-4 bg-rose-50 border-b border-rose-200 flex items-center justify-between">
+              <div className="flex items-center gap-2 font-display font-bold text-rose-950 text-base">
+                <AlertTriangle className="w-5 h-5 text-rose-700" />
+                <span>Konfirmasi Hapus Rekap Nilai</span>
+              </div>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setDeleteScope(null)}
+                className="p-1 rounded-lg text-rose-900/70 hover:bg-rose-100 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {deleteScope.kind === 'all' ? (
+                <div className="text-sm text-slate-700 space-y-2 leading-relaxed">
+                  <p>
+                    Anda akan menghapus{' '}
+                    <strong className="text-rose-800">
+                      KESELURUHAN rekap nilai ujian ({deleteScope.targets.length} data)
+                    </strong>
+                    {isRestrictedBySubject
+                      ? ' pada mata pelajaran yang ditugaskan kepada Anda'
+                      : ' untuk semua mata pelajaran dan semua kelas'}
+                    .
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    Pastikan Anda telah mengunduh laporan Excel/PDF terlebih dahulu jika nilai masih dibutuhkan. Data yang dihapus akan terhapus di penyimpanan lokal dan Supabase Cloud.
+                  </p>
+                </div>
+              ) : deleteScope.kind === 'single' ? (
+                <div className="text-sm text-slate-700 space-y-2 leading-relaxed">
+                  <p>
+                    Anda akan menghapus data rekap nilai{' '}
+                    <strong className="text-slate-900">{deleteScope.target.subject}</strong> untuk:
+                  </p>
+                  <div className="rounded-xl bg-slate-50 border border-slate-200 p-3 text-xs space-y-1">
+                    <div>
+                      Nama: <strong className="text-slate-900">{deleteScope.target.studentName}</strong>
+                    </div>
+                    <div>
+                      Nomor Peserta:{' '}
+                      <code className="font-mono font-bold text-slate-900">
+                        {deleteScope.target.participantNumber}
+                      </code>{' '}
+                      · Kelas <strong className="font-mono">{deleteScope.target.className}</strong>{' '}
+                      · Nilai{' '}
+                      <strong className="font-mono">{deleteScope.target.score.toFixed(1)}</strong>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-sm text-slate-700 space-y-2 leading-relaxed">
+                  <p>
+                    Anda akan menghapus{' '}
+                    <strong className="text-rose-800">
+                      {deleteScope.targets.length} data rekap nilai
+                    </strong>{' '}
+                    {deleteScope.kind === 'filtered' ? 'sesuai filter aktif' : 'yang dipilih'}.
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    Data nilai yang dihapus akan terhapus di penyimpanan lokal dan Supabase Cloud.
+                  </p>
+                </div>
+              )}
+
+              <div className="flex items-center gap-2.5 pt-1">
+                <button
+                  type="button"
+                  disabled={isDeleting}
+                  onClick={() => setDeleteScope(null)}
+                  className="flex-1 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs sm:text-sm font-semibold cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="button"
+                  disabled={isDeleting}
+                  onClick={() => void handleConfirmDelete()}
+                  className="flex-1 py-2.5 rounded-xl bg-rose-700 hover:bg-rose-800 text-white text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-60"
+                >
+                  {isDeleting ? 'Menghapus...' : 'Ya, Hapus Permanen'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

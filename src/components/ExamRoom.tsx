@@ -1,0 +1,818 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  Flag,
+  LayoutGrid,
+  Maximize2,
+  Send,
+  ShieldAlert,
+  X,
+} from 'lucide-react';
+import { MathText } from '@/src/components/MathText';
+import {
+  clearActiveSessionLocal,
+  flushExamProgressKeepalive,
+  saveActiveSessionLocal,
+  submitFinalExam,
+  upsertExamProgress,
+} from '@/src/lib/dataStore';
+import type { ActiveExamSession, ExamResult, OptionKey, SchoolProfile } from '@/src/types/cbt';
+
+interface ExamRoomProps {
+  profile: SchoolProfile;
+  initialSession: ActiveExamSession;
+  onExamCompleted: (result: ExamResult) => void;
+  onExamLocked: () => void;
+}
+
+function formatRemainingTime(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const hrs = Math.floor(safe / 3600);
+  const mins = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  if (hrs > 0) {
+    return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+export const ExamRoom: React.FC<ExamRoomProps> = ({
+  profile,
+  initialSession,
+  onExamCompleted,
+  onExamLocked,
+}) => {
+  const [session, setSession] = useState<ActiveExamSession>(initialSession);
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(() => {
+    return Math.max(
+      0,
+      Math.floor((new Date(initialSession.endsAt).getTime() - Date.now()) / 1000)
+    );
+  });
+  const [syncIndicator, setSyncIndicator] = useState<'synced' | 'syncing' | 'offline'>('synced');
+  const [showNavDrawer, setShowNavDrawer] = useState(false);
+  const [showSubmitModal, setShowSubmitModal] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [cheatWarningOpen, setCheatWarningOpen] = useState(false);
+  const [isViolationLocked, setIsViolationLocked] = useState<boolean>(
+    () => initialSession.tabSwitchCount >= initialSession.schedule.maxTabSwitches
+  );
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(() =>
+    Boolean(typeof document !== 'undefined' && document.fullscreenElement)
+  );
+
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const submittingRef = useRef(false);
+  const lastViolationTsRef = useRef(0);
+  const isUnloadingRef = useRef(false);
+  const blurTimerRef = useRef<number | null>(null);
+  const lockedRef = useRef(isViolationLocked);
+  lockedRef.current = isViolationLocked;
+
+  const currentQuestion = session.questions[session.currentIndex];
+  const answeredCount = useMemo(
+    () => Object.keys(session.answers).length,
+    [session.answers]
+  );
+
+  const handleFinalizeExam = useCallback(async () => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setIsSubmitting(true);
+    try {
+      const result = await submitFinalExam(sessionRef.current);
+      if (document.fullscreenElement && document.exitFullscreen) {
+        try {
+          await document.exitFullscreen();
+        } catch {
+          // Ignore fullscreen exit rejection
+        }
+      }
+      onExamCompleted(result);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [onExamCompleted]);
+
+  // Countdown timer synced to endsAt timestamp
+  useEffect(() => {
+    const checkAndTick = () => {
+      const left = Math.max(
+        0,
+        Math.floor((new Date(sessionRef.current.endsAt).getTime() - Date.now()) / 1000)
+      );
+      setRemainingSeconds(left);
+      if (left <= 0) {
+        void handleFinalizeExam();
+        return true;
+      }
+      return false;
+    };
+
+    if (checkAndTick()) return;
+
+    const timer = window.setInterval(() => {
+      if (checkAndTick()) {
+        window.clearInterval(timer);
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [handleFinalizeExam]);
+
+  // Protect active exam from accidental browser refresh & avoid false violations during reload
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      isUnloadingRef.current = true;
+      if (blurTimerRef.current) {
+        window.clearTimeout(blurTimerRef.current);
+        blurTimerRef.current = null;
+      }
+      // If user cancels reload dialog, re-enable monitoring after 2s
+      window.setTimeout(() => {
+        isUnloadingRef.current = false;
+      }, 2000);
+
+      if (!submittingRef.current && !lockedRef.current) {
+        flushExamProgressKeepalive(sessionRef.current);
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+
+    const handlePageHide = () => {
+      isUnloadingRef.current = true;
+      if (blurTimerRef.current) {
+        window.clearTimeout(blurTimerRef.current);
+        blurTimerRef.current = null;
+      }
+      if (!submittingRef.current && !lockedRef.current) {
+        flushExamProgressKeepalive(sessionRef.current);
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handlePageHide);
+    };
+  }, []);
+
+  // Anti-Cheating: Page Visibility API + Window Blur + Fullscreen Monitoring
+  useEffect(() => {
+    const recordViolation = () => {
+      if (isUnloadingRef.current || submittingRef.current || lockedRef.current) return;
+      const now = Date.now();
+      if (now - lastViolationTsRef.current < 1500) return;
+      lastViolationTsRef.current = now;
+
+      setSession((prev) => {
+        const nextCount = prev.tabSwitchCount + 1;
+        const updated: ActiveExamSession = {
+          ...prev,
+          tabSwitchCount: nextCount,
+        };
+        saveActiveSessionLocal(updated);
+        void upsertExamProgress(updated);
+        if (nextCount >= prev.schedule.maxTabSwitches) {
+          setIsViolationLocked(true);
+          setCheatWarningOpen(false);
+          clearActiveSessionLocal();
+        } else {
+          setCheatWarningOpen(true);
+        }
+        return updated;
+      });
+    };
+
+    const onVisibilityChange = () => {
+      if (document.hidden && !isUnloadingRef.current) {
+        if (!submittingRef.current && !lockedRef.current) {
+          flushExamProgressKeepalive(sessionRef.current);
+        }
+        window.setTimeout(() => {
+          if (document.hidden && !isUnloadingRef.current) {
+            recordViolation();
+          }
+        }, 150);
+      }
+    };
+
+    const onBlur = () => {
+      if (isUnloadingRef.current) return;
+      if (blurTimerRef.current) {
+        window.clearTimeout(blurTimerRef.current);
+      }
+      blurTimerRef.current = window.setTimeout(() => {
+        blurTimerRef.current = null;
+        if (!isUnloadingRef.current && !document.hasFocus()) {
+          recordViolation();
+        }
+      }, 300);
+    };
+
+    const onFocus = () => {
+      if (blurTimerRef.current) {
+        window.clearTimeout(blurTimerRef.current);
+        blurTimerRef.current = null;
+      }
+    };
+
+    const onFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+
+    return () => {
+      if (blurTimerRef.current) {
+        window.clearTimeout(blurTimerRef.current);
+      }
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('blur', onBlur);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+    };
+  }, []);
+
+  const persistProgress = useCallback(async (updated: ActiveExamSession) => {
+    setSyncIndicator('syncing');
+    try {
+      const res = await upsertExamProgress(updated);
+      setSyncIndicator(res.syncStatus === 'synced' ? 'synced' : 'offline');
+    } catch {
+      setSyncIndicator('offline');
+    }
+  }, []);
+
+  const handleSelectOption = (questionId: string, key: OptionKey) => {
+    const updated: ActiveExamSession = {
+      ...session,
+      answers: {
+        ...session.answers,
+        [questionId]: key,
+      },
+    };
+    saveActiveSessionLocal(updated);
+    setSession(updated);
+    void persistProgress(updated);
+  };
+
+  const handleToggleFlag = (questionId: string) => {
+    const exists = session.flaggedQuestions.includes(questionId);
+    const updated: ActiveExamSession = {
+      ...session,
+      flaggedQuestions: exists
+        ? session.flaggedQuestions.filter((id) => id !== questionId)
+        : [...session.flaggedQuestions, questionId],
+    };
+    saveActiveSessionLocal(updated);
+    setSession(updated);
+    void persistProgress(updated);
+  };
+
+  const handleJumpQuestion = (index: number) => {
+    if (index < 0 || index >= session.questions.length) return;
+    const updated: ActiveExamSession = {
+      ...session,
+      currentIndex: index,
+    };
+    saveActiveSessionLocal(updated);
+    setSession(updated);
+    setShowNavDrawer(false);
+    void persistProgress(updated);
+  };
+
+  const handleEnterFullscreen = async () => {
+    try {
+      if (document.documentElement.requestFullscreen) {
+        await document.documentElement.requestFullscreen();
+      }
+    } catch {
+      // Ignore if environment denies fullscreen
+    }
+  };
+
+  if (!currentQuestion) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
+        <div className="max-w-md w-full bg-white rounded-2xl border border-slate-200 p-6 text-center space-y-4">
+          <p className="text-slate-700 font-medium">
+            Belum ada soal mata pelajaran {session.schedule.subject} untuk kelas{' '}
+            {session.participant.className}.
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleFinalizeExam()}
+            className="px-4 py-2.5 rounded-xl bg-emerald-800 text-white text-sm font-semibold cursor-pointer"
+          >
+            Kembali
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const selectedAnswer = session.answers[currentQuestion.id];
+  const isFlagged = session.flaggedQuestions.includes(currentQuestion.id);
+  const isTimeCritical = remainingSeconds <= 300;
+
+  return (
+    <div
+      className="min-h-screen bg-slate-100 flex flex-col select-none"
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {/* Top Exam Bar */}
+      <header className="sticky top-0 z-30 bg-[#064e3b] text-white border-b border-emerald-900/50 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="min-w-0">
+              <div className="font-display font-bold text-sm sm:text-base truncate">
+                {session.participant.fullName}
+              </div>
+              <div className="text-xs text-emerald-100/85 truncate">
+                Kelas {session.participant.className} ·{' '}
+                <span className="font-mono">{session.participant.participantNumber}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
+            <div
+              className={`px-3 py-1.5 rounded-lg flex items-center gap-2 font-mono text-sm sm:text-base font-bold tabular-nums ${
+                isTimeCritical
+                  ? 'bg-red-600 text-white'
+                  : 'bg-emerald-950/60 text-emerald-50 border border-emerald-700/60'
+              }`}
+            >
+              <Clock className="w-4 h-4 shrink-0" />
+              <span>{formatRemainingTime(remainingSeconds)}</span>
+            </div>
+
+            {!isFullscreen && (
+              <button
+                type="button"
+                onClick={handleEnterFullscreen}
+                title="Aktifkan Layar Penuh"
+                className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 text-xs font-semibold border border-amber-300/30 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+                <span>Layar Penuh</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setShowNavDrawer(true)}
+              className="lg:hidden inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white/15 hover:bg-white/25 text-white text-xs font-semibold transition-colors cursor-pointer"
+            >
+              <LayoutGrid className="w-4 h-4" />
+              <span className="tabular-nums">
+                {answeredCount}/{session.questions.length}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowSubmitModal(true)}
+              className="hidden sm:inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-emerald-950 hover:bg-emerald-50 text-xs sm:text-sm font-bold transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Send className="w-3.5 h-3.5" />
+              <span>Akhiri Ujian</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Center Top Header Above Question: School Logo, Exam Name, Subject Name */}
+      <div className="bg-white border-b border-slate-200 px-4 py-3.5">
+        <div className="max-w-4xl mx-auto flex flex-col items-center justify-center text-center gap-1.5">
+          <div className="flex items-center justify-center gap-3">
+            {profile.logoDataUrl && (
+              <img
+                src={profile.logoDataUrl}
+                alt={`Logo ${profile.schoolName}`}
+                referrerPolicy="no-referrer"
+                className="w-14 h-14 object-contain shrink-0"
+              />
+            )}
+            <div className="text-left">
+              <div className="font-display font-bold text-slate-900 text-sm sm:text-base leading-tight">
+                {profile.examTitle}
+              </div>
+              <div className="text-xs sm:text-sm font-semibold text-emerald-800">
+                Mata Pelajaran: {session.schedule.subject}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content Split: Question Stage + Question Palette */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* Question Canvas */}
+        <section className="lg:col-span-8 bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+          <div className="px-5 sm:px-7 py-4 border-b border-slate-100 flex items-center justify-between gap-4 bg-slate-50/70">
+            <div className="flex items-center gap-3 text-sm">
+              <span className="font-display font-bold text-slate-900">
+                Soal Nomor <span className="font-mono tabular-nums">{session.currentIndex + 1}</span>
+              </span>
+              <span className="text-slate-300" aria-hidden="true">/</span>
+              <span className="text-slate-600 font-medium">{currentQuestion.subject}</span>
+            </div>
+            <div className="text-xs text-slate-500 font-medium">
+              {syncIndicator === 'syncing'
+                ? 'Menyimpan...'
+                : syncIndicator === 'synced'
+                  ? 'Tersimpan di Cloud & Lokal'
+                  : 'Tersimpan Lokal (Antrean Sync)'}
+            </div>
+          </div>
+
+          <div className="p-5 sm:p-8 space-y-6">
+            {currentQuestion.questionImageUrl && (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 flex justify-center">
+                <img
+                  src={currentQuestion.questionImageUrl}
+                  alt={`Ilustrasi Soal ${session.currentIndex + 1}`}
+                  referrerPolicy="no-referrer"
+                  className="max-h-72 w-auto object-contain rounded-lg"
+                />
+              </div>
+            )}
+
+            <div className="text-slate-900 text-base sm:text-lg leading-relaxed font-normal select-none">
+              <MathText text={currentQuestion.questionText} />
+            </div>
+
+            <div className="space-y-3" role="radiogroup" aria-label="Pilihan Jawaban">
+              {currentQuestion.options.map((opt) => {
+                const isSelected = selectedAnswer === opt.key;
+                return (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    role="radio"
+                    aria-checked={isSelected}
+                    onClick={() => handleSelectOption(currentQuestion.id, opt.key)}
+                    className={`w-full text-left p-4 rounded-xl border transition-all flex items-start gap-4 cursor-pointer min-h-[52px] ${
+                      isSelected
+                        ? 'bg-emerald-50 border-emerald-700 ring-1 ring-emerald-700 text-emerald-950'
+                        : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-800'
+                    }`}
+                  >
+                    <span
+                      className={`w-8 h-8 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 transition-colors ${
+                        isSelected
+                          ? 'bg-[#064e3b] text-white'
+                          : 'bg-slate-100 text-slate-700'
+                      }`}
+                    >
+                      {opt.key}
+                    </span>
+                    <div className="pt-0.5 text-sm sm:text-base leading-relaxed flex-1 space-y-2">
+                      {opt.text && (
+                        <div>
+                          <MathText text={opt.text} />
+                        </div>
+                      )}
+                      {opt.imageUrl && (
+                        <img
+                          src={opt.imageUrl}
+                          alt={`Gambar Opsi ${opt.key}`}
+                          referrerPolicy="no-referrer"
+                          className="max-h-40 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
+                        />
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Bottom Question Navigation Footer */}
+          <div className="px-5 sm:px-7 py-4 bg-slate-50 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3">
+            <button
+              type="button"
+              disabled={session.currentIndex === 0}
+              onClick={() => handleJumpQuestion(session.currentIndex - 1)}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 text-sm font-semibold transition-colors cursor-pointer"
+            >
+              <ChevronLeft className="w-4 h-4" />
+              <span>Sebelumnya</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleToggleFlag(currentQuestion.id)}
+              className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border text-sm font-semibold transition-colors cursor-pointer ${
+                isFlagged
+                  ? 'bg-amber-100 border-amber-400 text-amber-900'
+                  : 'bg-white border-slate-300 text-slate-700 hover:bg-amber-50'
+              }`}
+            >
+              <Flag className="w-4 h-4" />
+              <span>{isFlagged ? 'Ditandai Ragu' : 'Ragu-ragu'}</span>
+            </button>
+
+            {session.currentIndex < session.questions.length - 1 ? (
+              <button
+                type="button"
+                onClick={() => handleJumpQuestion(session.currentIndex + 1)}
+                className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-sm font-semibold transition-colors cursor-pointer"
+              >
+                <span>Selanjutnya</span>
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowSubmitModal(true)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold transition-colors cursor-pointer"
+              >
+                <Send className="w-4 h-4" />
+                <span>Akhiri Ujian</span>
+              </button>
+            )}
+          </div>
+        </section>
+
+        {/* Desktop Sidebar Question Palette */}
+        <aside className="hidden lg:block lg:col-span-4 bg-white rounded-2xl border border-slate-200 shadow-xs p-5 space-y-5 sticky top-24">
+          <div className="flex items-center justify-between">
+            <h2 className="font-display font-bold text-slate-900 text-base">
+              Navigasi Soal
+            </h2>
+            <span className="text-xs font-mono font-semibold text-slate-600 tabular-nums">
+              {answeredCount} / {session.questions.length} Terjawab
+            </span>
+          </div>
+
+          <div className="grid grid-cols-5 gap-2">
+            {session.questions.map((q, idx) => {
+              const isCurrent = idx === session.currentIndex;
+              const isAnswered = Boolean(session.answers[q.id]);
+              const qFlagged = session.flaggedQuestions.includes(q.id);
+
+              let cellStyle = 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100';
+              if (qFlagged) {
+                cellStyle = 'bg-amber-100 border-amber-400 text-amber-900';
+              } else if (isAnswered) {
+                cellStyle = 'bg-emerald-700 border-emerald-800 text-white';
+              }
+
+              return (
+                <button
+                  key={q.id}
+                  type="button"
+                  onClick={() => handleJumpQuestion(idx)}
+                  className={`h-11 rounded-xl border font-mono text-sm font-bold tabular-nums transition-all cursor-pointer flex items-center justify-center relative ${cellStyle} ${
+                    isCurrent ? 'ring-2 ring-offset-2 ring-[#064e3b]' : ''
+                  }`}
+                >
+                  {idx + 1}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="pt-3 border-t border-slate-100 space-y-2 text-xs text-slate-600">
+            <div className="flex items-center justify-between">
+              <span className="flex items-center gap-2">
+                <span className="w-3.5 h-3.5 rounded bg-emerald-700 inline-block" />
+                Sudah dijawab
+              </span>
+              <span className="font-mono font-semibold tabular-nums">{answeredCount}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="flex items-center gap-2">
+                <span className="w-3.5 h-3.5 rounded bg-amber-300 border border-amber-500 inline-block" />
+                Ditandai ragu-ragu
+              </span>
+              <span className="font-mono font-semibold tabular-nums">
+                {session.flaggedQuestions.length}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="flex items-center gap-2">
+                <span className="w-3.5 h-3.5 rounded bg-slate-100 border border-slate-300 inline-block" />
+                Belum dijawab
+              </span>
+              <span className="font-mono font-semibold tabular-nums">
+                {session.questions.length - answeredCount}
+              </span>
+            </div>
+          </div>
+
+          <div className="pt-3 border-t border-slate-100 space-y-2">
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-600 font-medium">Pengawas Tab / Fokus</span>
+              <span
+                className={`font-mono font-bold tabular-nums ${
+                  session.tabSwitchCount > 0 ? 'text-amber-700' : 'text-emerald-700'
+                }`}
+              >
+                {session.tabSwitchCount} / {session.schedule.maxTabSwitches} Peringatan
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowSubmitModal(true)}
+              className="w-full py-3 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer"
+            >
+              <Send className="w-4 h-4" />
+              <span>Akhiri Ujian</span>
+            </button>
+          </div>
+        </aside>
+      </main>
+
+      {/* Mobile Navigation Drawer */}
+      {showNavDrawer && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-4 lg:hidden">
+          <div className="w-full max-w-md bg-white rounded-2xl p-5 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="font-display font-bold text-slate-900">
+                Daftar Soal ({answeredCount}/{session.questions.length})
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowNavDrawer(false)}
+                className="p-2 rounded-lg text-slate-500 hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="grid grid-cols-5 gap-2 max-h-72 overflow-y-auto py-1">
+              {session.questions.map((q, idx) => {
+                const isCurrent = idx === session.currentIndex;
+                const isAnswered = Boolean(session.answers[q.id]);
+                const qFlagged = session.flaggedQuestions.includes(q.id);
+                let cellStyle = 'bg-slate-50 border-slate-200 text-slate-700';
+                if (qFlagged) cellStyle = 'bg-amber-100 border-amber-400 text-amber-900';
+                else if (isAnswered) cellStyle = 'bg-emerald-700 border-emerald-800 text-white';
+
+                return (
+                  <button
+                    key={q.id}
+                    type="button"
+                    onClick={() => handleJumpQuestion(idx)}
+                    className={`h-11 rounded-xl border font-mono text-sm font-bold tabular-nums cursor-pointer ${cellStyle} ${
+                      isCurrent ? 'ring-2 ring-[#064e3b]' : ''
+                    }`}
+                  >
+                    {idx + 1}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowNavDrawer(false);
+                setShowSubmitModal(true);
+              }}
+              className="w-full py-3 rounded-xl bg-[#064e3b] text-white font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Send className="w-4 h-4" />
+              <span>Akhiri Ujian</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Anti-Cheat Tab Switch Warning Modal */}
+      {cheatWarningOpen && !isViolationLocked && (
+        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-red-200 p-6 space-y-4 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="w-11 h-11 rounded-xl bg-red-100 text-red-700 flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-display font-bold text-slate-900 text-lg">
+                  Perpindahan Tab / Layar Terdeteksi
+                </h3>
+                <p className="text-sm text-slate-600 mt-1 leading-relaxed">
+                  Aktivitas keluar dari jendela ujian dicatat otomatis oleh sistem pengawas.
+                  Pelanggaran tercatat:{' '}
+                  <span className="font-mono font-bold text-red-700">
+                    {session.tabSwitchCount} / {session.schedule.maxTabSwitches} kali
+                  </span>
+                  . Jika mencapai batas maksimal, ujian akan terkunci otomatis.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setCheatWarningOpen(false);
+                void handleEnterFullscreen();
+              }}
+              className="w-full py-3 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white font-semibold text-sm cursor-pointer"
+            >
+              Kembali ke Ujian &amp; Kunci Layar Penuh
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Violation Lockout Modal */}
+      {isViolationLocked && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-red-300 p-6 space-y-4 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="w-12 h-12 rounded-xl bg-red-100 text-red-700 flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-7 h-7" />
+              </div>
+              <div>
+                <h3 className="font-display font-bold text-red-900 text-lg">
+                  Akses Ujian Terkunci
+                </h3>
+                <p className="text-sm text-slate-600 mt-1 leading-relaxed">
+                  Anda telah mencapai batas maksimal pelanggaran perpindahan tab/layar (
+                  <span className="font-mono font-bold text-red-700">
+                    {session.tabSwitchCount}/{session.schedule.maxTabSwitches}
+                  </span>
+                  ). Sesi ujian mata pelajaran <strong>{session.schedule.subject}</strong> telah
+                  dikunci dan dilaporkan ke panitia. Hubungi pengawas/admin untuk membuka kunci
+                  melalui menu Reset Ujian.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                clearActiveSessionLocal();
+                if (document.fullscreenElement && document.exitFullscreen) {
+                  void document.exitFullscreen().catch(() => {});
+                }
+                onExamLocked();
+              }}
+              className="w-full py-3 rounded-xl bg-red-700 hover:bg-red-800 text-white font-semibold text-sm cursor-pointer"
+            >
+              Kembali ke Halaman Login
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Final Submit Confirmation Modal */}
+      {showSubmitModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-slate-200 p-6 space-y-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="w-11 h-11 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center shrink-0">
+                {answeredCount < session.questions.length ? (
+                  <AlertTriangle className="w-6 h-6 text-amber-600" />
+                ) : (
+                  <Check className="w-6 h-6" />
+                )}
+              </div>
+              <div>
+                <h3 className="font-display font-bold text-slate-900 text-lg">
+                  Konfirmasi Akhiri Ujian
+                </h3>
+                <p className="text-sm text-slate-600 mt-1 leading-relaxed">
+                  Anda telah menjawab{' '}
+                  <span className="font-mono font-bold text-slate-900">
+                    {answeredCount} dari {session.questions.length}
+                  </span>{' '}
+                  soal. Jawaban ujian akan dikirim otomatis ke database cloud.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => setShowSubmitModal(false)}
+                className="flex-1 py-3 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 font-semibold text-sm cursor-pointer"
+              >
+                Periksa Lagi
+              </button>
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => void handleFinalizeExam()}
+                className="flex-1 py-3 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white font-semibold text-sm cursor-pointer disabled:opacity-60"
+              >
+                {isSubmitting ? 'Mengirim Jawaban...' : 'Ya, Akhiri & Kirim'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
