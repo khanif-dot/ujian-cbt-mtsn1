@@ -3,6 +3,7 @@ import { Check, ImagePlus, KeyRound, RotateCcw, Save } from 'lucide-react';
 import { compressLogoImage } from '@/src/lib/importers';
 import { DEFAULT_LOGO_DATA_URL } from '@/src/lib/seedData';
 import type { SchoolProfile } from '@/src/types/cbt';
+import { verifyPassword } from '@/src/lib/dataStore';
 import {
   clearPersistedValue,
   readPersistedValue,
@@ -77,7 +78,7 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
     setPwdFeedback(null);
     const activePwd = profile.adminPassword || 'admin123';
 
-    if (currentPwd !== activePwd) {
+    if (!(await verifyPassword(currentPwd, activePwd))) {
       setPwdFeedback({ type: 'err', msg: 'Sandi admin saat ini tidak sesuai.' });
       return;
     }
@@ -90,7 +91,7 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
       return;
     }
 
-    await onSaveProfile({ ...profile, ...form, adminPassword: newPwd.trim() });
+    await onSaveProfile({ ...profile, adminPassword: newPwd.trim() });
     setCurrentPwd('');
     setNewPwd('');
     setConfirmPwd('');

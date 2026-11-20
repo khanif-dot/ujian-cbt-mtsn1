@@ -41,6 +41,7 @@ interface AdminDashboardTabProps {
   schedules: ExamSchedule[];
   results: ExamResult[];
   hiddenDashboardLogs: Record<string, string>;
+  allowedSubjects?: string[];
   onForceSync: () => Promise<void>;
   isSyncing: boolean;
   onForceFinishResults: (resultIds: string[]) => Promise<number>;
@@ -54,6 +55,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
   schedules,
   results,
   hiddenDashboardLogs,
+  allowedSubjects,
   onForceSync,
   isSyncing,
   onForceFinishResults,
@@ -61,6 +63,12 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
   onClearDashboardLogs,
   onNavigateToReset,
 }) => {
+  const isRestrictedBySubject = Boolean(allowedSubjects && allowedSubjects.length > 0);
+  const normalizedAllowed = useMemo(
+    () => (allowedSubjects || []).map((s) => s.trim().toLowerCase()),
+    [allowedSubjects]
+  );
+
   const [statusFilter, setStatusFilter] = useState<MonitoringStatusFilter>('in_progress');
   const [classFilter, setClassFilter] = useState<string>('ALL');
   const [subjectFilter, setSubjectFilter] = useState<string>('ALL');
@@ -79,25 +87,42 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
-    void autoFinalizeExpiredExams();
+    void autoFinalizeExpiredExams({ isAdmin: true });
     const timer = window.setInterval(() => {
       setNowMs(Date.now());
     }, 15000);
     return () => window.clearInterval(timer);
   }, []);
 
+  const scopedSchedules = useMemo(() => {
+    if (!isRestrictedBySubject) return schedules;
+    return schedules.filter((s) =>
+      normalizedAllowed.includes(s.subject.trim().toLowerCase())
+    );
+  }, [schedules, isRestrictedBySubject, normalizedAllowed]);
+
+  const scopedResults = useMemo(() => {
+    if (!isRestrictedBySubject) return results;
+    return results.filter((r) =>
+      normalizedAllowed.includes((r.subject || '').trim().toLowerCase())
+    );
+  }, [results, isRestrictedBySubject, normalizedAllowed]);
+
   const dashboardResults = useMemo(
-    () => results.filter((r) => hiddenDashboardLogs[r.id] !== r.startedAt),
-    [results, hiddenDashboardLogs]
+    () => scopedResults.filter((r) => hiddenDashboardLogs[r.id] !== r.startedAt),
+    [scopedResults, hiddenDashboardLogs]
   );
 
   const subjects = useMemo(() => {
-    const set = new Set<string>(schedules.map((s) => s.subject));
+    if (isRestrictedBySubject && allowedSubjects) {
+      return [...allowedSubjects].sort();
+    }
+    const set = new Set<string>(scopedSchedules.map((s) => s.subject));
     dashboardResults.forEach((r) => {
       if (r.subject) set.add(r.subject);
     });
     return Array.from(set).sort();
-  }, [schedules, dashboardResults]);
+  }, [scopedSchedules, dashboardResults, isRestrictedBySubject, allowedSubjects]);
 
   const stats = useMemo(() => {
     const inProgress = dashboardResults.filter((r) => r.status === 'in_progress');
@@ -107,7 +132,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
     const completedResults = dashboardResults.filter(
       (r) => r.status === 'submitted' || r.status === 'flagged'
     );
-    const pendingSync = results.filter((r) => r.syncStatus === 'pending').length;
+    const pendingSync = scopedResults.filter((r) => r.syncStatus === 'pending').length;
 
     return {
       totalParticipants: participants.length,
@@ -116,12 +141,14 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
       alertCount: violationResults.length,
       completedCount: completedResults.length,
       pendingSync,
-      activeSubjects: schedules.filter((s) => s.isActive).length,
+      activeSubjects: scopedSchedules.filter((s) => s.isActive).length,
+      totalSchedules: scopedSchedules.length,
     };
-  }, [participants.length, dashboardResults, results, schedules]);
+  }, [participants.length, dashboardResults, scopedResults, scopedSchedules]);
 
   const filteredResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
+    const normSubjFilter = subjectFilter.trim().toLowerCase();
     return dashboardResults.filter((r) => {
       if (statusFilter === 'in_progress' && r.status !== 'in_progress') return false;
       if (
@@ -140,7 +167,12 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
       }
 
       if (classFilter !== 'ALL' && r.className !== classFilter) return false;
-      if (subjectFilter !== 'ALL' && r.subject !== subjectFilter) return false;
+      if (
+        subjectFilter !== 'ALL' &&
+        (r.subject || '').trim().toLowerCase() !== normSubjFilter
+      ) {
+        return false;
+      }
       if (
         q &&
         !r.studentName.toLowerCase().includes(q) &&
@@ -497,7 +529,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
             {stats.activeSubjects}
           </div>
           <div className="text-xs text-slate-500 mt-1">
-            Dari {schedules.length} jadwal tersimpan
+            Dari {stats.totalSchedules} jadwal tersimpan
           </div>
         </div>
 

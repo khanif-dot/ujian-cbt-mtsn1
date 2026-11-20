@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
+  Cloud,
   Eye,
   EyeOff,
   KeyRound,
@@ -25,15 +27,22 @@ import type {
   StaffAccount,
   StaffRoleType,
 } from '@/src/types/cbt';
+import { isPasswordHashed } from '@/src/lib/dataStore';
+import { isLiveSupabaseConfigured } from '@/src/lib/supabase';
 import { usePersistedState } from '@/src/lib/usePersistedState';
+
+interface StaffSyncResult {
+  synced: boolean;
+  error?: string;
+}
 
 interface AdminRolesTabProps {
   staffAccounts: StaffAccount[];
   currentStaffId: string;
   schedules: ExamSchedule[];
   questions: Question[];
-  onUpsertStaff: (account: StaffAccount) => Promise<void>;
-  onDeleteStaff: (id: string) => Promise<void>;
+  onUpsertStaff: (account: StaffAccount) => Promise<StaffSyncResult | void>;
+  onDeleteStaff: (id: string) => Promise<StaffSyncResult | void>;
 }
 
 const MENU_OPTIONS: { key: AdminTabKey; label: string; desc: string }[] = [
@@ -136,8 +145,8 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
   const [showPassword, setShowPassword] = useState(false);
   const [customSubjectInput, setCustomSubjectInput] = useState('');
   const [formError, setFormError] = useState('');
-  const [feedback, setFeedback] = useState('');
-  const [revealedIds, setRevealedIds] = useState<Record<string, boolean>>({});
+  const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const liveCloud = isLiveSupabaseConfigured();
 
   const allSubjects = useMemo(() => {
     const set = new Set<string>();
@@ -177,7 +186,7 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       id: acc.id,
       userId: acc.userId,
       name: acc.name,
-      password: acc.password,
+      password: '',
       roleType: acc.roleType,
       roleLabel: acc.roleLabel,
       allowedTabs: [...acc.allowedTabs],
@@ -251,6 +260,9 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
     const cleanName = form.name.trim();
     const cleanPwd = form.password.trim();
     const cleanLabel = form.roleLabel.trim() || 'Panitia';
+    const existingAcc = form.id
+      ? staffAccounts.find((acc) => acc.id === form.id)
+      : undefined;
 
     if (!cleanId) {
       setFormError('ID Login wajib diisi (contoh: proktor2 atau guru-ipa).');
@@ -264,8 +276,12 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       setFormError('Nama lengkap pengguna wajib diisi.');
       return;
     }
-    if (cleanPwd.length < 4) {
+    if (!existingAcc && cleanPwd.length < 4) {
       setFormError('Sandi login minimal 4 karakter.');
+      return;
+    }
+    if (existingAcc && cleanPwd.length > 0 && cleanPwd.length < 4) {
+      setFormError('Sandi login baru minimal 4 karakter (atau kosongkan jika tidak diubah).');
       return;
     }
     if (form.allowedTabs.length === 0) {
@@ -287,12 +303,23 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       return;
     }
 
+    const resolvedPassword = cleanPwd || existingAcc?.password || '';
+    if (!resolvedPassword) {
+      setFormError('Sandi login wajib diisi minimal 4 karakter.');
+      return;
+    }
+
     const isPrimaryAdmin = cleanId.toLowerCase() === 'admin';
+    const generatedStaffId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `staff-${crypto.randomUUID()}`
+        : `staff-${cleanId.toLowerCase().replace(/[^a-z0-9-_]/g, '')}-${Date.now()}`;
+
     const payload: StaffAccount = {
-      id: form.id || `staff-${cleanId.toLowerCase().replace(/[^a-z0-9-_]/g, '')}-${Date.now()}`,
+      id: form.id || generatedStaffId,
       userId: cleanId,
       name: cleanName,
-      password: cleanPwd,
+      password: resolvedPassword,
       roleType: form.roleType,
       roleLabel: cleanLabel,
       allowedTabs: isPrimaryAdmin
@@ -304,13 +331,28 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       createdAt: form.createdAt || new Date().toISOString(),
     };
 
-    await onUpsertStaff(payload);
+    const syncRes = await onUpsertStaff(payload);
     setModalOpen(false);
-    setFeedback(
-      form.id
-        ? `Role & akses untuk "${payload.name}" (ID: ${payload.userId}) berhasil diperbarui.`
-        : `Role baru "${payload.name}" (ID: ${payload.userId}) berhasil ditambahkan.`
-    );
+    const actionLabel = form.id
+      ? `Role & akses untuk "${payload.name}" (ID: ${payload.userId}) berhasil diperbarui`
+      : `Role baru "${payload.name}" (ID: ${payload.userId}) berhasil ditambahkan`;
+
+    if (syncRes && syncRes.error) {
+      setFeedback({
+        ok: false,
+        text: `${actionLabel} di perangkat ini, namun GAGAL sinkron ke Supabase Cloud (${syncRes.error}). Pastikan Skrip SQL terbaru (tabel staff_accounts) sudah dijalankan di menu Database & SQL.`,
+      });
+    } else if (syncRes?.synced) {
+      setFeedback({
+        ok: true,
+        text: `${actionLabel} & tersinkron ke Database Cloud (aktif di semua perangkat).`,
+      });
+    } else {
+      setFeedback({
+        ok: true,
+        text: `${actionLabel} di cache lokal perangkat ini.`,
+      });
+    }
   };
 
   const roleBadgeClass = (roleType: StaffRoleType): string => {
@@ -330,9 +372,25 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="font-display text-2xl font-bold text-slate-900 tracking-tight">
-            Manajemen Role &amp; Hak Akses Panitia
-          </h1>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="font-display text-2xl font-bold text-slate-900 tracking-tight">
+              Manajemen Role &amp; Hak Akses Panitia
+            </h1>
+            <span
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold ${
+                liveCloud
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-amber-50 border-amber-200 text-amber-800'
+              }`}
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              <span>
+                {liveCloud
+                  ? 'Sinkron Otomatis ke Cloud (Semua Perangkat)'
+                  : 'Mode Lokal (Belum Terhubung Cloud)'}
+              </span>
+            </span>
+          </div>
           <p className="text-sm text-slate-600 mt-0.5">
             Tambahkan akun role Admin, Proktor (Teknisi), Guru Mapel, atau role kustom dengan ID, nama, sandi, dan pengaturan akses menu masing-masing.
           </p>
@@ -369,15 +427,25 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       </div>
 
       {feedback && (
-        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center justify-between gap-3">
+        <div
+          className={`p-3.5 rounded-xl border text-sm flex items-center justify-between gap-3 ${
+            feedback.ok
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              : 'bg-amber-50 border-amber-300 text-amber-950'
+          }`}
+        >
           <div className="flex items-center gap-2">
-            <Check className="w-4 h-4 text-emerald-700 shrink-0" />
-            <span>{feedback}</span>
+            {feedback.ok ? (
+              <Check className="w-4 h-4 text-emerald-700 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+            )}
+            <span>{feedback.text}</span>
           </div>
           <button
             type="button"
-            onClick={() => setFeedback('')}
-            className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer"
+            onClick={() => setFeedback(null)}
+            className="p-1 rounded-lg hover:bg-black/5 cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>
@@ -442,7 +510,7 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
               {staffAccounts.map((acc) => {
                 const isMainAdmin = acc.userId.toLowerCase() === 'admin';
                 const isSelf = acc.id === currentStaffId;
-                const pwdVisible = Boolean(revealedIds[acc.id]);
+                const hashed = isPasswordHashed(acc.password);
 
                 return (
                   <tr key={acc.id} className="hover:bg-slate-50/70 align-top">
@@ -462,22 +530,17 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
                     </td>
 
                     <td className="py-3 px-4 whitespace-nowrap">
-                      <div className="inline-flex items-center gap-1.5 font-mono text-xs bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-lg text-slate-800">
-                        <span>{pwdVisible ? acc.password : '••••••••'}</span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setRevealedIds((prev) => ({ ...prev, [acc.id]: !prev[acc.id] }))
-                          }
-                          title={pwdVisible ? 'Sembunyikan sandi' : 'Lihat sandi'}
-                          className="text-slate-500 hover:text-slate-800 cursor-pointer"
-                        >
-                          {pwdVisible ? (
-                            <EyeOff className="w-3.5 h-3.5" />
-                          ) : (
-                            <Eye className="w-3.5 h-3.5" />
-                          )}
-                        </button>
+                      <div
+                        className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border ${
+                          hashed
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                            : 'bg-slate-100 border-slate-200 text-slate-700'
+                        }`}
+                      >
+                        <KeyRound className="w-3.5 h-3.5 shrink-0" />
+                        <span className="font-semibold">
+                          {hashed ? 'Tersandi (SHA-256)' : '••••••••'}
+                        </span>
                       </div>
                     </td>
 
@@ -512,7 +575,21 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
                         type="button"
                         disabled={isMainAdmin || isSelf}
                         onClick={() =>
-                          void onUpsertStaff({ ...acc, isActive: !acc.isActive })
+                          void (async () => {
+                            const nextActive = !acc.isActive;
+                            const syncRes = await onUpsertStaff({ ...acc, isActive: nextActive });
+                            if (syncRes?.error) {
+                              setFeedback({
+                                ok: false,
+                                text: `Status "${acc.userId}" diubah secara lokal, namun gagal sinkron ke Cloud (${syncRes.error}).`,
+                              });
+                            } else if (syncRes?.synced) {
+                              setFeedback({
+                                ok: true,
+                                text: `Status akun "${acc.userId}" (${nextActive ? 'Aktif' : 'Nonaktif'}) tersinkron ke semua perangkat.`,
+                              });
+                            }
+                          })()
                         }
                         className={`px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
                           acc.isActive
@@ -538,7 +615,22 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
                         <button
                           type="button"
                           disabled={isMainAdmin || isSelf}
-                          onClick={() => void onDeleteStaff(acc.id)}
+                          onClick={() =>
+                            void (async () => {
+                              const syncRes = await onDeleteStaff(acc.id);
+                              if (syncRes?.error) {
+                                setFeedback({
+                                  ok: false,
+                                  text: `Akun "${acc.userId}" dihapus secara lokal, namun gagal terhapus di Cloud (${syncRes.error}).`,
+                                });
+                              } else if (syncRes?.synced) {
+                                setFeedback({
+                                  ok: true,
+                                  text: `Akun "${acc.userId}" berhasil dihapus dari lokal dan Database Cloud.`,
+                                });
+                              }
+                            })()
+                          }
                           title={
                             isMainAdmin
                               ? 'Akun admin utama tidak dapat dihapus'
@@ -627,15 +719,19 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
 
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Sandi / PIN Login
+                    {form.id ? 'Sandi / PIN Baru (Opsional)' : 'Sandi / PIN Login'}
                   </label>
                   <div className="relative">
                     <input
                       type={showPassword ? 'text' : 'password'}
-                      required
+                      required={!form.id}
                       value={form.password}
                       onChange={(e) => setForm((prev) => ({ ...prev, password: e.target.value }))}
-                      placeholder="Minimal 4 karakter"
+                      placeholder={
+                        form.id
+                          ? 'Kosongkan jika tidak mengubah sandi'
+                          : 'Minimal 4 karakter'
+                      }
                       className="w-full pl-3 pr-9 py-2 rounded-xl border border-slate-300 font-mono text-sm"
                     />
                     <button

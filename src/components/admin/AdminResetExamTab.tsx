@@ -19,6 +19,7 @@ import {
 interface AdminResetExamTabProps {
   schedules: ExamSchedule[];
   results: ExamResult[];
+  allowedSubjects?: string[];
   onResetExamResults: (resultIds: string[]) => Promise<void>;
 }
 
@@ -27,8 +28,15 @@ type ResetFilterMode = 'needs_unlock' | 'violation' | 'in_progress' | 'submitted
 export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
   schedules,
   results,
+  allowedSubjects,
   onResetExamResults,
 }) => {
+  const isRestrictedBySubject = Boolean(allowedSubjects && allowedSubjects.length > 0);
+  const normalizedAllowed = useMemo(
+    () => (allowedSubjects || []).map((s) => s.trim().toLowerCase()),
+    [allowedSubjects]
+  );
+
   const [filterMode, setFilterMode] = useState<ResetFilterMode>('needs_unlock');
   const [subjectFilter, setSubjectFilter] = useState<string>('ALL');
   const [classFilter, setClassFilter] = useState<string>('ALL');
@@ -38,35 +46,53 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
   const [isResetting, setIsResetting] = useState(false);
   const [feedback, setFeedback] = useState('');
 
+  const scopedSchedules = useMemo(() => {
+    if (!isRestrictedBySubject) return schedules;
+    return schedules.filter((s) =>
+      normalizedAllowed.includes(s.subject.trim().toLowerCase())
+    );
+  }, [schedules, isRestrictedBySubject, normalizedAllowed]);
+
+  const scopedResults = useMemo(() => {
+    if (!isRestrictedBySubject) return results;
+    return results.filter((r) =>
+      normalizedAllowed.includes((r.subject || '').trim().toLowerCase())
+    );
+  }, [results, isRestrictedBySubject, normalizedAllowed]);
+
   const subjects = useMemo(() => {
-    const set = new Set<string>(schedules.map((s) => s.subject));
-    results.forEach((r) => {
+    if (isRestrictedBySubject && allowedSubjects) {
+      return [...allowedSubjects].sort();
+    }
+    const set = new Set<string>(scopedSchedules.map((s) => s.subject));
+    scopedResults.forEach((r) => {
       if (r.subject) set.add(r.subject);
     });
     return Array.from(set).sort();
-  }, [schedules, results]);
+  }, [scopedSchedules, scopedResults, isRestrictedBySubject, allowedSubjects]);
 
   const counts = useMemo(() => {
-    const needsUnlock = results.filter(
+    const needsUnlock = scopedResults.filter(
       (r) => r.status === 'in_progress' || r.status === 'flagged' || r.tabSwitchCount > 0
     ).length;
-    const violation = results.filter(
+    const violation = scopedResults.filter(
       (r) => r.status === 'flagged' || r.tabSwitchCount > 0
     ).length;
-    const inProgress = results.filter((r) => r.status === 'in_progress').length;
-    const submitted = results.filter((r) => r.status === 'submitted').length;
+    const inProgress = scopedResults.filter((r) => r.status === 'in_progress').length;
+    const submitted = scopedResults.filter((r) => r.status === 'submitted').length;
     return {
       needsUnlock,
       violation,
       inProgress,
       submitted,
-      all: results.length,
+      all: scopedResults.length,
     };
-  }, [results]);
+  }, [scopedResults]);
 
   const filteredResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return results.filter((r) => {
+    const normSubjFilter = subjectFilter.trim().toLowerCase();
+    return scopedResults.filter((r) => {
       if (filterMode === 'needs_unlock') {
         if (r.status !== 'in_progress' && r.status !== 'flagged' && r.tabSwitchCount === 0) {
           return false;
@@ -79,7 +105,12 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
         if (r.status !== 'submitted') return false;
       }
 
-      if (subjectFilter !== 'ALL' && r.subject !== subjectFilter) return false;
+      if (
+        subjectFilter !== 'ALL' &&
+        (r.subject || '').trim().toLowerCase() !== normSubjFilter
+      ) {
+        return false;
+      }
       if (classFilter !== 'ALL' && r.className !== classFilter) return false;
       if (
         q &&
@@ -90,7 +121,7 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
       }
       return true;
     });
-  }, [results, filterMode, subjectFilter, classFilter, searchQuery]);
+  }, [scopedResults, filterMode, subjectFilter, classFilter, searchQuery]);
 
   const allVisibleSelected =
     filteredResults.length > 0 &&
@@ -132,8 +163,8 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
   };
 
   const selectedRecords = useMemo(
-    () => results.filter((r) => selectedIds.includes(r.id)),
-    [results, selectedIds]
+    () => scopedResults.filter((r) => selectedIds.includes(r.id)),
+    [scopedResults, selectedIds]
   );
 
   return (

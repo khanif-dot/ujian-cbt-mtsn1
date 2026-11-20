@@ -1,9 +1,5 @@
 import {
   ALL_ADMIN_TABS,
-  SEED_EXAM_RESULTS,
-  SEED_PARTICIPANTS,
-  SEED_QUESTIONS,
-  SEED_SCHEDULES,
   SEED_SCHOOL_PROFILE,
   SEED_STAFF_ACCOUNTS,
 } from '@/src/lib/seedData';
@@ -144,6 +140,186 @@ async function idbPut<T>(storeName: string, item: T): Promise<void> {
   });
 }
 
+// ============================================================================
+// SHA-256 PASSWORD HASHING (WEB CRYPTO + DETERMINISTIC LAN FALLBACK)
+// ============================================================================
+const HASH_PREFIX = 'sha256$';
+
+function sha256FallbackHex(ascii: string): string {
+  const rightRotate = (value: number, amount: number) => (value >>> amount) | (value << (32 - amount));
+  const mathPow = Math.pow;
+  const maxWord = mathPow(2, 32);
+  let result = '';
+  const words: number[] = [];
+  const encoded = unescape(encodeURIComponent(ascii));
+  const asciiBitLength = encoded.length * 8;
+
+  const hash: number[] = [];
+  const k: number[] = [];
+  let primeCounter = 0;
+  const isComposite: Record<number, boolean> = {};
+  for (let candidate = 2; primeCounter < 64; candidate++) {
+    if (!isComposite[candidate]) {
+      for (let i = 0; i < 313; i += candidate) {
+        isComposite[i] = true;
+      }
+      hash[primeCounter] = (mathPow(candidate, 0.5) * maxWord) | 0;
+      k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+    }
+  }
+
+  let msg = encoded + '\x80';
+  while ((msg.length % 64) - 56) msg += '\x00';
+  for (let i = 0; i < msg.length; i++) {
+    const j = msg.charCodeAt(i);
+    words[i >> 2] |= j << (((3 - i) % 4) * 8);
+  }
+  words[words.length] = (asciiBitLength / maxWord) | 0;
+  words[words.length] = asciiBitLength;
+
+  for (let j = 0; j < words.length; ) {
+    const w = words.slice(j, (j += 16));
+    const oldHash = hash.slice(0);
+    for (let i = 0; i < 64; i++) {
+      const w15 = w[i - 15];
+      const w2 = w[i - 2];
+      const a = hash[0];
+      const e = hash[4];
+      const temp1 =
+        hash[7] +
+        (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)) +
+        ((e & hash[5]) ^ (~e & hash[6])) +
+        k[i] +
+        (w[i] =
+          i < 16
+            ? w[i]
+            : (w[i - 16] +
+                (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3)) +
+                w[i - 7] +
+                (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))) |
+              0);
+      const temp2 =
+        (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)) +
+        ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+      hash[7] = hash[6];
+      hash[6] = hash[5];
+      hash[5] = hash[4];
+      hash[4] = (hash[3] + temp1) | 0;
+      hash[3] = hash[2];
+      hash[2] = hash[1];
+      hash[1] = hash[0];
+      hash[0] = (temp1 + temp2) | 0;
+    }
+    for (let i = 0; i < 8; i++) {
+      hash[i] = (hash[i] + oldHash[i]) | 0;
+    }
+  }
+  for (let i = 0; i < 8; i++) {
+    for (let j = 3; j + 1; j--) {
+      const b = (hash[i] >> (j * 8)) & 255;
+      result += (b < 16 ? '0' : '') + b.toString(16);
+    }
+  }
+  return result;
+}
+
+export function isPasswordHashed(value: string): boolean {
+  return value.startsWith(HASH_PREFIX);
+}
+
+export async function hashPassword(raw: string): Promise<string> {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (isPasswordHashed(trimmed)) return trimmed;
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.crypto?.subtle) {
+      const data = new TextEncoder().encode(trimmed);
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', data);
+      const bytes = Array.from(new Uint8Array(digest));
+      return HASH_PREFIX + bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {
+    // Fallback to deterministic JS SHA-256
+  }
+  return HASH_PREFIX + sha256FallbackHex(trimmed);
+}
+
+export async function verifyPassword(input: string, stored: string): Promise<boolean> {
+  const cleanInput = input.trim();
+  const cleanStored = (stored || '').trim();
+  if (!cleanInput || !cleanStored) return false;
+  if (isPasswordHashed(cleanStored)) {
+    const hashed = await hashPassword(cleanInput);
+    return hashed === cleanStored;
+  }
+  return cleanInput === cleanStored;
+}
+
+// ============================================================================
+// SERVER CLOCK OFFSET (ANTI MANIPULASI JAM PERANGKAT)
+// ============================================================================
+let serverClockOffsetMs = 0;
+let lastClockSyncMs = 0;
+
+export function getServerNowMs(): number {
+  return Date.now() + serverClockOffsetMs;
+}
+
+export function getServerClockOffsetMs(): number {
+  return serverClockOffsetMs;
+}
+
+export async function syncServerClock(force = false): Promise<number> {
+  if (!isLiveSupabaseConfigured()) return serverClockOffsetMs;
+  if (!force && Date.now() - lastClockSyncMs < 30_000) {
+    return serverClockOffsetMs;
+  }
+  try {
+    const supabase = getSupabaseClient();
+    const reqStart = Date.now();
+    const { data, error } = await supabase.rpc('get_server_time');
+    const reqEnd = Date.now();
+    if (!error && typeof data === 'string') {
+      const serverMs = new Date(data).getTime();
+      if (Number.isFinite(serverMs)) {
+        const midpoint = Math.round((reqStart + reqEnd) / 2);
+        serverClockOffsetMs = serverMs - midpoint;
+        lastClockSyncMs = Date.now();
+        return serverClockOffsetMs;
+      }
+    }
+  } catch {
+    // Fallback below using HTTP Date header
+  }
+
+  try {
+    const { url, anonKey } = getSupabaseConfig();
+    if (url && anonKey) {
+      const reqStart = Date.now();
+      const resp = await fetch(`${url.replace(/\/+$/, '')}/rest/v1/`, {
+        method: 'HEAD',
+        headers: { apikey: anonKey },
+      });
+      const reqEnd = Date.now();
+      const dateHeader = resp.headers.get('date');
+      if (dateHeader) {
+        const serverMs = new Date(dateHeader).getTime();
+        if (Number.isFinite(serverMs)) {
+          const midpoint = Math.round((reqStart + reqEnd) / 2);
+          serverClockOffsetMs = serverMs - midpoint;
+          lastClockSyncMs = Date.now();
+        }
+      }
+    }
+  } catch {
+    // Keep existing offset if offline
+  }
+  return serverClockOffsetMs;
+}
+
+// ============================================================================
+// INDEXEDDB SAFE HELPERS (ANTI CONSTRAINT ERROR)
+// ============================================================================
 async function idbPutMany<T>(storeName: string, items: T[], clearFirst = false): Promise<void> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -154,6 +330,83 @@ async function idbPutMany<T>(storeName: string, items: T[], clearFirst = false):
     }
     for (const item of items) {
       store.put(item);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbPutParticipantsSafe(items: Participant[], clearFirst = false): Promise<void> {
+  if (clearFirst) {
+    const dedup = new Map<string, Participant>();
+    for (const item of items) {
+      const key = item.participantNumber.trim().toUpperCase();
+      dedup.set(key, { ...item, participantNumber: item.participantNumber.trim() });
+    }
+    await idbPutMany(STORES.PARTICIPANTS, Array.from(dedup.values()), true);
+    return;
+  }
+
+  const existing = await idbGetAll<Participant>(STORES.PARTICIPANTS);
+  const byNumber = new Map<string, Participant>();
+  for (const row of existing) {
+    byNumber.set(row.participantNumber.trim().toUpperCase(), row);
+  }
+
+  const db = await openDB();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORES.PARTICIPANTS, 'readwrite');
+    const store = tx.objectStore(STORES.PARTICIPANTS);
+    for (const rawItem of items) {
+      const normNum = rawItem.participantNumber.trim().toUpperCase();
+      const conflict = byNumber.get(normNum);
+      if (conflict && conflict.id !== rawItem.id) {
+        store.delete(conflict.id);
+      }
+      const cleanItem: Participant = {
+        ...rawItem,
+        participantNumber: rawItem.participantNumber.trim(),
+      };
+      byNumber.set(normNum, cleanItem);
+      store.put(cleanItem);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbPutStaffSafe(items: StaffAccount[], clearFirst = false): Promise<void> {
+  if (clearFirst) {
+    const dedup = new Map<string, StaffAccount>();
+    for (const item of items) {
+      dedup.set(item.userId.trim().toLowerCase(), { ...item, userId: item.userId.trim() });
+    }
+    await idbPutMany(STORES.STAFF_ACCOUNTS, Array.from(dedup.values()), true);
+    return;
+  }
+
+  const existing = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+  const byUserId = new Map<string, StaffAccount>();
+  for (const row of existing) {
+    byUserId.set(row.userId.trim().toLowerCase(), row);
+  }
+
+  const db = await openDB();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORES.STAFF_ACCOUNTS, 'readwrite');
+    const store = tx.objectStore(STORES.STAFF_ACCOUNTS);
+    for (const rawItem of items) {
+      const normUser = rawItem.userId.trim().toLowerCase();
+      const conflict = byUserId.get(normUser);
+      if (conflict && conflict.id !== rawItem.id) {
+        store.delete(conflict.id);
+      }
+      const cleanItem: StaffAccount = {
+        ...rawItem,
+        userId: rawItem.userId.trim(),
+      };
+      byUserId.set(normUser, cleanItem);
+      store.put(cleanItem);
     }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
@@ -171,73 +424,119 @@ async function idbDelete(storeName: string, key: string): Promise<void> {
 }
 
 let initialized = false;
+let initPromise: Promise<void> | null = null;
 
 export async function ensureInitialized(): Promise<void> {
   if (initialized) return;
-  const initFlags = await idbGet<{ id: string; seeded: boolean }>(STORES.META, 'init_flags');
-  const existingProfile = await idbGet<SchoolProfile>(STORES.META, 'default');
-  const isFreshInstall = !initFlags && !existingProfile;
+  if (initPromise) return initPromise;
 
-  if (!existingProfile) {
-    await idbPut(STORES.META, SEED_SCHOOL_PROFILE);
-  } else if (!existingProfile.adminPassword) {
-    await idbPut(STORES.META, { ...existingProfile, adminPassword: 'admin123' });
-  }
+  initPromise = (async () => {
+    const initFlags = await idbGet<{ id: string; seeded: boolean }>(STORES.META, 'init_flags');
+    const existingProfile = await idbGet<SchoolProfile>(STORES.META, 'default');
 
-  if (isFreshInstall) {
-    await idbPutMany(STORES.PARTICIPANTS, SEED_PARTICIPANTS);
-    await idbPutMany(STORES.SCHEDULES, SEED_SCHEDULES);
-    await idbPutMany(STORES.QUESTIONS, SEED_QUESTIONS);
-    await idbPutMany(STORES.RESULTS, SEED_EXAM_RESULTS);
-  }
-
-  if (!initFlags) {
-    await idbPut(STORES.META, { id: 'init_flags', seeded: true });
-  }
-
-  const existingStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-  if (existingStaff.length === 0) {
-    const profilePwd = existingProfile?.adminPassword || SEED_SCHOOL_PROFILE.adminPassword;
-    await idbPutMany(
-      STORES.STAFF_ACCOUNTS,
-      SEED_STAFF_ACCOUNTS.map((acc) =>
-        acc.userId === 'admin' ? { ...acc, password: profilePwd } : acc
-      )
-    );
-  } else {
-    // Ensure main admin always has 'roles' tab access
-    const mainAdmin = existingStaff.find((s) => s.userId.toLowerCase() === 'admin');
-    if (mainAdmin && !mainAdmin.allowedTabs.includes('roles')) {
-      await idbPut(STORES.STAFF_ACCOUNTS, {
-        ...mainAdmin,
-        allowedTabs: ALL_ADMIN_TABS,
-      });
+    if (!existingProfile) {
+      await idbPut(STORES.META, SEED_SCHOOL_PROFILE);
+    } else if (!existingProfile.adminPassword) {
+      await idbPut(STORES.META, { ...existingProfile, adminPassword: 'admin123' });
     }
-  }
 
-  initialized = true;
+    if (!initFlags) {
+      await idbPut(STORES.META, { id: 'init_flags', seeded: true });
+    }
 
-  if (isLiveSupabaseConfigured()) {
-    void pullFromSupabaseSilent();
-  }
-}
+    const existingStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+    if (existingStaff.length === 0) {
+      const profilePwd = existingProfile?.adminPassword || SEED_SCHOOL_PROFILE.adminPassword;
+      const seededHashed = await Promise.all(
+        SEED_STAFF_ACCOUNTS.map(async (acc) => ({
+          ...acc,
+          password: await hashPassword(acc.userId === 'admin' ? profilePwd : acc.password),
+        }))
+      );
+      await idbPutStaffSafe(seededHashed);
+    } else {
+      const mainAdmin = existingStaff.find((s) => s.userId.toLowerCase() === 'admin');
+      if (mainAdmin && !mainAdmin.allowedTabs.includes('roles')) {
+        await idbPut(STORES.STAFF_ACCOUNTS, {
+          ...mainAdmin,
+          allowedTabs: ALL_ADMIN_TABS,
+        });
+      }
+    }
 
-export async function syncFromSupabase(): Promise<void> {
-  if (!isLiveSupabaseConfigured()) return;
-  await pullFromSupabaseSilent();
-}
+    initialized = true;
 
-async function pullFromSupabaseSilent(): Promise<void> {
+    if (isLiveSupabaseConfigured()) {
+      void syncServerClock();
+      void pullFromSupabaseSilent();
+    }
+  })();
+
   try {
+    await initPromise;
+  } finally {
+    initPromise = null;
+  }
+}
+
+let syncInFlight: Promise<void> | null = null;
+let lastSyncPullMs = 0;
+
+export async function syncFromSupabase(options?: {
+  force?: boolean;
+  currentParticipantNumber?: string;
+  isAdmin?: boolean;
+}): Promise<void> {
+  if (!isLiveSupabaseConfigured()) return;
+  const now = Date.now();
+  if (!options?.force && !syncInFlight && now - lastSyncPullMs < 1500) {
+    return;
+  }
+  if (syncInFlight) {
+    return syncInFlight;
+  }
+  syncInFlight = (async () => {
+    try {
+      await pullFromSupabaseSilent({
+        currentParticipantNumber: options?.currentParticipantNumber,
+        isAdmin: options?.isAdmin,
+      });
+      lastSyncPullMs = Date.now();
+    } finally {
+      syncInFlight = null;
+    }
+  })();
+  return syncInFlight;
+}
+
+function isMissingTableError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes('does not exist') ||
+    lower.includes('could not find') ||
+    lower.includes('relation') && lower.includes('not')
+  );
+}
+
+async function pullFromSupabaseSilent(options?: {
+  currentParticipantNumber?: string;
+  isAdmin?: boolean;
+}): Promise<void> {
+  try {
+    await syncServerClock();
     const supabase = getSupabaseClient();
-    const [profRes, schedRes, partRes, resRes] = await Promise.all([
+    const adminClient = getSupabaseAdminClient();
+    const [profRes, schedRes, partRes, resRes, staffRes] = await Promise.all([
       supabase.from('school_profile').select('*').eq('id', 'default').maybeSingle(),
       supabase.from('exam_schedules').select('*'),
       supabase.from('participants').select('*'),
       supabase.from('exam_results').select('*'),
+      supabase.from('staff_accounts').select('*'),
     ]);
 
-    if (profRes.data) {
+    const hasCloudProfile = Boolean(!profRes.error && profRes.data);
+
+    if (hasCloudProfile && profRes.data) {
       await idbPut(STORES.META, {
         id: 'default',
         schoolName: profRes.data.school_name,
@@ -252,46 +551,58 @@ async function pullFromSupabaseSilent(): Promise<void> {
       } satisfies SchoolProfile);
     }
 
-    if (schedRes.data && schedRes.data.length > 0) {
-      await idbPutMany(
-        STORES.SCHEDULES,
-        schedRes.data.map((r) => ({
-          id: r.id,
-          title: r.title,
-          subject: r.subject,
-          kkm: Number(r.kkm ?? 75),
-          durationMinutes: r.duration_minutes,
-          targetClasses: r.target_classes,
-          isActive: r.is_active,
-          randomizeQuestions: Boolean(r.randomize_questions ?? false),
-          maxTabSwitches: r.max_tab_switches,
-          createdAt: r.created_at,
-        }))
-      );
+    if (!schedRes.error && Array.isArray(schedRes.data)) {
+      if (schedRes.data.length > 0 || hasCloudProfile) {
+        await idbPutMany(
+          STORES.SCHEDULES,
+          schedRes.data.map((r) => ({
+            id: r.id,
+            title: r.title,
+            subject: r.subject,
+            kkm: Number(r.kkm ?? 75),
+            durationMinutes: r.duration_minutes,
+            targetClasses: r.target_classes,
+            isActive: r.is_active,
+            randomizeQuestions: Boolean(r.randomize_questions ?? false),
+            maxTabSwitches: r.max_tab_switches,
+            createdAt: r.created_at,
+          })),
+          true
+        );
+      }
     }
 
-    if (partRes.data && partRes.data.length > 0) {
-      await idbPutMany(
-        STORES.PARTICIPANTS,
-        partRes.data.map((r) => ({
-          id: r.id,
-          participantNumber: r.participant_number,
-          token: r.token || 'CBT2026',
-          fullName: r.full_name,
-          className: r.class_name,
-          isActive: r.is_active,
-          createdAt: r.created_at,
-        }))
-      );
+    if (!partRes.error && Array.isArray(partRes.data)) {
+      if (partRes.data.length > 0 || hasCloudProfile) {
+        await idbPutParticipantsSafe(
+          partRes.data.map((r) => ({
+            id: String(r.id),
+            participantNumber: r.participant_number,
+            token: r.token || 'CBT2026',
+            fullName: r.full_name,
+            className: r.class_name,
+            isActive: r.is_active,
+            createdAt: r.created_at,
+          })),
+          true
+        );
+      }
     }
 
-    if (resRes.data && resRes.data.length > 0) {
+    if (!resRes.error && Array.isArray(resRes.data)) {
       const localResults = await idbGetAll<ExamResult>(STORES.RESULTS);
-      const pendingIdSet = new Set(
-        localResults.filter((lr) => lr.syncStatus === 'pending').map((lr) => lr.id)
+      const pendingLocals = localResults.filter((lr) => lr.syncStatus === 'pending');
+      const pendingKeySet = new Set(
+        pendingLocals.map((lr) => `${lr.participantNumber.trim().toUpperCase()}::${lr.examId}`)
       );
-      const mergedResults = resRes.data
-        .filter((r) => !pendingIdSet.has(r.id))
+
+      const cloudResults: ExamResult[] = resRes.data
+        .filter(
+          (r) =>
+            !pendingKeySet.has(
+              `${String(r.participant_number || '').trim().toUpperCase()}::${r.exam_id}`
+            )
+        )
         .map((r) => ({
           id: r.id,
           participantId: r.participant_id,
@@ -303,6 +614,7 @@ async function pullFromSupabaseSilent(): Promise<void> {
           subject: r.subject || '',
           answers: r.answers || {},
           flaggedQuestions: r.flagged_questions || [],
+          questionIds: Array.isArray(r.question_ids) ? r.question_ids : undefined,
           correctCount: r.correct_count,
           totalQuestions: r.total_questions,
           score: Number(r.score),
@@ -312,16 +624,69 @@ async function pullFromSupabaseSilent(): Promise<void> {
           submittedAt: r.submitted_at,
           syncStatus: 'synced' as const,
         }));
-      if (mergedResults.length > 0) {
-        await idbPutMany(STORES.RESULTS, mergedResults);
-      }
-      if (pendingIdSet.size > 0) {
+
+      await idbPutMany(STORES.RESULTS, [...cloudResults, ...pendingLocals], true);
+
+      if (pendingLocals.length > 0) {
         void flushPendingSyncQueue();
       }
     }
 
+    if (!staffRes.error && Array.isArray(staffRes.data) && staffRes.data.length > 0) {
+      const mappedStaff: StaffAccount[] = staffRes.data.map((s) => ({
+        id: String(s.id),
+        userId: String(s.user_id),
+        name: String(s.name),
+        password: String(s.password_hash || ''),
+        roleType: s.role_type,
+        roleLabel: String(s.role_label || 'Staff'),
+        allowedTabs: Array.isArray(s.allowed_tabs) ? s.allowed_tabs : [],
+        assignedSubjects: Array.isArray(s.assigned_subjects) ? s.assigned_subjects : [],
+        restrictToAssignedSubjects: Boolean(s.restrict_to_assigned_subjects),
+        isActive: Boolean(s.is_active),
+        createdAt: s.created_at,
+      }));
+      const hasCloudAdmin = mappedStaff.some(
+        (s) => s.userId.trim().toLowerCase() === 'admin'
+      );
+      if (!hasCloudAdmin) {
+        const localStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+        const localAdmin = localStaff.find(
+          (s) => s.userId.trim().toLowerCase() === 'admin'
+        );
+        if (localAdmin) {
+          mappedStaff.unshift(localAdmin);
+        }
+      }
+      await idbPutStaffSafe(mappedStaff, true);
+    }
+
+    if (options?.isAdmin && adminClient) {
+      const qRes = await adminClient.from('questions').select('*');
+      if (!qRes.error && Array.isArray(qRes.data) && (qRes.data.length > 0 || hasCloudProfile)) {
+        await idbPutMany(
+          STORES.QUESTIONS,
+          qRes.data.map((q) => ({
+            id: q.id,
+            subject: q.subject,
+            targetClasses: q.target_classes || [],
+            questionText: q.question_text,
+            questionImageUrl: q.question_image_url || undefined,
+            options: q.options || [],
+            correctAnswer: q.correct_answer,
+            points: Number(q.points ?? 1),
+            orderIndex: Number(q.order_index ?? 1),
+          })),
+          true
+        );
+      }
+    }
+
     broadcastDataChange('supabase_pull');
-    void autoFinalizeExpiredExams();
+    void autoFinalizeExpiredExams({
+      currentParticipantNumber: options?.currentParticipantNumber,
+      isAdmin: options?.isAdmin,
+    });
   } catch {
     // Keep operating cleanly with Local-First IndexedDB cache
   }
@@ -341,11 +706,40 @@ export async function saveSchoolProfile(profile: SchoolProfile): Promise<void> {
   const updated: SchoolProfile = { ...profile, id: 'default', updatedAt: new Date().toISOString() };
   await idbPut(STORES.META, updated);
 
-  // Keep primary 'admin' staff account password in sync
+  // Keep primary 'admin' staff account password in sync (hashed in staff_accounts)
   const staffList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-  const mainAdmin = staffList.find((s) => s.userId.toLowerCase() === 'admin');
-  if (mainAdmin && mainAdmin.password !== updated.adminPassword) {
-    await idbPut(STORES.STAFF_ACCOUNTS, { ...mainAdmin, password: updated.adminPassword });
+  const existingAdmin = staffList.find((s) => s.userId.toLowerCase() === 'admin');
+  const hashedAdminPwd = await hashPassword(updated.adminPassword);
+  const baseAdmin = existingAdmin || {
+    ...SEED_STAFF_ACCOUNTS[0],
+    allowedTabs: ALL_ADMIN_TABS,
+  };
+  if (!existingAdmin || existingAdmin.password !== hashedAdminPwd) {
+    const updatedAdmin: StaffAccount = { ...baseAdmin, password: hashedAdminPwd };
+    await idbPutStaffSafe([updatedAdmin]);
+    if (isLiveSupabaseConfigured()) {
+      try {
+        const supabase = getSupabaseClient();
+        await supabase.from('staff_accounts').upsert(
+          {
+            id: updatedAdmin.id,
+            user_id: updatedAdmin.userId,
+            name: updatedAdmin.name,
+            password_hash: updatedAdmin.password,
+            role_type: updatedAdmin.roleType,
+            role_label: updatedAdmin.roleLabel,
+            allowed_tabs: updatedAdmin.allowedTabs,
+            assigned_subjects: updatedAdmin.assignedSubjects,
+            restrict_to_assigned_subjects: updatedAdmin.restrictToAssignedSubjects,
+            is_active: updatedAdmin.isActive,
+            created_at: updatedAdmin.createdAt,
+          },
+          { onConflict: 'user_id' }
+        );
+      } catch {
+        // Ignore if staff_accounts table not yet migrated
+      }
+    }
   }
 
   broadcastDataChange('profile');
@@ -384,36 +778,142 @@ export async function getStaffAccounts(): Promise<StaffAccount[]> {
   });
 }
 
-export async function upsertStaffAccount(account: StaffAccount): Promise<void> {
+export async function upsertStaffAccount(
+  account: StaffAccount
+): Promise<{ synced: boolean; error?: string }> {
   await ensureInitialized();
+  const rawPassword = account.password.trim();
+  const hashedPassword = rawPassword ? await hashPassword(rawPassword) : '';
   const normalized: StaffAccount = {
     ...account,
     userId: account.userId.trim(),
+    password: hashedPassword,
   };
-  await idbPut(STORES.STAFF_ACCOUNTS, normalized);
+  await idbPutStaffSafe([normalized]);
 
-  if (normalized.userId.toLowerCase() === 'admin') {
+  if (normalized.userId.toLowerCase() === 'admin' && rawPassword && !isPasswordHashed(rawPassword)) {
     const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
-    if (profile && profile.adminPassword !== normalized.password) {
-      await idbPut(STORES.META, {
+    if (profile && profile.adminPassword !== rawPassword) {
+      const updatedProfile = {
         ...profile,
-        adminPassword: normalized.password,
+        adminPassword: rawPassword,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      await idbPut(STORES.META, updatedProfile);
+      if (isLiveSupabaseConfigured()) {
+        try {
+          const supabase = getSupabaseClient();
+          await supabase
+            .from('school_profile')
+            .update({ admin_password: rawPassword, updated_at: updatedProfile.updatedAt })
+            .eq('id', 'default');
+        } catch {
+          // Cached locally
+        }
+      }
+    }
+  }
+
+  let synced = false;
+  let syncError: string | undefined;
+
+  if (isLiveSupabaseConfigured()) {
+    try {
+      const supabase = getSupabaseClient();
+      const { error } = await supabase.from('staff_accounts').upsert(
+        {
+          id: normalized.id,
+          user_id: normalized.userId,
+          name: normalized.name,
+          password_hash: normalized.password,
+          role_type: normalized.roleType,
+          role_label: normalized.roleLabel,
+          allowed_tabs: normalized.allowedTabs,
+          assigned_subjects: normalized.assignedSubjects,
+          restrict_to_assigned_subjects: normalized.restrictToAssignedSubjects,
+          is_active: normalized.isActive,
+          created_at: normalized.createdAt,
+        },
+        { onConflict: 'user_id' }
+      );
+      if (error) {
+        syncError = error.message;
+      } else {
+        synced = true;
+        // Pastikan akun 'admin' utama juga tersimpan di cloud jika sebelumnya tabel masih kosong
+        if (normalized.userId.toLowerCase() !== 'admin') {
+          const { data: cloudAdmin } = await supabase
+            .from('staff_accounts')
+            .select('id')
+            .ilike('user_id', 'admin')
+            .maybeSingle();
+          if (!cloudAdmin) {
+            const localStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+            const localAdmin = localStaff.find(
+              (s) => s.userId.trim().toLowerCase() === 'admin'
+            );
+            if (localAdmin) {
+              await supabase.from('staff_accounts').upsert(
+                {
+                  id: localAdmin.id,
+                  user_id: localAdmin.userId,
+                  name: localAdmin.name,
+                  password_hash: await hashPassword(localAdmin.password),
+                  role_type: localAdmin.roleType,
+                  role_label: localAdmin.roleLabel,
+                  allowed_tabs: localAdmin.allowedTabs,
+                  assigned_subjects: localAdmin.assignedSubjects,
+                  restrict_to_assigned_subjects: localAdmin.restrictToAssignedSubjects,
+                  is_active: localAdmin.isActive,
+                  created_at: localAdmin.createdAt,
+                },
+                { onConflict: 'user_id' }
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      syncError = err instanceof Error ? err.message : 'Gagal terhubung ke Supabase';
     }
   }
 
   broadcastDataChange('staff_accounts');
+  return { synced, error: syncError };
 }
 
-export async function deleteStaffAccount(id: string): Promise<void> {
+export async function deleteStaffAccount(
+  id: string
+): Promise<{ synced: boolean; error?: string }> {
   await ensureInitialized();
   const existing = await idbGet<StaffAccount>(STORES.STAFF_ACCOUNTS, id);
   if (existing && existing.userId.toLowerCase() === 'admin') {
-    return;
+    return { synced: true };
   }
   await idbDelete(STORES.STAFF_ACCOUNTS, id);
+
+  let synced = false;
+  let syncError: string | undefined;
+
+  if (isLiveSupabaseConfigured()) {
+    try {
+      const supabase = getSupabaseClient();
+      const { error: idErr } = await supabase.from('staff_accounts').delete().eq('id', id);
+      if (idErr) {
+        syncError = idErr.message;
+      } else {
+        if (existing?.userId) {
+          await supabase.from('staff_accounts').delete().ilike('user_id', existing.userId);
+        }
+        synced = true;
+      }
+    } catch (err) {
+      syncError = err instanceof Error ? err.message : 'Gagal terhubung ke Supabase';
+    }
+  }
+
   broadcastDataChange('staff_accounts');
+  return { synced, error: syncError };
 }
 
 export async function authenticateStaff(
@@ -431,8 +931,55 @@ export async function authenticateStaff(
     return { ok: false, staff: null, message: 'Masukkan Sandi / PIN terlebih dahulu.' };
   }
 
+  if (isLiveSupabaseConfigured()) {
+    try {
+      const supabase = getSupabaseClient();
+      const { data: remoteStaff, error: staffErr } = await supabase
+        .from('staff_accounts')
+        .select('*')
+        .ilike('user_id', normId)
+        .maybeSingle();
+
+      if (!staffErr && remoteStaff) {
+        const mapped: StaffAccount = {
+          id: String(remoteStaff.id),
+          userId: String(remoteStaff.user_id),
+          name: String(remoteStaff.name),
+          password: String(remoteStaff.password_hash || ''),
+          roleType: remoteStaff.role_type,
+          roleLabel: String(remoteStaff.role_label || 'Staff'),
+          allowedTabs: Array.isArray(remoteStaff.allowed_tabs) ? remoteStaff.allowed_tabs : [],
+          assignedSubjects: Array.isArray(remoteStaff.assigned_subjects)
+            ? remoteStaff.assigned_subjects
+            : [],
+          restrictToAssignedSubjects: Boolean(remoteStaff.restrict_to_assigned_subjects),
+          isActive: Boolean(remoteStaff.is_active),
+          createdAt: remoteStaff.created_at,
+        };
+        await idbPutStaffSafe([mapped]);
+      } else if (normId === 'admin') {
+        const { data: prof } = await supabase
+          .from('school_profile')
+          .select('admin_password')
+          .eq('id', 'default')
+          .maybeSingle();
+        if (prof?.admin_password) {
+          const localList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+          const localAdmin = localList.find((acc) => acc.userId.trim().toLowerCase() === 'admin');
+          if (localAdmin) {
+            await idbPutStaffSafe([
+              { ...localAdmin, password: await hashPassword(prof.admin_password) },
+            ]);
+          }
+        }
+      }
+    } catch {
+      // Fallback to local cache when offline
+    }
+  }
+
   const list = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-  const matched = list.find((acc) => acc.userId.trim().toLowerCase() === normId);
+  let matched = list.find((acc) => acc.userId.trim().toLowerCase() === normId);
 
   if (!matched) {
     return { ok: false, staff: null, message: `ID "${rawUserId.trim()}" tidak ditemukan.` };
@@ -444,8 +991,25 @@ export async function authenticateStaff(
       message: `Akun dengan ID "${matched.userId}" sedang dinonaktifkan oleh Administrator.`,
     };
   }
-  if (matched.password !== pwd) {
+
+  let valid = await verifyPassword(pwd, matched.password);
+  if (!valid && normId === 'admin') {
+    const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
+    if (profile && (await verifyPassword(pwd, profile.adminPassword))) {
+      valid = true;
+      matched = { ...matched, password: await hashPassword(pwd) };
+      await idbPutStaffSafe([matched]);
+    }
+  }
+
+  if (!valid) {
     return { ok: false, staff: null, message: 'Sandi / PIN tidak sesuai.' };
+  }
+
+  // Upgrade legacy plaintext stored hash transparently
+  if (!isPasswordHashed(matched.password)) {
+    matched = { ...matched, password: await hashPassword(matched.password) };
+    await idbPutStaffSafe([matched]);
   }
 
   return { ok: true, staff: matched };
@@ -466,24 +1030,28 @@ export async function getParticipants(): Promise<Participant[]> {
 
 export async function upsertParticipants(items: Participant[]): Promise<void> {
   await ensureInitialized();
-  await idbPutMany(STORES.PARTICIPANTS, items);
+  await idbPutParticipantsSafe(items);
   broadcastDataChange('participants');
 
   if (isLiveSupabaseConfigured()) {
     try {
       const supabase = getSupabaseClient();
-      await supabase.from('participants').upsert(
-        items.map((p) => ({
-          id: p.id,
-          participant_number: p.participantNumber,
-          token: p.token,
-          full_name: p.fullName,
-          class_name: p.className,
-          is_active: p.isActive,
-          created_at: p.createdAt,
-        })),
-        { onConflict: 'participant_number' }
-      );
+      const CHUNK = 200;
+      for (let i = 0; i < items.length; i += CHUNK) {
+        const chunk = items.slice(i, i + CHUNK);
+        await supabase.from('participants').upsert(
+          chunk.map((p) => ({
+            id: p.id,
+            participant_number: p.participantNumber.trim(),
+            token: p.token,
+            full_name: p.fullName,
+            class_name: p.className,
+            is_active: p.isActive,
+            created_at: p.createdAt,
+          })),
+          { onConflict: 'participant_number' }
+        );
+      }
     } catch {
       // Local-first persists regardless
     }
@@ -571,7 +1139,7 @@ export async function validateParticipantAndToken(
           createdAt: data.created_at,
         };
         source = 'supabase';
-        await idbPut(STORES.PARTICIPANTS, found);
+        await idbPutParticipantsSafe([found]);
       }
     } catch {
       // Fallback to local cache
@@ -931,65 +1499,80 @@ export async function checkStudentExamLock(
   schedule: ExamSchedule
 ): Promise<{
   locked: boolean;
-  reason: 'in_progress' | 'flagged' | 'submitted' | null;
+  reason: 'in_progress' | 'flagged' | 'submitted' | 'network_error' | null;
   result: ExamResult | null;
+  errorMessage?: string;
 }> {
   await ensureInitialized();
   const normNum = participantNumber.trim().toUpperCase();
-  const normSubj = schedule.subject.trim().toLowerCase();
 
   let matched: ExamResult | null = null;
+  let checkedRemote = false;
 
   if (isLiveSupabaseConfigured()) {
+    await syncServerClock();
     try {
       const supabase = getSupabaseClient();
       const { data, error } = await supabase
         .from('exam_results')
         .select('*')
-        .ilike('participant_number', normNum);
+        .ilike('participant_number', normNum)
+        .eq('exam_id', schedule.id);
 
-      if (!error && Array.isArray(data)) {
-        const remoteMatch = data.find(
-          (r) =>
-            r.exam_id === schedule.id ||
-            String(r.subject || '').trim().toLowerCase() === normSubj
-        );
-        if (remoteMatch) {
-          matched = {
-            id: remoteMatch.id,
-            participantId: remoteMatch.participant_id,
-            participantNumber: remoteMatch.participant_number,
-            studentName: remoteMatch.student_name,
-            className: remoteMatch.class_name,
-            examId: remoteMatch.exam_id,
-            examTitle: remoteMatch.exam_title,
-            subject: remoteMatch.subject || '',
-            answers: remoteMatch.answers || {},
-            flaggedQuestions: remoteMatch.flagged_questions || [],
-            correctCount: remoteMatch.correct_count,
-            totalQuestions: remoteMatch.total_questions,
-            score: Number(remoteMatch.score),
-            tabSwitchCount: remoteMatch.tab_switch_count,
-            status: remoteMatch.status,
-            startedAt: remoteMatch.started_at,
-            submittedAt: remoteMatch.submitted_at,
-            syncStatus: 'synced',
-          };
-          await idbPut(STORES.RESULTS, matched);
-        }
+      if (error) {
+        return {
+          locked: true,
+          reason: 'network_error',
+          result: null,
+          errorMessage: `Gagal memverifikasi status ujian ke server: ${error.message}. Periksa koneksi lalu coba lagi.`,
+        };
+      }
+
+      checkedRemote = true;
+      if (Array.isArray(data) && data.length > 0) {
+        const remoteMatch = data[0];
+        matched = {
+          id: remoteMatch.id,
+          participantId: remoteMatch.participant_id,
+          participantNumber: remoteMatch.participant_number,
+          studentName: remoteMatch.student_name,
+          className: remoteMatch.class_name,
+          examId: remoteMatch.exam_id,
+          examTitle: remoteMatch.exam_title,
+          subject: remoteMatch.subject || '',
+          answers: remoteMatch.answers || {},
+          flaggedQuestions: remoteMatch.flagged_questions || [],
+          questionIds: Array.isArray(remoteMatch.question_ids)
+            ? remoteMatch.question_ids
+            : undefined,
+          correctCount: remoteMatch.correct_count,
+          totalQuestions: remoteMatch.total_questions,
+          score: Number(remoteMatch.score),
+          tabSwitchCount: remoteMatch.tab_switch_count,
+          status: remoteMatch.status,
+          startedAt: remoteMatch.started_at,
+          submittedAt: remoteMatch.submitted_at,
+          syncStatus: 'synced',
+        };
+        await idbPut(STORES.RESULTS, matched);
       }
     } catch {
-      // Fallback to local cache
+      return {
+        locked: true,
+        reason: 'network_error',
+        result: null,
+        errorMessage:
+          'Koneksi ke server terputus saat memeriksa status ujian. Silakan coba lagi beberapa detik lagi.',
+      };
     }
   }
 
-  if (!matched) {
+  if (!matched && !checkedRemote) {
     const localList = await idbGetAll<ExamResult>(STORES.RESULTS);
     matched =
       localList.find(
         (r) =>
-          r.participantNumber.trim().toUpperCase() === normNum &&
-          (r.examId === schedule.id || r.subject.trim().toLowerCase() === normSubj)
+          r.participantNumber.trim().toUpperCase() === normNum && r.examId === schedule.id
       ) || null;
   }
 
@@ -1000,7 +1583,10 @@ export async function checkStudentExamLock(
   if (matched.status === 'in_progress') {
     const startedMs = new Date(matched.startedAt).getTime();
     const durationMs = Math.max(1, schedule.durationMinutes) * 60 * 1000;
-    if (Number.isFinite(startedMs) && Date.now() >= startedMs + durationMs + EXPIRY_GRACE_MS) {
+    if (
+      Number.isFinite(startedMs) &&
+      getServerNowMs() >= startedMs + durationMs + EXPIRY_GRACE_MS
+    ) {
       matched = await finalizeExamResultRecord(matched, {
         maxTabSwitches: schedule.maxTabSwitches,
         skipIfFinalized: true,
@@ -1014,6 +1600,166 @@ export async function checkStudentExamLock(
     reason: matched.status,
     result: matched,
   };
+}
+
+export async function verifyStudentCanStartExam(
+  participantNumber: string,
+  scheduleId: string
+): Promise<{
+  ok: boolean;
+  participant?: Participant;
+  schedule?: ExamSchedule;
+  message?: string;
+}> {
+  await ensureInitialized();
+  const normNum = participantNumber.trim().toUpperCase();
+
+  if (isLiveSupabaseConfigured()) {
+    try {
+      const supabase = getSupabaseClient();
+      const [pRes, sRes] = await Promise.all([
+        supabase
+          .from('participants')
+          .select('*')
+          .ilike('participant_number', normNum)
+          .maybeSingle(),
+        supabase.from('exam_schedules').select('*').eq('id', scheduleId).maybeSingle(),
+      ]);
+
+      if (pRes.error || sRes.error) {
+        return {
+          ok: false,
+          message: 'Gagal memverifikasi status peserta/jadwal ke server. Coba lagi.',
+        };
+      }
+      if (!pRes.data || !pRes.data.is_active) {
+        return {
+          ok: false,
+          message: 'Akun peserta Anda sedang dinonaktifkan atau dihapus oleh Panitia.',
+        };
+      }
+      if (!sRes.data || !sRes.data.is_active) {
+        return {
+          ok: false,
+          message: 'Jadwal ujian ini sudah ditutup atau dinonaktifkan oleh Panitia.',
+        };
+      }
+
+      const freshParticipant: Participant = {
+        id: String(pRes.data.id),
+        participantNumber: pRes.data.participant_number,
+        token: pRes.data.token || 'CBT2026',
+        fullName: pRes.data.full_name,
+        className: pRes.data.class_name,
+        isActive: Boolean(pRes.data.is_active),
+        createdAt: pRes.data.created_at,
+      };
+      const freshSchedule: ExamSchedule = {
+        id: sRes.data.id,
+        title: sRes.data.title,
+        subject: sRes.data.subject,
+        kkm: Number(sRes.data.kkm ?? 75),
+        durationMinutes: sRes.data.duration_minutes,
+        targetClasses: sRes.data.target_classes,
+        isActive: Boolean(sRes.data.is_active),
+        randomizeQuestions: Boolean(sRes.data.randomize_questions ?? false),
+        maxTabSwitches: sRes.data.max_tab_switches,
+        createdAt: sRes.data.created_at,
+      };
+
+      if (!freshSchedule.targetClasses.includes(freshParticipant.className)) {
+        return {
+          ok: false,
+          message: `Kelas ${freshParticipant.className} tidak terdaftar pada jadwal ujian ini.`,
+        };
+      }
+
+      await idbPutParticipantsSafe([freshParticipant]);
+      await idbPut(STORES.SCHEDULES, freshSchedule);
+
+      return { ok: true, participant: freshParticipant, schedule: freshSchedule };
+    } catch {
+      return {
+        ok: false,
+        message: 'Koneksi ke server terputus saat memverifikasi jadwal ujian.',
+      };
+    }
+  }
+
+  const [parts, scheds] = await Promise.all([
+    idbGetAll<Participant>(STORES.PARTICIPANTS),
+    idbGetAll<ExamSchedule>(STORES.SCHEDULES),
+  ]);
+  const participant = parts.find(
+    (p) => p.participantNumber.trim().toUpperCase() === normNum && p.isActive
+  );
+  const schedule = scheds.find((s) => s.id === scheduleId && s.isActive);
+
+  if (!participant) {
+    return { ok: false, message: 'Akun peserta tidak aktif atau tidak ditemukan.' };
+  }
+  if (!schedule) {
+    return { ok: false, message: 'Jadwal ujian tidak aktif atau telah ditutup.' };
+  }
+  if (!schedule.targetClasses.includes(participant.className)) {
+    return { ok: false, message: 'Kelas Anda tidak termasuk sasaran jadwal ujian ini.' };
+  }
+
+  return { ok: true, participant, schedule };
+}
+
+export async function checkLiveSessionStatusFromCloud(
+  participantNumber: string,
+  examId: string
+): Promise<{
+  status: 'ok' | 'finalized' | 'reset_deleted' | 'offline';
+  result?: ExamResult;
+}> {
+  if (!isLiveSupabaseConfigured()) {
+    return { status: 'offline' };
+  }
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from('exam_results')
+      .select('*')
+      .ilike('participant_number', participantNumber.trim().toUpperCase())
+      .eq('exam_id', examId)
+      .maybeSingle();
+
+    if (error) return { status: 'offline' };
+    if (!data) {
+      return { status: 'reset_deleted' };
+    }
+    const mapped: ExamResult = {
+      id: data.id,
+      participantId: data.participant_id,
+      participantNumber: data.participant_number,
+      studentName: data.student_name,
+      className: data.class_name,
+      examId: data.exam_id,
+      examTitle: data.exam_title,
+      subject: data.subject || '',
+      answers: data.answers || {},
+      flaggedQuestions: data.flagged_questions || [],
+      questionIds: Array.isArray(data.question_ids) ? data.question_ids : undefined,
+      correctCount: data.correct_count,
+      totalQuestions: data.total_questions,
+      score: Number(data.score),
+      tabSwitchCount: data.tab_switch_count,
+      status: data.status,
+      startedAt: data.started_at,
+      submittedAt: data.submitted_at,
+      syncStatus: 'synced',
+    };
+    if (mapped.status === 'submitted' || mapped.status === 'flagged') {
+      await idbPut(STORES.RESULTS, mapped);
+      return { status: 'finalized', result: mapped };
+    }
+    return { status: 'ok', result: mapped };
+  } catch {
+    return { status: 'offline' };
+  }
 }
 
 const DASHBOARD_HIDDEN_LOGS_META_ID = 'dashboard_hidden_logs';
@@ -1216,14 +1962,128 @@ export async function resetBulkExamResults(resultIds: string[]): Promise<void> {
   await deleteExamResultsBatch(resultIds);
 }
 
-async function pushResultToSupabase(result: ExamResult): Promise<boolean> {
+async function pushResultToSupabase(
+  result: ExamResult
+): Promise<{ ok: boolean; finalizedFromServer?: ExamResult }> {
   if (!isLiveSupabaseConfigured()) {
-    return false;
+    return { ok: false };
   }
   try {
     const supabase = getSupabaseClient();
-    const { error } = await supabase.from('exam_results').upsert(
-      {
+
+    if (result.status === 'in_progress' && result.submittedAt === null) {
+      const { data: rpcData, error: rpcError } = await supabase.rpc('upsert_exam_progress', {
+        p_result_id: result.id,
+        p_participant_id: result.participantId,
+        p_participant_number: result.participantNumber,
+        p_student_name: result.studentName,
+        p_class_name: result.className,
+        p_exam_id: result.examId,
+        p_exam_title: result.examTitle,
+        p_subject: result.subject,
+        p_answers: result.answers,
+        p_flagged_questions: result.flaggedQuestions,
+        p_total_questions: result.totalQuestions,
+        p_tab_switch_count: result.tabSwitchCount,
+        p_started_at: result.startedAt,
+        p_question_ids: result.questionIds || null,
+      });
+
+      if (!rpcError && Array.isArray(rpcData) && rpcData[0]) {
+        if (rpcData[0].applied === true) {
+          return { ok: true };
+        }
+        const { data: serverRow } = await supabase
+          .from('exam_results')
+          .select('*')
+          .ilike('participant_number', result.participantNumber)
+          .eq('exam_id', result.examId)
+          .maybeSingle();
+
+        if (serverRow) {
+          const mapped: ExamResult = {
+            id: serverRow.id,
+            participantId: serverRow.participant_id,
+            participantNumber: serverRow.participant_number,
+            studentName: serverRow.student_name,
+            className: serverRow.class_name,
+            examId: serverRow.exam_id,
+            examTitle: serverRow.exam_title,
+            subject: serverRow.subject || '',
+            answers: serverRow.answers || {},
+            flaggedQuestions: serverRow.flagged_questions || [],
+            questionIds: Array.isArray(serverRow.question_ids)
+              ? serverRow.question_ids
+              : undefined,
+            correctCount: serverRow.correct_count,
+            totalQuestions: serverRow.total_questions,
+            score: Number(serverRow.score),
+            tabSwitchCount: serverRow.tab_switch_count,
+            status: serverRow.status,
+            startedAt: serverRow.started_at,
+            submittedAt: serverRow.submitted_at,
+            syncStatus: 'synced',
+          };
+          return { ok: false, finalizedFromServer: mapped };
+        }
+        return { ok: false };
+      }
+
+      // Fallback when upsert_exam_progress RPC hasn't been deployed on Supabase yet
+      const { data: existingRow, error: checkErr } = await supabase
+        .from('exam_results')
+        .select('*')
+        .ilike('participant_number', result.participantNumber)
+        .eq('exam_id', result.examId)
+        .maybeSingle();
+
+      if (checkErr) return { ok: false };
+
+      if (existingRow) {
+        if (existingRow.status !== 'in_progress' || existingRow.submitted_at !== null) {
+          const mapped: ExamResult = {
+            id: existingRow.id,
+            participantId: existingRow.participant_id,
+            participantNumber: existingRow.participant_number,
+            studentName: existingRow.student_name,
+            className: existingRow.class_name,
+            examId: existingRow.exam_id,
+            examTitle: existingRow.exam_title,
+            subject: existingRow.subject || '',
+            answers: existingRow.answers || {},
+            flaggedQuestions: existingRow.flagged_questions || [],
+            questionIds: Array.isArray(existingRow.question_ids)
+              ? existingRow.question_ids
+              : undefined,
+            correctCount: existingRow.correct_count,
+            totalQuestions: existingRow.total_questions,
+            score: Number(existingRow.score),
+            tabSwitchCount: existingRow.tab_switch_count,
+            status: existingRow.status,
+            startedAt: existingRow.started_at,
+            submittedAt: existingRow.submitted_at,
+            syncStatus: 'synced',
+          };
+          return { ok: false, finalizedFromServer: mapped };
+        }
+
+        const { error: updErr } = await supabase
+          .from('exam_results')
+          .update({
+            answers: result.answers,
+            flagged_questions: result.flaggedQuestions,
+            total_questions: result.totalQuestions,
+            tab_switch_count: Math.max(existingRow.tab_switch_count || 0, result.tabSwitchCount),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', existingRow.id)
+          .eq('status', 'in_progress')
+          .is('submitted_at', null);
+
+        return { ok: !updErr };
+      }
+
+      const { error: insErr } = await supabase.from('exam_results').insert({
         id: result.id,
         participant_id: result.participantId,
         participant_number: result.participantNumber,
@@ -1234,66 +2094,95 @@ async function pushResultToSupabase(result: ExamResult): Promise<boolean> {
         subject: result.subject,
         answers: result.answers,
         flagged_questions: result.flaggedQuestions,
-        correct_count: result.correctCount,
+        correct_count: 0,
         total_questions: result.totalQuestions,
-        score: result.score,
+        score: 0,
         tab_switch_count: result.tabSwitchCount,
-        status: result.status,
+        status: 'in_progress',
         started_at: result.startedAt,
-        submitted_at: result.submittedAt,
+        submitted_at: null,
         updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'participant_number,exam_id' }
-    );
-    return !error;
+      });
+      return { ok: !insErr };
+    }
+
+    const basePayload: Record<string, unknown> = {
+      id: result.id,
+      participant_id: result.participantId,
+      participant_number: result.participantNumber,
+      student_name: result.studentName,
+      class_name: result.className,
+      exam_id: result.examId,
+      exam_title: result.examTitle,
+      subject: result.subject,
+      answers: result.answers,
+      flagged_questions: result.flaggedQuestions,
+      correct_count: result.correctCount,
+      total_questions: result.totalQuestions,
+      score: result.score,
+      tab_switch_count: result.tabSwitchCount,
+      status: result.status,
+      started_at: result.startedAt,
+      submitted_at: result.submittedAt,
+      updated_at: new Date().toISOString(),
+    };
+    if (result.questionIds && result.questionIds.length > 0) {
+      basePayload.question_ids = result.questionIds;
+    }
+
+    let { error } = await supabase
+      .from('exam_results')
+      .upsert(basePayload, { onConflict: 'participant_number,exam_id' });
+
+    if (error && 'question_ids' in basePayload && error.message.includes('question_ids')) {
+      delete basePayload.question_ids;
+      const retry = await supabase
+        .from('exam_results')
+        .upsert(basePayload, { onConflict: 'participant_number,exam_id' });
+      error = retry.error;
+    }
+
+    return { ok: !error };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 
 const EXPIRY_GRACE_MS = 5000;
 
 export function flushExamProgressKeepalive(session: ActiveExamSession): void {
-  saveActiveSessionLocal(session);
+  const isLocked = session.tabSwitchCount >= session.schedule.maxTabSwitches;
+  if (!isLocked) {
+    saveActiveSessionLocal(session);
+  }
   if (!isLiveSupabaseConfigured()) return;
 
   try {
     const { url, anonKey } = getSupabaseConfig();
     if (!url || !anonKey) return;
     const cleanUrl = url.replace(/\/+$/, '');
-    const status =
-      session.tabSwitchCount >= session.schedule.maxTabSwitches ? 'flagged' : 'in_progress';
-    const payload = {
-      id: session.resultId,
-      participant_id: session.participant.id,
-      participant_number: session.participant.participantNumber,
-      student_name: session.participant.fullName,
-      class_name: session.participant.className,
-      exam_id: session.schedule.id,
-      exam_title: session.schedule.title,
-      subject: session.schedule.subject,
-      answers: session.answers,
-      flagged_questions: session.flaggedQuestions,
-      correct_count: 0,
-      total_questions: session.questions.length,
-      score: 0,
-      tab_switch_count: session.tabSwitchCount,
-      status,
-      started_at: session.startedAt,
-      submitted_at: null,
-      updated_at: new Date().toISOString(),
-    };
 
-    void fetch(`${cleanUrl}/rest/v1/exam_results?on_conflict=participant_number,exam_id`, {
-      method: 'POST',
+    // Conditional PATCH hanya jika row masih in_progress & submitted_at IS NULL
+    // agar tidak pernah menimpa status submitted/flagged dari perangkat lain atau Proktor!
+    const query = `participant_number=eq.${encodeURIComponent(
+      session.participant.participantNumber
+    )}&exam_id=eq.${encodeURIComponent(session.schedule.id)}&status=eq.in_progress&submitted_at=is.null`;
+
+    void fetch(`${cleanUrl}/rest/v1/exam_results?${query}`, {
+      method: 'PATCH',
       keepalive: true,
       headers: {
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
         'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates',
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        answers: session.answers,
+        flagged_questions: session.flaggedQuestions,
+        total_questions: session.questions.length,
+        tab_switch_count: session.tabSwitchCount,
+        updated_at: new Date().toISOString(),
+      }),
     });
   } catch {
     // Ignore keepalive network issues on unload
@@ -1302,7 +2191,23 @@ export function flushExamProgressKeepalive(session: ActiveExamSession): void {
 
 export async function upsertExamProgress(session: ActiveExamSession): Promise<ExamResult> {
   await ensureInitialized();
-  saveActiveSessionLocal(session);
+  const isLocked = session.tabSwitchCount >= session.schedule.maxTabSwitches;
+  if (!isLocked) {
+    saveActiveSessionLocal(session);
+  }
+
+  // Guard: jangan pernah menimpa hasil lokal yang sudah submitted/flagged
+  const existingLocal = await idbGet<ExamResult>(STORES.RESULTS, session.resultId);
+  if (
+    existingLocal &&
+    (existingLocal.status === 'submitted' ||
+      (existingLocal.status === 'flagged' && existingLocal.submittedAt !== null))
+  ) {
+    clearActiveSessionLocal();
+    return existingLocal;
+  }
+
+  const questionIds = session.questions.map((q) => q.id);
 
   const progressRecord: ExamResult = {
     id: session.resultId,
@@ -1315,11 +2220,12 @@ export async function upsertExamProgress(session: ActiveExamSession): Promise<Ex
     subject: session.schedule.subject,
     answers: session.answers,
     flaggedQuestions: session.flaggedQuestions,
+    questionIds,
     correctCount: 0,
     totalQuestions: session.questions.length,
     score: 0,
     tabSwitchCount: session.tabSwitchCount,
-    status: session.tabSwitchCount >= session.schedule.maxTabSwitches ? 'flagged' : 'in_progress',
+    status: isLocked ? 'flagged' : 'in_progress',
     startedAt: session.startedAt,
     submittedAt: null,
     syncStatus: 'pending',
@@ -1328,11 +2234,19 @@ export async function upsertExamProgress(session: ActiveExamSession): Promise<Ex
   await idbPut(STORES.RESULTS, progressRecord);
   broadcastDataChange('results');
 
-  const synced = await pushResultToSupabase(progressRecord);
-  if (synced) {
-    progressRecord.syncStatus = 'synced';
-    await idbPut(STORES.RESULTS, progressRecord);
-    broadcastDataChange('results');
+  if (!isLocked) {
+    const pushRes = await pushResultToSupabase(progressRecord);
+    if (pushRes.finalizedFromServer) {
+      await idbPut(STORES.RESULTS, pushRes.finalizedFromServer);
+      clearActiveSessionLocal();
+      broadcastDataChange('results');
+      return pushRes.finalizedFromServer;
+    }
+    if (pushRes.ok) {
+      progressRecord.syncStatus = 'synced';
+      await idbPut(STORES.RESULTS, progressRecord);
+      broadcastDataChange('results');
+    }
   }
 
   return progressRecord;
@@ -1368,9 +2282,10 @@ async function finalizeExamResultRecord(
     return rawResult;
   }
 
-  const nowIso = new Date().toISOString();
+  const nowIso = new Date(getServerNowMs()).toISOString();
   const answers = rawResult.answers || {};
   const flaggedQuestions = rawResult.flaggedQuestions || [];
+  const questionIds = rawResult.questionIds;
 
   let maxTabSwitches = options?.maxTabSwitches;
   if (maxTabSwitches === undefined) {
@@ -1395,7 +2310,7 @@ async function finalizeExamResultRecord(
   if (isLiveSupabaseConfigured()) {
     try {
       const supabase = getSupabaseClient();
-      const { data, error } = await supabase.rpc('submit_exam_and_score', {
+      let rpcResult = await supabase.rpc('submit_exam_and_score', {
         p_result_id: rawResult.id,
         p_participant_id: rawResult.participantId,
         p_participant_number: rawResult.participantNumber,
@@ -1408,15 +2323,38 @@ async function finalizeExamResultRecord(
         p_flagged_questions: flaggedQuestions,
         p_tab_switch_count: rawResult.tabSwitchCount,
         p_started_at: rawResult.startedAt,
+        p_max_tab_switches: maxTabSwitches,
+        p_question_ids: questionIds && questionIds.length > 0 ? questionIds : null,
       });
 
-      if (!error && Array.isArray(data) && data[0] && Number(data[0].total_questions) > 0) {
-        correctCount = data[0].correct_count;
-        totalQuestions = data[0].total_questions;
-        score = Number(data[0].score);
-        // RPC hardcodes >= 3 for flagged; keep synced only if status matches RPC
-        const rpcStatus = rawResult.tabSwitchCount >= 3 ? 'flagged' : 'submitted';
-        synced = rpcStatus === computedStatus;
+      // Graceful fallback ke signature 12 argumen jika SQL DB belum di-upgrade
+      if (rpcResult.error && rpcResult.error.message.toLowerCase().includes('function')) {
+        rpcResult = await supabase.rpc('submit_exam_and_score', {
+          p_result_id: rawResult.id,
+          p_participant_id: rawResult.participantId,
+          p_participant_number: rawResult.participantNumber,
+          p_student_name: rawResult.studentName,
+          p_class_name: rawResult.className,
+          p_exam_id: rawResult.examId,
+          p_exam_title: rawResult.examTitle,
+          p_subject: rawResult.subject,
+          p_answers: answers,
+          p_flagged_questions: flaggedQuestions,
+          p_tab_switch_count: rawResult.tabSwitchCount,
+          p_started_at: rawResult.startedAt,
+        });
+      }
+
+      if (
+        !rpcResult.error &&
+        Array.isArray(rpcResult.data) &&
+        rpcResult.data[0] &&
+        Number(rpcResult.data[0].total_questions) > 0
+      ) {
+        correctCount = rpcResult.data[0].correct_count;
+        totalQuestions = rpcResult.data[0].total_questions;
+        score = Number(rpcResult.data[0].score);
+        synced = true;
       }
     } catch {
       // Fallback to local vault scoring + background upsert queue
@@ -1425,10 +2363,14 @@ async function finalizeExamResultRecord(
 
   if (!synced) {
     const vaultQuestions = await idbGetAll<Question>(STORES.QUESTIONS);
+    const idFilterSet =
+      questionIds && questionIds.length > 0 ? new Set(questionIds) : null;
+
     const classSubjectQuestions = vaultQuestions.filter(
       (q) =>
         q.targetClasses.includes(rawResult.className) &&
-        q.subject.trim().toLowerCase() === (rawResult.subject || '').trim().toLowerCase()
+        q.subject.trim().toLowerCase() === (rawResult.subject || '').trim().toLowerCase() &&
+        (!idFilterSet || idFilterSet.has(q.id))
     );
     if (classSubjectQuestions.length > 0) {
       let totalPoints = 0;
@@ -1452,6 +2394,7 @@ async function finalizeExamResultRecord(
     ...rawResult,
     answers,
     flaggedQuestions,
+    questionIds,
     correctCount,
     totalQuestions,
     score,
@@ -1461,8 +2404,8 @@ async function finalizeExamResultRecord(
   };
 
   if (!synced) {
-    const pushed = await pushResultToSupabase(finalResult);
-    if (pushed) {
+    const pushRes = await pushResultToSupabase(finalResult);
+    if (pushRes.ok) {
       finalResult.syncStatus = 'synced';
     }
   }
@@ -1491,6 +2434,7 @@ export async function submitFinalExam(session: ActiveExamSession): Promise<ExamR
     subject: session.schedule.subject,
     answers: session.answers,
     flaggedQuestions: session.flaggedQuestions,
+    questionIds: session.questions.map((q) => q.id),
     correctCount: 0,
     totalQuestions: session.questions.length,
     score: 0,
@@ -1509,6 +2453,15 @@ export async function submitFinalExam(session: ActiveExamSession): Promise<ExamR
 
   clearActiveSessionLocal();
   return finalResult;
+}
+
+export async function lockoutExamSession(session: ActiveExamSession): Promise<ExamResult> {
+  const lockedSession: ActiveExamSession = {
+    ...session,
+    tabSwitchCount: Math.max(session.tabSwitchCount, session.schedule.maxTabSwitches),
+  };
+  clearActiveSessionLocal();
+  return submitFinalExam(lockedSession);
 }
 
 export async function forceFinishExamResults(
@@ -1553,22 +2506,40 @@ export async function forceFinishExamResults(
 
 let autoFinalizeInFlight: Promise<number> | null = null;
 
-export async function autoFinalizeExpiredExams(): Promise<number> {
+export async function autoFinalizeExpiredExams(options?: {
+  currentParticipantNumber?: string;
+  isAdmin?: boolean;
+}): Promise<number> {
   if (autoFinalizeInFlight) return autoFinalizeInFlight;
 
   autoFinalizeInFlight = (async () => {
     try {
       await ensureInitialized();
+      const savedSession = getSavedActiveSession();
+      const targetParticipant =
+        options?.currentParticipantNumber?.trim().toUpperCase() ||
+        savedSession?.participant.participantNumber.trim().toUpperCase() ||
+        '';
+
+      // Hanya panel Admin/Proktor yang boleh mem-finalisasi peserta lain secara massal.
+      // Peramban siswa hanya mem-finalisasi sesi miliknya sendiri agar tidak menghitung skor 0 dari vault kosong.
+      if (!options?.isAdmin && !targetParticipant) {
+        return 0;
+      }
+
       const [allResults, schedules] = await Promise.all([
         idbGetAll<ExamResult>(STORES.RESULTS),
         idbGetAll<ExamSchedule>(STORES.SCHEDULES),
       ]);
 
-      const nowMs = Date.now();
+      const nowMs = getServerNowMs();
       const expiredItems: Array<{ result: ExamResult; maxTabSwitches: number }> = [];
 
       for (const res of allResults) {
         if (res.status !== 'in_progress') continue;
+        if (!options?.isAdmin && res.participantNumber.trim().toUpperCase() !== targetParticipant) {
+          continue;
+        }
         const sched = schedules.find(
           (s) =>
             s.id === res.examId ||
@@ -1618,8 +2589,27 @@ export async function flushPendingSyncQueue(): Promise<number> {
   let syncedCount = 0;
 
   for (const item of pending) {
-    const ok = await pushResultToSupabase(item);
-    if (ok) {
+    if (
+      (item.status === 'submitted' || (item.status === 'flagged' && item.submittedAt !== null)) &&
+      item.score === 0 &&
+      item.correctCount === 0
+    ) {
+      // Coba sinkron dengan penilaian server RPC jika sebelumnya submit saat offline
+      const finalized = await finalizeExamResultRecord(item, {
+        skipIfFinalized: false,
+        broadcast: false,
+      });
+      if (finalized.syncStatus === 'synced') {
+        syncedCount += 1;
+      }
+      continue;
+    }
+
+    const pushRes = await pushResultToSupabase(item);
+    if (pushRes.finalizedFromServer) {
+      await idbPut(STORES.RESULTS, pushRes.finalizedFromServer);
+      syncedCount += 1;
+    } else if (pushRes.ok) {
       item.syncStatus = 'synced';
       await idbPut(STORES.RESULTS, item);
       syncedCount += 1;
@@ -1672,11 +2662,17 @@ export async function resetDemoDatabase(): Promise<void> {
   await idbPut(STORES.META, SEED_SCHOOL_PROFILE);
   await idbPut(STORES.META, { id: 'init_flags', seeded: true });
   await idbDelete(STORES.META, DASHBOARD_HIDDEN_LOGS_META_ID);
-  await idbPutMany(STORES.PARTICIPANTS, SEED_PARTICIPANTS, true);
-  await idbPutMany(STORES.SCHEDULES, SEED_SCHEDULES, true);
-  await idbPutMany(STORES.QUESTIONS, SEED_QUESTIONS, true);
-  await idbPutMany(STORES.RESULTS, SEED_EXAM_RESULTS, true);
-  await idbPutMany(STORES.STAFF_ACCOUNTS, SEED_STAFF_ACCOUNTS, true);
+  await idbPutMany(STORES.PARTICIPANTS, [], true);
+  await idbPutMany(STORES.SCHEDULES, [], true);
+  await idbPutMany(STORES.QUESTIONS, [], true);
+  await idbPutMany(STORES.RESULTS, [], true);
+  const hashedStaff = await Promise.all(
+    SEED_STAFF_ACCOUNTS.map(async (acc) => ({
+      ...acc,
+      password: await hashPassword(acc.password),
+    }))
+  );
+  await idbPutStaffSafe(hashedStaff, true);
   clearActiveSessionLocal();
   broadcastDataChange('reset');
 }
@@ -1687,7 +2683,13 @@ export async function resetDemoDatabase(): Promise<void> {
 const LAST_SYNC_KEY = 'cbt_last_cloud_sync_at_v1';
 
 export interface SyncTableStats {
-  table: 'school_profile' | 'participants' | 'exam_schedules' | 'questions' | 'exam_results';
+  table:
+    | 'school_profile'
+    | 'participants'
+    | 'exam_schedules'
+    | 'questions'
+    | 'exam_results'
+    | 'staff_accounts';
   label: string;
   localCount: number;
   cloudCount: number | null;
@@ -1725,12 +2727,13 @@ export async function getSyncDiagnostics(): Promise<{
   lastSyncAt: string | null;
 }> {
   await ensureInitialized();
-  const [profile, participants, schedules, questions, results] = await Promise.all([
+  const [profile, participants, schedules, questions, results, staffAccounts] = await Promise.all([
     idbGet<SchoolProfile>(STORES.META, 'default'),
     idbGetAll<Participant>(STORES.PARTICIPANTS),
     idbGetAll<ExamSchedule>(STORES.SCHEDULES),
     idbGetAll<Question>(STORES.QUESTIONS),
     idbGetAll<ExamResult>(STORES.RESULTS),
+    idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS),
   ]);
 
   const pendingResultsCount = results.filter((r) => r.syncStatus === 'pending').length;
@@ -1740,6 +2743,12 @@ export async function getSyncDiagnostics(): Promise<{
       table: 'school_profile',
       label: 'Profil Sekolah & Pengaturan',
       localCount: profile ? 1 : 0,
+      cloudCount: null,
+    },
+    {
+      table: 'staff_accounts',
+      label: 'Akun Role & Hak Akses Panitia',
+      localCount: staffAccounts.length,
       cloudCount: null,
     },
     {
@@ -1829,6 +2838,7 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
   const errors: string[] = [];
   const details: Record<string, number> = {
     school_profile: 0,
+    staff_accounts: 0,
     exam_schedules: 0,
     participants: 0,
     questions: 0,
@@ -1839,12 +2849,15 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
     const supabase = getSupabaseClient();
     const adminClient = getSupabaseAdminClient();
 
-    const [profRes, schedRes, partRes, resRes] = await Promise.all([
+    const [profRes, schedRes, partRes, resRes, staffRes] = await Promise.all([
       supabase.from('school_profile').select('*').eq('id', 'default').maybeSingle(),
       supabase.from('exam_schedules').select('*'),
       supabase.from('participants').select('*'),
       supabase.from('exam_results').select('*'),
+      supabase.from('staff_accounts').select('*'),
     ]);
+
+    const hasCloudProfile = Boolean(!profRes.error && profRes.data);
 
     if (profRes.error) {
       errors.push(`school_profile: ${profRes.error.message}`);
@@ -1867,48 +2880,64 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
     if (schedRes.error) {
       errors.push(`exam_schedules: ${schedRes.error.message}`);
     } else if (schedRes.data) {
-      await idbPutMany(
-        STORES.SCHEDULES,
-        schedRes.data.map((r) => ({
-          id: r.id,
-          title: r.title,
-          subject: r.subject,
-          kkm: Number(r.kkm ?? 75),
-          durationMinutes: r.duration_minutes,
-          targetClasses: r.target_classes,
-          isActive: r.is_active,
-          randomizeQuestions: Boolean(r.randomize_questions ?? false),
-          maxTabSwitches: r.max_tab_switches,
-          createdAt: r.created_at,
-        }))
-      );
+      if (schedRes.data.length > 0 || hasCloudProfile) {
+        await idbPutMany(
+          STORES.SCHEDULES,
+          schedRes.data.map((r) => ({
+            id: r.id,
+            title: r.title,
+            subject: r.subject,
+            kkm: Number(r.kkm ?? 75),
+            durationMinutes: r.duration_minutes,
+            targetClasses: r.target_classes,
+            isActive: r.is_active,
+            randomizeQuestions: Boolean(r.randomize_questions ?? false),
+            maxTabSwitches: r.max_tab_switches,
+            createdAt: r.created_at,
+          })),
+          true
+        );
+      }
       details.exam_schedules = schedRes.data.length;
     }
 
     if (partRes.error) {
       errors.push(`participants: ${partRes.error.message}`);
     } else if (partRes.data) {
-      await idbPutMany(
-        STORES.PARTICIPANTS,
-        partRes.data.map((r) => ({
-          id: r.id,
-          participantNumber: r.participant_number,
-          token: r.token || 'CBT2026',
-          fullName: r.full_name,
-          className: r.class_name,
-          isActive: r.is_active,
-          createdAt: r.created_at,
-        }))
-      );
+      if (partRes.data.length > 0 || hasCloudProfile) {
+        await idbPutParticipantsSafe(
+          partRes.data.map((r) => ({
+            id: String(r.id),
+            participantNumber: r.participant_number,
+            token: r.token || 'CBT2026',
+            fullName: r.full_name,
+            className: r.class_name,
+            isActive: r.is_active,
+            createdAt: r.created_at,
+          })),
+          true
+        );
+      }
       details.participants = partRes.data.length;
     }
 
     if (resRes.error) {
       errors.push(`exam_results: ${resRes.error.message}`);
     } else if (resRes.data) {
-      await idbPutMany(
-        STORES.RESULTS,
-        resRes.data.map((r) => ({
+      const localResults = await idbGetAll<ExamResult>(STORES.RESULTS);
+      const pendingLocals = localResults.filter((lr) => lr.syncStatus === 'pending');
+      const pendingKeySet = new Set(
+        pendingLocals.map((lr) => `${lr.participantNumber.trim().toUpperCase()}::${lr.examId}`)
+      );
+
+      const cloudResults: ExamResult[] = resRes.data
+        .filter(
+          (r) =>
+            !pendingKeySet.has(
+              `${String(r.participant_number || '').trim().toUpperCase()}::${r.exam_id}`
+            )
+        )
+        .map((r) => ({
           id: r.id,
           participantId: r.participant_id,
           participantNumber: r.participant_number,
@@ -1919,6 +2948,7 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
           subject: r.subject || '',
           answers: r.answers || {},
           flaggedQuestions: r.flagged_questions || [],
+          questionIds: Array.isArray(r.question_ids) ? r.question_ids : undefined,
           correctCount: r.correct_count,
           totalQuestions: r.total_questions,
           score: Number(r.score),
@@ -1926,10 +2956,49 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
           status: r.status,
           startedAt: r.started_at,
           submittedAt: r.submitted_at,
-          syncStatus: 'synced',
-        }))
-      );
+          syncStatus: 'synced' as const,
+        }));
+
+      await idbPutMany(STORES.RESULTS, [...cloudResults, ...pendingLocals], true);
       details.exam_results = resRes.data.length;
+    }
+
+    if (staffRes.error) {
+      if (isMissingTableError(staffRes.error.message)) {
+        errors.push('staff_accounts: Tabel belum dibuat di Supabase (jalankan Skema SQL terlebih dahulu).');
+      } else {
+        errors.push(`staff_accounts: ${staffRes.error.message}`);
+      }
+    } else if (staffRes.data) {
+      details.staff_accounts = staffRes.data.length;
+      if (staffRes.data.length > 0) {
+        const mappedStaff: StaffAccount[] = staffRes.data.map((s) => ({
+          id: String(s.id),
+          userId: String(s.user_id),
+          name: String(s.name),
+          password: String(s.password_hash || ''),
+          roleType: s.role_type,
+          roleLabel: String(s.role_label || 'Staff'),
+          allowedTabs: Array.isArray(s.allowed_tabs) ? s.allowed_tabs : [],
+          assignedSubjects: Array.isArray(s.assigned_subjects) ? s.assigned_subjects : [],
+          restrictToAssignedSubjects: Boolean(s.restrict_to_assigned_subjects),
+          isActive: Boolean(s.is_active),
+          createdAt: s.created_at,
+        }));
+        const hasCloudAdmin = mappedStaff.some(
+          (s) => s.userId.trim().toLowerCase() === 'admin'
+        );
+        if (!hasCloudAdmin) {
+          const localStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+          const localAdmin = localStaff.find(
+            (s) => s.userId.trim().toLowerCase() === 'admin'
+          );
+          if (localAdmin) {
+            mappedStaff.unshift(localAdmin);
+          }
+        }
+        await idbPutStaffSafe(mappedStaff, true);
+      }
     }
 
     if (adminClient) {
@@ -1949,7 +3018,8 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
             correctAnswer: q.correct_answer,
             points: Number(q.points ?? 1),
             orderIndex: Number(q.order_index ?? 1),
-          }))
+          })),
+          true
         );
         details.questions = qRes.data.length;
       }
@@ -2003,6 +3073,7 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
   const errors: string[] = [];
   const details: Record<string, number> = {
     school_profile: 0,
+    staff_accounts: 0,
     exam_schedules: 0,
     participants: 0,
     questions: 0,
@@ -2010,12 +3081,13 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
   };
 
   try {
-    const [profile, schedules, participants, questions, results] = await Promise.all([
+    const [profile, schedules, participants, questions, results, staffAccounts] = await Promise.all([
       idbGet<SchoolProfile>(STORES.META, 'default'),
       idbGetAll<ExamSchedule>(STORES.SCHEDULES),
       idbGetAll<Participant>(STORES.PARTICIPANTS),
       idbGetAll<Question>(STORES.QUESTIONS),
       idbGetAll<ExamResult>(STORES.RESULTS),
+      idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS),
     ]);
 
     if (profile) {
@@ -2078,6 +3150,36 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
         }
       }
       details.participants = pushedParts;
+    }
+
+    if (staffAccounts.length > 0) {
+      const hashedPayload = await Promise.all(
+        staffAccounts.map(async (s) => ({
+          id: s.id,
+          user_id: s.userId,
+          name: s.name,
+          password_hash: await hashPassword(s.password),
+          role_type: s.roleType,
+          role_label: s.roleLabel,
+          allowed_tabs: s.allowedTabs,
+          assigned_subjects: s.assignedSubjects,
+          restrict_to_assigned_subjects: s.restrictToAssignedSubjects,
+          is_active: s.isActive,
+          created_at: s.createdAt,
+        }))
+      );
+      const { error: staffErr } = await supabase
+        .from('staff_accounts')
+        .upsert(hashedPayload, { onConflict: 'user_id' });
+      if (staffErr) {
+        if (isMissingTableError(staffErr.message)) {
+          errors.push('staff_accounts: Tabel belum dibuat di Supabase (jalankan Skema SQL terlebih dahulu).');
+        } else {
+          errors.push(`staff_accounts: ${staffErr.message}`);
+        }
+      } else {
+        details.staff_accounts = staffAccounts.length;
+      }
     }
 
     if (questions.length > 0) {
@@ -2207,8 +3309,28 @@ export async function flushPendingQueueDetailed(): Promise<SyncOperationReport> 
   const errors: string[] = [];
 
   for (const item of pending) {
-    const ok = await pushResultToSupabase(item);
-    if (ok) {
+    if (
+      (item.status === 'submitted' || (item.status === 'flagged' && item.submittedAt !== null)) &&
+      item.score === 0 &&
+      item.correctCount === 0
+    ) {
+      const finalized = await finalizeExamResultRecord(item, {
+        skipIfFinalized: false,
+        broadcast: false,
+      });
+      if (finalized.syncStatus === 'synced') {
+        flushed += 1;
+      } else {
+        errors.push(`Gagal menilai/mengunggah hasil ${item.participantNumber} (${item.subject})`);
+      }
+      continue;
+    }
+
+    const pushRes = await pushResultToSupabase(item);
+    if (pushRes.finalizedFromServer) {
+      await idbPut(STORES.RESULTS, pushRes.finalizedFromServer);
+      flushed += 1;
+    } else if (pushRes.ok) {
       item.syncStatus = 'synced';
       await idbPut(STORES.RESULTS, item);
       flushed += 1;
@@ -2330,12 +3452,12 @@ export async function restoreLocalBackupSnapshot(
   }
 
   await idbPut(STORES.META, { ...snap.profile, id: 'default' });
-  await idbPutMany(STORES.PARTICIPANTS, snap.participants, true);
+  await idbPutParticipantsSafe(snap.participants, true);
   await idbPutMany(STORES.SCHEDULES, snap.schedules, true);
   await idbPutMany(STORES.QUESTIONS, snap.questions, true);
   await idbPutMany(STORES.RESULTS, snap.results, true);
   if (Array.isArray(snap.staffAccounts) && snap.staffAccounts.length > 0) {
-    await idbPutMany(STORES.STAFF_ACCOUNTS, snap.staffAccounts, true);
+    await idbPutStaffSafe(snap.staffAccounts, true);
   }
   clearActiveSessionLocal();
   broadcastDataChange('backup_restored');

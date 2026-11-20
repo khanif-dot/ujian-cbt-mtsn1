@@ -31,6 +31,7 @@ import {
   DEFAULT_SUPABASE_ANON_KEY,
   DEFAULT_SUPABASE_URL,
   SUPABASE_SCHEMA_SQL,
+  clearRuntimeServiceRoleKey,
   decodeJwtPayload,
   extractProjectRef,
   getSupabaseConfig,
@@ -111,14 +112,14 @@ const SETUP_GUIDE_STEPS: GuideStep[] = [
     id: 'step_sql',
     stepNumber: 3,
     title: 'Eksekusi Skrip SQL Skema Tabel & Keamanan RLS',
-    subtitle: 'Membuat 5 tabel utama, indeks performa, dan 4 fungsi RPC anti-Inspect Element',
+    subtitle: 'Membuat 6 tabel utama (termasuk staff_accounts), indeks performa, dan fungsi RPC anti-Inspect Element',
     estimatedTime: '1 menit',
     instructions: [
       'Klik tombol "Salin Skrip SQL" di bawah ini atau buka tab "Skema SQL & RLS".',
       'Di dashboard Supabase, buka menu kiri "SQL Editor" → klik "+ New query".',
       'Tempel (Paste) seluruh skrip SQL ke editor, lalu klik tombol "Run" (atau tekan Ctrl+Enter / Cmd+Enter).',
       'Pastikan hasil eksekusi menampilkan status "Success. No rows returned" tanpa pesan error merah.',
-      'Skrip ini otomatis membuat tabel school_profile, participants, exam_schedules, questions, dan exam_results, sekaligus memblokir SELECT langsung tabel questions dari role anon agar kunci jawaban aman dari Inspect Element.',
+      'Skrip ini otomatis membuat tabel school_profile, staff_accounts, participants, exam_schedules, questions, dan exam_results, sekaligus memblokir SELECT langsung tabel questions dari role anon agar kunci jawaban aman dari Inspect Element.',
     ],
     note: 'Aman dijalankan ulang (idempoten): semua CREATE TABLE menggunakan IF NOT EXISTS dan policy menggunakan DROP POLICY IF EXISTS.',
     actionType: 'copy-sql',
@@ -128,13 +129,13 @@ const SETUP_GUIDE_STEPS: GuideStep[] = [
     id: 'step_realtime',
     stepNumber: 4,
     title: 'Aktifkan Realtime Replication untuk Monitoring Live',
-    subtitle: 'Pembaruan otomatis progres, skor, & pelanggaran tab-switch di Dashboard',
+    subtitle: 'Pembaruan otomatis progres, skor, & sinkronisasi role/akses antar perangkat',
     estimatedTime: '1 menit',
     instructions: [
       'Di dashboard Supabase, buka menu kiri "Database" → pilih "Publications" (atau "Replication").',
       'Klik publication bernama "supabase_realtime".',
       'Aktifkan toggle (ON) untuk tabel "exam_results" agar dashboard pengawas menerima event INSERT/UPDATE seketika saat siswa menjawab atau berpindah tab.',
-      '(Opsional) Anda juga dapat mengaktifkan toggle untuk "exam_schedules" dan "participants" jika beberapa panitia mengedit jadwal secara bersamaan.',
+      '(Disarankan) Aktifkan juga toggle untuk "exam_schedules", "participants", "school_profile", dan "staff_accounts" agar perubahan role, sandi, dan jadwal langsung tersinkron ke semua perangkat.',
       'Pastikan opsi "Aktifkan Realtime WebSocket" pada Parameter Kredensial API dalam kondisi aktif.',
     ],
   },
@@ -187,8 +188,8 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
     'cbt_draft_db_anon_v1',
     () => initialConfig.anonKey
   );
-  const [serviceRoleKey, setServiceRoleKey] = usePersistedState(
-    'cbt_draft_db_service_v1',
+  // Service Role Key is strictly kept in memory (never written to localStorage)
+  const [serviceRoleKey, setServiceRoleKey] = useState(
     () => initialConfig.serviceRoleKey || ''
   );
   const [schema, setSchema] = usePersistedState(
@@ -301,6 +302,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
 
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!serviceRoleKey.trim()) {
+      clearRuntimeServiceRoleKey();
+    }
     saveSupabaseConfig(url, anonKey, {
       serviceRoleKey,
       schema,
@@ -321,6 +325,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
   };
 
   const handleResetDefault = async () => {
+    clearRuntimeServiceRoleKey();
     resetSupabaseConfig();
     clearDbDrafts();
     setUrl(DEFAULT_SUPABASE_URL);
@@ -336,6 +341,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
   };
 
   const handleTest = async () => {
+    if (!serviceRoleKey.trim()) {
+      clearRuntimeServiceRoleKey();
+    }
     saveSupabaseConfig(url, anonKey, {
       serviceRoleKey,
       schema,
@@ -422,7 +430,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
     setConfirmResetSeed(false);
     setBackupFeedback({
       ok: true,
-      text: 'Cache lokal IndexedDB telah direset ke data awal 27 kelas (7A–9I).',
+      text: 'Cache lokal IndexedDB telah dikosongkan dan direset ke kondisi bersih.',
     });
     await refreshDiagnostics();
     await onDatabaseChanged();
@@ -749,7 +757,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
 
                 <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-900/90">
                   <span>
-                    Digunakan khusus di panel Admin untuk mengecek jumlah baris &amp; menarik ulang Bank Soal (tabel{' '}
+                    Disimpan <strong>hanya di memori sesi browser Admin (tidak ditulis ke localStorage)</strong> untuk mengecek jumlah baris &amp; menarik ulang Bank Soal (tabel{' '}
                     <code className="font-mono">questions</code>) yang diblokir dari role <code className="font-mono">anon</code>. Jangan masukkan key ini ke file <code className="font-mono">.env</code> client siswa.
                   </span>
                   {serviceJwtInfo && (
@@ -1181,7 +1189,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
                         <td className="py-3 px-4">
                           <div className="font-semibold text-slate-900">{row.label}</div>
                           <div className="font-mono text-[11px] text-slate-500">
-                            public.{row.table}
+                            {schema.trim() || 'public'}.{row.table}
                           </div>
                         </td>
                         <td className="py-3 px-4 text-right font-mono font-bold text-slate-900 tabular-nums">
@@ -1332,7 +1340,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h3 className="font-display font-bold text-sm text-slate-900">
-                  Cadangan Snapshot Lokal (JSON) &amp; Reset Data Awal
+                  Cadangan Snapshot Lokal (JSON) &amp; Kosongkan Cache Lokal
                 </h3>
                 <p className="text-xs text-slate-600 mt-0.5">
                   Unduh seluruh data CBT lokal sebagai file cadangan JSON untuk arsip atau pemulihan cepat di perangkat lain.
@@ -1372,19 +1380,19 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
                     className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 text-xs font-semibold cursor-pointer"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Reset Data Lokal Awal</span>
+                    <span>Kosongkan Cache Lokal</span>
                   </button>
                 ) : (
                   <div className="inline-flex items-center gap-1.5 bg-rose-50 border border-rose-300 rounded-xl px-2.5 py-1.5">
                     <span className="text-[11px] font-semibold text-rose-900">
-                      Yakin reset cache lokal?
+                      Yakin kosongkan cache lokal?
                     </span>
                     <button
                       type="button"
                       onClick={() => void handleResetSeed()}
                       className="px-2.5 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 text-white text-[11px] font-semibold cursor-pointer"
                     >
-                      Ya, Reset
+                      Ya, Kosongkan
                     </button>
                     <button
                       type="button"
@@ -1470,9 +1478,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
         <div className="space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="bg-white rounded-xl border border-slate-200 p-4">
-              <div className="text-xs font-bold text-slate-900">5 Tabel Relasional Inti</div>
+              <div className="text-xs font-bold text-slate-900">6 Tabel Relasional Inti</div>
               <p className="text-[11px] text-slate-600 mt-1 font-mono leading-relaxed">
-                school_profile, participants, exam_schedules, questions, exam_results
+                school_profile, participants, exam_schedules, questions, exam_results, staff_accounts
               </p>
             </div>
             <div className="bg-white rounded-xl border border-slate-200 p-4">
@@ -1483,9 +1491,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
               </p>
             </div>
             <div className="bg-white rounded-xl border border-slate-200 p-4">
-              <div className="text-xs font-bold text-slate-900">4 Fungsi RPC SECURITY DEFINER</div>
+              <div className="text-xs font-bold text-slate-900">6 Fungsi RPC SECURITY DEFINER</div>
               <p className="text-[11px] text-slate-600 mt-1 font-mono leading-relaxed">
-                get_student_questions, submit_exam_and_score, upsert_questions_batch, delete_question_by_id
+                get_server_time, get_student_questions, upsert_exam_progress, submit_exam_and_score, upsert_questions_batch, delete_question_by_id
               </p>
             </div>
           </div>

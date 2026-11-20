@@ -58,8 +58,8 @@ interface AdminConsoleProps {
   onHideDashboardLogs: (items: Array<{ id: string; startedAt: string }>) => Promise<void>;
   onClearDashboardLogs: () => Promise<void>;
   onResetExamResults: (resultIds: string[]) => Promise<void>;
-  onUpsertStaff: (account: StaffAccount) => Promise<void>;
-  onDeleteStaff: (id: string) => Promise<void>;
+  onUpsertStaff: (account: StaffAccount) => Promise<{ synced: boolean; error?: string } | void>;
+  onDeleteStaff: (id: string) => Promise<{ synced: boolean; error?: string } | void>;
   onRefreshAll: () => Promise<void>;
   onExitAdmin: () => void;
 }
@@ -269,6 +269,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
               schedules={schedules}
               results={results}
               hiddenDashboardLogs={hiddenDashboardLogs}
+              allowedSubjects={restrictedSubjects}
               onForceSync={onForceSync}
               isSyncing={isSyncing}
               onForceFinishResults={onForceFinishExamResults}
@@ -286,6 +287,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
             <AdminResetExamTab
               schedules={schedules}
               results={results}
+              allowedSubjects={restrictedSubjects}
               onResetExamResults={onResetExamResults}
             />
           )}
@@ -293,7 +295,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           {activeTab === 'recap' && currentStaff.allowedTabs.includes('recap') && (
             <AdminRecapTab
               profile={profile}
+              participants={participants}
               schedules={schedules}
+              questions={questions}
               results={results}
               allowedSubjects={restrictedSubjects}
               onDeleteResults={onResetExamResults}
@@ -317,6 +321,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
             <AdminQuestionsTab
               schedules={schedules}
               questions={questions}
+              results={results}
               allowedSubjects={restrictedSubjects}
               onSaveSchedule={onSaveSchedule}
               onDeleteSchedule={onDeleteSchedule}

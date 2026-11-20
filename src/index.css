@@ -23,7 +23,7 @@
 /* Print-Ready A4 Layout for Exam Cards (2 columns x 5 rows = 10 cards per A4 sheet) */
 @page {
   size: A4 portrait;
-  margin: 8mm;
+  margin: 6mm;
 }
 
 @media print {
@@ -48,8 +48,9 @@
   }
 
   .print-a4-page {
-    width: 194mm !important;
+    width: 196mm !important;
     height: 280mm !important;
+    overflow: hidden !important;
     margin: 0 auto !important;
     padding: 0 !important;
     display: grid !important;

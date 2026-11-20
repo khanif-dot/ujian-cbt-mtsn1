@@ -21,6 +21,7 @@ import {
 import { MathText } from '@/src/components/MathText';
 import {
   ALL_CLASSES,
+  type ExamResult,
   type ExamSchedule,
   type OptionKey,
   type Question,
@@ -38,6 +39,7 @@ import { usePersistedState } from '@/src/lib/usePersistedState';
 interface AdminQuestionsTabProps {
   schedules: ExamSchedule[];
   questions: Question[];
+  results?: ExamResult[];
   allowedSubjects?: string[];
   onSaveSchedule: (schedule: ExamSchedule) => Promise<void>;
   onDeleteSchedule: (id: string) => Promise<void>;
@@ -235,9 +237,66 @@ function questionToFormState(q: Question): QuestionFormState {
   };
 }
 
+interface ScheduleInlineNumberInputProps {
+  value: number;
+  min: number;
+  max: number;
+  fallback: number;
+  className?: string;
+  onCommit: (nextValue: number) => void;
+}
+
+const ScheduleInlineNumberInput: React.FC<ScheduleInlineNumberInputProps> = ({
+  value,
+  min,
+  max,
+  fallback,
+  className,
+  onCommit,
+}) => {
+  const [draft, setDraft] = useState(String(value));
+
+  React.useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = () => {
+    const parsed = Number(draft);
+    const clamped = Number.isFinite(parsed)
+      ? Math.max(min, Math.min(max, Math.round(parsed)))
+      : fallback;
+    setDraft(String(clamped));
+    if (clamped !== value) {
+      onCommit(clamped);
+    }
+  };
+
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          (e.currentTarget as HTMLInputElement).blur();
+        } else if (e.key === 'Escape') {
+          setDraft(String(value));
+          (e.currentTarget as HTMLInputElement).blur();
+        }
+      }}
+      className={className}
+    />
+  );
+};
+
 export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   schedules,
   questions,
+  results = [],
   allowedSubjects,
   onSaveSchedule,
   onDeleteSchedule,
@@ -311,7 +370,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   const [importDocxClasses, setImportDocxClasses] = useState<string[]>([...CLASSES_7]);
   const [showDocxClassPicker, setShowDocxClassPicker] = useState(false);
   const [importDocxSubject, setImportDocxSubject] = useState(
-    (isRestrictedBySubject ? allowedSubjects?.[0] : visibleSchedules[0]?.subject) || 'Matematika'
+    (isRestrictedBySubject ? allowedSubjects?.[0] : visibleSchedules[0]?.subject) || ''
   );
 
   // Excel Import Optional Class Override
@@ -333,28 +392,44 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     'cbt_draft_q_modal_form_v1',
     () =>
       createEmptyQuestionForm(
-        availableSubjects[0] || 'Matematika',
+        availableSubjects[0] || '',
         visibleQuestions.length + 1
       )
   );
   const [formError, setFormError] = useState('');
   const [isSavingQuestion, setIsSavingQuestion] = useState(false);
 
+  const activeInProgressSubjectSet = useMemo(() => {
+    const set = new Set<string>();
+    results.forEach((r) => {
+      if (r.status === 'in_progress' && r.subject) {
+        set.add(r.subject.trim().toLowerCase());
+      }
+    });
+    return set;
+  }, [results]);
+
   const effectiveSubjectFilter = useMemo(() => {
     if (isRestrictedBySubject && availableSubjects.length === 1) {
       return availableSubjects[0];
     }
-    if (subjectFilter !== 'ALL' && !availableSubjects.includes(subjectFilter)) {
+    const normFilter = subjectFilter.trim().toLowerCase();
+    const matched = availableSubjects.find((s) => s.trim().toLowerCase() === normFilter);
+    if (subjectFilter !== 'ALL' && !matched) {
       return 'ALL';
     }
-    return subjectFilter;
+    return matched || subjectFilter;
   }, [isRestrictedBySubject, availableSubjects, subjectFilter]);
 
   const filteredQuestions = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
+    const normFilter = effectiveSubjectFilter.trim().toLowerCase();
     return visibleQuestions
       .filter((item) => {
-        if (effectiveSubjectFilter !== 'ALL' && item.subject !== effectiveSubjectFilter) {
+        if (
+          effectiveSubjectFilter !== 'ALL' &&
+          item.subject.trim().toLowerCase() !== normFilter
+        ) {
           return false;
         }
         if (classFilter !== 'ALL' && !item.targetClasses.includes(classFilter)) return false;
@@ -381,9 +456,12 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     const defaultSubject =
       effectiveSubjectFilter !== 'ALL'
         ? effectiveSubjectFilter
-        : availableSubjects[0] || 'Matematika';
-    const subjectCount = visibleQuestions.filter((q) => q.subject === defaultSubject).length;
-    setQForm(createEmptyQuestionForm(defaultSubject, subjectCount + 1));
+        : availableSubjects[0] || '';
+    const normDefault = defaultSubject.trim().toLowerCase();
+    const maxOrder = visibleQuestions
+      .filter((q) => q.subject.trim().toLowerCase() === normDefault)
+      .reduce((acc, q) => Math.max(acc, q.orderIndex || 0), 0);
+    setQForm(createEmptyQuestionForm(defaultSubject, maxOrder + 1));
     setQuestionModalOpen(true);
   };
 
@@ -539,10 +617,17 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     if (!file) return;
     setFeedback('');
     try {
-      const safeDocxSubject =
+      const safeDocxSubject = (
         isRestrictedBySubject && !normalizedAllowed.includes(importDocxSubject.trim().toLowerCase())
           ? availableSubjects[0] || importDocxSubject
-          : importDocxSubject;
+          : importDocxSubject || availableSubjects[0] || ''
+      ).trim();
+
+      if (!safeDocxSubject) {
+        setFeedback('Pilih atau isi nama mata pelajaran terlebih dahulu sebelum mengimpor soal Word (.docx).');
+        e.target.value = '';
+        return;
+      }
 
       const { questions: parsed, errors } = await parseQuestionsDocx(
         file,
@@ -618,21 +703,39 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       }
     }
 
+    const targetSubject = (qForm.subject || availableSubjects[0] || '').trim();
+    if (!targetSubject) {
+      setFormError('Pilih atau isi nama mata pelajaran terlebih dahulu.');
+      return null;
+    }
+    if (
+      isRestrictedBySubject &&
+      !normalizedAllowed.includes(targetSubject.toLowerCase())
+    ) {
+      setFormError(`Anda hanya diperbolehkan menyimpan soal pada mapel: ${availableSubjects.join(', ')}.`);
+      return null;
+    }
+
     const builtOptions: QuestionOption[] = OPTION_KEYS.map((key) => ({
       key,
       text: qForm.options[key].text.trim(),
       imageUrl: qForm.options[key].imageUrl.trim() || undefined,
     }));
 
+    const generatedId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `q-man-${crypto.randomUUID()}`
+        : `q-man-${Date.now()}`;
+
     return {
-      id: qForm.id || `q-man-${Date.now()}`,
-      subject: qForm.subject.trim() || 'Matematika',
+      id: qForm.id || generatedId,
+      subject: targetSubject,
       targetClasses: [...qForm.targetClasses],
       questionText: qForm.questionText.trim(),
       questionImageUrl: qForm.questionImageUrl.trim() || undefined,
       options: builtOptions,
       correctAnswer: qForm.correctAnswer,
-      points: Number(qForm.points) || 10,
+      points: Math.max(1, Number(qForm.points) || 10),
       orderIndex: Math.max(1, Number(qForm.orderIndex) || 1),
     };
   };
@@ -641,6 +744,14 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     setFormError('');
     const payload = buildQuestionPayloadFromForm();
     if (!payload) return;
+
+    const currentIdx = goToNext && qForm.id
+      ? filteredQuestions.findIndex((item) => item.id === qForm.id)
+      : -1;
+    const capturedNextQuestion =
+      currentIdx >= 0 && currentIdx + 1 < filteredQuestions.length
+        ? filteredQuestions[currentIdx + 1]
+        : null;
 
     setIsSavingQuestion(true);
     try {
@@ -651,16 +762,9 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           : `Soal baru Nomor ${payload.orderIndex} (${payload.subject}) berhasil disimpan.`
       );
 
-      if (goToNext && qForm.id) {
-        const currentIdx = filteredQuestions.findIndex((item) => item.id === qForm.id);
-        const nextQuestion =
-          currentIdx >= 0 && currentIdx + 1 < filteredQuestions.length
-            ? filteredQuestions[currentIdx + 1]
-            : null;
-        if (nextQuestion) {
-          setQForm(questionToFormState(nextQuestion));
-          return;
-        }
+      if (goToNext && capturedNextQuestion) {
+        setQForm(questionToFormState(capturedNextQuestion));
+        return;
       }
       setQuestionModalOpen(false);
     } finally {
@@ -811,6 +915,15 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           </button>
         </div>
       </div>
+
+      {activeInProgressSubjectSet.size > 0 && (
+        <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-xs sm:text-sm flex items-start gap-2.5">
+          <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+          <span>
+            <strong>Perhatian Sesi Aktif:</strong> Ada peserta yang sedang mengerjakan ujian saat ini. Mengubah durasi, menghapus soal, atau mengacak bank soal dapat memengaruhi peserta yang baru memulai sesi.
+          </span>
+        </div>
+      )}
 
       {feedback && (
         <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center justify-between gap-3">
@@ -985,32 +1098,30 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     <div className="text-xs text-slate-500">{sched.title}</div>
                   </td>
                   <td className="py-2.5 px-4">
-                    <input
-                      type="number"
+                    <ScheduleInlineNumberInput
+                      value={sched.kkm}
                       min={0}
                       max={100}
-                      value={sched.kkm}
-                      onChange={(e) =>
-                        void handleUpdateScheduleKkmOrStatus(sched, {
-                          kkm: Number(e.target.value) || 0,
-                        })
+                      fallback={75}
+                      onCommit={(nextVal) =>
+                        void handleUpdateScheduleKkmOrStatus(sched, { kkm: nextVal })
                       }
-                      className="w-16 px-2 py-1 rounded-lg border border-slate-300 font-mono text-xs font-bold text-center"
+                      className="w-16 px-2 py-1 rounded-lg border border-slate-300 font-mono text-xs font-bold text-center focus:outline-none focus:ring-2 focus:ring-emerald-700"
                     />
                   </td>
                   <td className="py-2.5 px-4">
                     <div className="inline-flex items-center gap-1">
-                      <input
-                        type="number"
+                      <ScheduleInlineNumberInput
+                        value={sched.durationMinutes}
                         min={5}
                         max={300}
-                        value={sched.durationMinutes}
-                        onChange={(e) =>
+                        fallback={60}
+                        onCommit={(nextVal) =>
                           void handleUpdateScheduleKkmOrStatus(sched, {
-                            durationMinutes: Number(e.target.value) || 60,
+                            durationMinutes: nextVal,
                           })
                         }
-                        className="w-16 px-2 py-1 rounded-lg border border-slate-300 font-mono text-xs text-center"
+                        className="w-16 px-2 py-1 rounded-lg border border-slate-300 font-mono text-xs text-center focus:outline-none focus:ring-2 focus:ring-emerald-700"
                       />
                       <span className="text-xs text-slate-500">mnt</span>
                     </div>
@@ -1142,17 +1253,27 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           </p>
 
           <div className="flex flex-wrap items-center gap-2">
-            <select
-              value={importDocxSubject}
-              onChange={(e) => setImportDocxSubject(e.target.value)}
-              className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium"
-            >
-              {availableSubjects.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
+            {availableSubjects.length > 0 ? (
+              <select
+                value={importDocxSubject || availableSubjects[0]}
+                onChange={(e) => setImportDocxSubject(e.target.value)}
+                className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium"
+              >
+                {availableSubjects.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={importDocxSubject}
+                onChange={(e) => setImportDocxSubject(e.target.value)}
+                placeholder="Nama mata pelajaran..."
+                className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium"
+              />
+            )}
             <button
               type="button"
               onClick={() => setShowDocxClassPicker((v) => !v)}
@@ -1432,17 +1553,28 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   <label className="block text-xs font-semibold text-slate-600 mb-1">
                     Mata Pelajaran
                   </label>
-                  <select
-                    value={qForm.subject}
-                    onChange={(e) => setQForm((prev) => ({ ...prev, subject: e.target.value }))}
-                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium"
-                  >
-                    {availableSubjects.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
-                  </select>
+                  {availableSubjects.length > 0 ? (
+                    <select
+                      value={qForm.subject || availableSubjects[0]}
+                      onChange={(e) => setQForm((prev) => ({ ...prev, subject: e.target.value }))}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium"
+                    >
+                      {availableSubjects.map((s) => (
+                        <option key={s} value={s}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      required
+                      value={qForm.subject}
+                      onChange={(e) => setQForm((prev) => ({ ...prev, subject: e.target.value }))}
+                      placeholder="Mis. Matematika"
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium"
+                    />
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1">

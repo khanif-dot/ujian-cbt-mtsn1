@@ -51,7 +51,17 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingToken, setEditingToken] = useState('');
 
+  // Full Participant Edit Modal State
+  const [editModalParticipant, setEditModalParticipant] = useState<Participant | null>(null);
+  const [editFormNumber, setEditFormNumber] = useState('');
+  const [editFormName, setEditFormName] = useState('');
+  const [editFormClass, setEditFormClass] = useState<string>(ALL_CLASSES[0]);
+  const [editFormToken, setEditFormToken] = useState('');
+  const [editFormActive, setEditFormActive] = useState(true);
+  const [editModalError, setEditModalError] = useState('');
+
   const [importFeedback, setImportFeedback] = useState('');
+  const [importError, setImportError] = useState('');
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [isDeletingAll, setIsDeletingAll] = useState(false);
 
@@ -73,14 +83,31 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
 
   const handleAddSingle = async (e: React.FormEvent) => {
     e.preventDefault();
+    setImportFeedback('');
+    setImportError('');
     const num = newNumber.trim().toUpperCase();
     const name = newName.trim();
     const tkn = (newToken.trim() || generateRandomToken(6)).toUpperCase();
     if (!num || !name) return;
 
+    const existing = participants.find(
+      (p) => p.participantNumber.trim().toUpperCase() === num
+    );
+    if (existing) {
+      setImportError(
+        `Nomor peserta "${num}" sudah terdaftar atas nama ${existing.fullName} (Kelas ${existing.className}). Gunakan tombol Edit pada baris peserta jika ingin mengubah datanya.`
+      );
+      return;
+    }
+
+    const id =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `ptc-${crypto.randomUUID()}`
+        : `ptc-${num.toLowerCase().replace(/[^a-z0-9-]/g, '')}-${Date.now()}`;
+
     await onUpsertParticipants([
       {
-        id: `ptc-${num.toLowerCase().replace(/[^a-z0-9-]/g, '')}-${Date.now()}`,
+        id,
         participantNumber: num,
         token: tkn,
         fullName: name,
@@ -93,6 +120,57 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
     setNewName('');
     setNewToken(generateRandomToken(6));
     setImportFeedback(`Peserta "${name}" (${num}) dengan token ${tkn} berhasil ditambahkan.`);
+  };
+
+  const openEditParticipantModal = (p: Participant) => {
+    setEditModalParticipant(p);
+    setEditFormNumber(p.participantNumber);
+    setEditFormName(p.fullName);
+    setEditFormClass(p.className);
+    setEditFormToken(p.token || '');
+    setEditFormActive(p.isActive);
+    setEditModalError('');
+  };
+
+  const handleSaveParticipantModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editModalParticipant) return;
+    setEditModalError('');
+
+    const num = editFormNumber.trim().toUpperCase();
+    const name = editFormName.trim();
+    const tkn = (editFormToken.trim() || generateRandomToken(6)).toUpperCase();
+
+    if (!num || !name) {
+      setEditModalError('Nomor peserta dan nama lengkap wajib diisi.');
+      return;
+    }
+
+    const duplicate = participants.find(
+      (p) =>
+        p.id !== editModalParticipant.id &&
+        p.participantNumber.trim().toUpperCase() === num
+    );
+    if (duplicate) {
+      setEditModalError(
+        `Nomor peserta "${num}" sudah dipakai oleh ${duplicate.fullName} (Kelas ${duplicate.className}).`
+      );
+      return;
+    }
+
+    await onUpsertParticipants([
+      {
+        ...editModalParticipant,
+        participantNumber: num,
+        fullName: name,
+        className: editFormClass,
+        token: tkn,
+        isActive: editFormActive,
+      },
+    ]);
+    setEditModalParticipant(null);
+    setImportError('');
+    setImportFeedback(`Data peserta "${name}" (${num}) berhasil diperbarui.`);
   };
 
   const handleBulkApplyUniformToken = async (e: React.FormEvent) => {
@@ -227,9 +305,29 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
         </div>
       </div>
 
+      {importError && (
+        <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 text-sm flex items-center justify-between gap-3">
+          <span>{importError}</span>
+          <button
+            type="button"
+            onClick={() => setImportError('')}
+            className="p-1 rounded-lg hover:bg-rose-100 text-rose-700 cursor-pointer shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {importFeedback && (
-        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm">
-          {importFeedback}
+        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center justify-between gap-3">
+          <span>{importFeedback}</span>
+          <button
+            type="button"
+            onClick={() => setImportFeedback('')}
+            className="p-1 rounded-lg hover:bg-emerald-100 text-emerald-700 cursor-pointer shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -480,18 +578,42 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
                       <td className="py-2.5 px-4 font-mono font-semibold text-emerald-900">
                         {p.className}
                       </td>
-                      <td className="py-2.5 px-4 text-xs font-medium text-emerald-700">
-                        {p.isActive ? 'Aktif' : 'Nonaktif'}
-                      </td>
-                      <td className="py-2.5 px-4 text-right">
+                      <td className="py-2.5 px-4 text-xs font-medium">
                         <button
                           type="button"
-                          onClick={() => void onDeleteParticipant(p.id)}
-                          title="Hapus peserta"
-                          className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                          onClick={() =>
+                            void onUpsertParticipants([{ ...p, isActive: !p.isActive }])
+                          }
+                          title="Klik untuk mengaktifkan atau menonaktifkan peserta"
+                          className={`px-2.5 py-1 rounded-lg border text-xs font-semibold cursor-pointer transition-colors ${
+                            p.isActive
+                              ? 'bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100'
+                              : 'bg-slate-100 border-slate-200 text-slate-500 hover:bg-slate-200'
+                          }`}
                         >
-                          <Trash2 className="w-4 h-4" />
+                          {p.isActive ? 'Aktif' : 'Nonaktif'}
                         </button>
+                      </td>
+                      <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => openEditParticipantModal(p)}
+                            title="Edit profil peserta"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-emerald-50 hover:border-emerald-300 text-slate-700 hover:text-emerald-900 text-xs font-semibold transition-colors cursor-pointer"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                            <span>Edit</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void onDeleteParticipant(p.id)}
+                            title="Hapus peserta"
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -551,6 +673,127 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Edit Participant */}
+      {editModalParticipant && (
+        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-2xl overflow-hidden">
+            <div className="px-5 py-4 bg-[#064e3b] text-white flex items-center justify-between">
+              <div>
+                <h3 className="font-display font-bold text-base">Edit Data Peserta</h3>
+                <p className="text-xs text-emerald-100/85">
+                  Perbarui nama, kelas, token login, atau status keaktifan peserta.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditModalParticipant(null)}
+                className="p-1.5 rounded-lg text-emerald-100 hover:bg-white/10 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveParticipantModal} className="p-5 space-y-4">
+              {editModalError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-medium">
+                  {editModalError}
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Nomor Peserta
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editFormNumber}
+                  onChange={(e) => setEditFormNumber(e.target.value.toUpperCase())}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 font-mono text-sm font-bold focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Nama Lengkap
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editFormName}
+                  onChange={(e) => setEditFormName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">Kelas</label>
+                  <select
+                    value={editFormClass}
+                    onChange={(e) => setEditFormClass(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-mono text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  >
+                    {ALL_CLASSES.map((cls) => (
+                      <option key={cls} value={cls}>
+                        {cls}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">Token</label>
+                  <div className="flex gap-1">
+                    <input
+                      type="text"
+                      required
+                      value={editFormToken}
+                      onChange={(e) => setEditFormToken(e.target.value.toUpperCase())}
+                      className="w-full px-2.5 py-2 rounded-xl border border-slate-300 font-mono text-sm font-bold focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                    />
+                    <button
+                      type="button"
+                      title="Acak token"
+                      onClick={() => setEditFormToken(generateRandomToken(6))}
+                      className="p-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer shrink-0"
+                    >
+                      <Dices className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <label className="flex items-center gap-2.5 text-xs font-semibold text-slate-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={editFormActive}
+                  onChange={(e) => setEditFormActive(e.target.checked)}
+                  className="w-4 h-4 accent-[#064e3b]"
+                />
+                <span>Akun peserta aktif (diizinkan login ujian)</span>
+              </label>
+
+              <div className="flex justify-end gap-2.5 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setEditModalParticipant(null)}
+                  className="px-4 py-2 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm font-semibold cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-sm font-semibold cursor-pointer"
+                >
+                  Simpan Perubahan
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

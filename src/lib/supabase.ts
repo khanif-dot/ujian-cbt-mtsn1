@@ -93,17 +93,26 @@ export function getSupabaseConfigSource(): SupabaseConfigSource {
   } catch {
     // Ignore localStorage parse errors
   }
-  const envUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-  const envKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+  const metaEnv = (import.meta as { env?: Record<string, string | undefined> }).env;
+  const envUrl = metaEnv?.VITE_SUPABASE_URL;
+  const envKey = metaEnv?.VITE_SUPABASE_ANON_KEY;
   if (envUrl?.trim() && envKey?.trim()) {
     return 'env';
   }
   return 'default';
 }
 
+let runtimeServiceRoleKey = '';
+
+export function clearRuntimeServiceRoleKey(): void {
+  runtimeServiceRoleKey = '';
+  cachedAdminClient = null;
+}
+
 export function getSupabaseConfig(): SupabaseRuntimeConfig {
-  const envUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-  const envKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+  const metaEnv = (import.meta as { env?: Record<string, string | undefined> }).env;
+  const envUrl = metaEnv?.VITE_SUPABASE_URL;
+  const envKey = metaEnv?.VITE_SUPABASE_ANON_KEY;
 
   try {
     const raw = localStorage.getItem(RUNTIME_CONFIG_KEY);
@@ -113,7 +122,7 @@ export function getSupabaseConfig(): SupabaseRuntimeConfig {
         return {
           url: parsed.url.trim(),
           anonKey: parsed.anonKey.trim(),
-          serviceRoleKey: parsed.serviceRoleKey?.trim() || '',
+          serviceRoleKey: runtimeServiceRoleKey,
           schema: parsed.schema?.trim() || 'public',
           autoSyncIntervalSec:
             typeof parsed.autoSyncIntervalSec === 'number' && parsed.autoSyncIntervalSec >= 3
@@ -130,7 +139,7 @@ export function getSupabaseConfig(): SupabaseRuntimeConfig {
   return {
     url: (envUrl && envUrl.trim()) || DEFAULT_SUPABASE_URL,
     anonKey: (envKey && envKey.trim()) || DEFAULT_SUPABASE_ANON_KEY,
-    serviceRoleKey: '',
+    serviceRoleKey: runtimeServiceRoleKey,
     schema: 'public',
     autoSyncIntervalSec: 8,
     enableRealtime: true,
@@ -143,13 +152,12 @@ export function saveSupabaseConfig(
   extra?: Partial<Omit<SupabaseRuntimeConfig, 'url' | 'anonKey'>>
 ): void {
   const current = getSupabaseConfig();
-  const next: SupabaseRuntimeConfig = {
+  if (extra?.serviceRoleKey !== undefined) {
+    runtimeServiceRoleKey = extra.serviceRoleKey.trim();
+  }
+  const persistedConfig: Omit<SupabaseRuntimeConfig, 'serviceRoleKey'> = {
     url: url.trim(),
     anonKey: anonKey.trim(),
-    serviceRoleKey:
-      extra?.serviceRoleKey !== undefined
-        ? extra.serviceRoleKey.trim()
-        : current.serviceRoleKey || '',
     schema: extra?.schema?.trim() || current.schema || 'public',
     autoSyncIntervalSec:
       extra?.autoSyncIntervalSec !== undefined && extra.autoSyncIntervalSec >= 3
@@ -158,13 +166,14 @@ export function saveSupabaseConfig(
     enableRealtime:
       extra?.enableRealtime !== undefined ? extra.enableRealtime : current.enableRealtime ?? true,
   };
-  localStorage.setItem(RUNTIME_CONFIG_KEY, JSON.stringify(next));
+  localStorage.setItem(RUNTIME_CONFIG_KEY, JSON.stringify(persistedConfig));
   cachedClient = null;
   cachedAdminClient = null;
 }
 
 export function resetSupabaseConfig(): void {
   localStorage.removeItem(RUNTIME_CONFIG_KEY);
+  runtimeServiceRoleKey = '';
   cachedClient = null;
   cachedAdminClient = null;
 }
@@ -185,8 +194,11 @@ let cachedAdminClient: SupabaseClient | null = null;
 
 export function getSupabaseClient(): SupabaseClient {
   if (cachedClient) return cachedClient;
-  const { url, anonKey } = getSupabaseConfig();
+  const { url, anonKey, schema } = getSupabaseConfig();
   cachedClient = createClient(url, anonKey, {
+    db: {
+      schema: (schema || 'public') as 'public',
+    },
     auth: {
       persistSession: false,
       autoRefreshToken: false,
@@ -202,15 +214,18 @@ export function getSupabaseClient(): SupabaseClient {
 
 /**
  * Opsional: Client khusus Admin menggunakan Service Role Key (bila diisi di pengaturan Admin).
- * Hanya digunakan di sisi panel Admin untuk sinkronisasi penuh tabel terproteksi RLS seperti `questions`.
+ * Disimpan hanya di memori sesi browser (tidak persisten di localStorage).
  */
 export function getSupabaseAdminClient(): SupabaseClient | null {
   if (!isLiveSupabaseConfigured()) return null;
-  const { url, serviceRoleKey } = getSupabaseConfig();
+  const { url, serviceRoleKey, schema } = getSupabaseConfig();
   const key = serviceRoleKey?.trim();
   if (!key) return null;
   if (cachedAdminClient) return cachedAdminClient;
   cachedAdminClient = createClient(url, key, {
+    db: {
+      schema: (schema || 'public') as 'public',
+    },
     auth: {
       persistSession: false,
       autoRefreshToken: false,
@@ -244,9 +259,9 @@ CREATE TABLE IF NOT EXISTS public.school_profile (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 2. Tabel Peserta Ujian (Kelas 7A - 9I) dengan Kolom Token
+-- 2. Tabel Peserta Ujian (Kelas 7A - 9I) dengan Kolom Token (id TEXT agar kompatibel seed & UUID)
 CREATE TABLE IF NOT EXISTS public.participants (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   participant_number TEXT UNIQUE NOT NULL,
   token TEXT NOT NULL DEFAULT 'CBT2026',
   full_name TEXT NOT NULL,
@@ -254,6 +269,17 @@ CREATE TABLE IF NOT EXISTS public.participants (
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'participants' AND column_name = 'id' AND data_type = 'uuid'
+  ) THEN
+    ALTER TABLE public.participants ALTER COLUMN id TYPE TEXT USING id::text;
+    ALTER TABLE public.participants ALTER COLUMN id SET DEFAULT gen_random_uuid()::text;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_participants_number ON public.participants(participant_number);
 CREATE INDEX IF NOT EXISTS idx_participants_class ON public.participants(class_name);
@@ -297,6 +323,7 @@ CREATE TABLE IF NOT EXISTS public.exam_results (
   subject TEXT NOT NULL DEFAULT '',
   answers JSONB NOT NULL DEFAULT '{}'::jsonb,
   flagged_questions TEXT[] NOT NULL DEFAULT '{}',
+  question_ids TEXT[] DEFAULT NULL,
   correct_count INTEGER NOT NULL DEFAULT 0,
   total_questions INTEGER NOT NULL DEFAULT 0,
   score NUMERIC(5,2) NOT NULL DEFAULT 0,
@@ -308,9 +335,26 @@ CREATE TABLE IF NOT EXISTS public.exam_results (
   UNIQUE (participant_number, exam_id)
 );
 
+ALTER TABLE public.exam_results ADD COLUMN IF NOT EXISTS question_ids TEXT[] DEFAULT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_exam_results_class ON public.exam_results(class_name);
 CREATE INDEX IF NOT EXISTS idx_exam_results_subject ON public.exam_results(subject);
 CREATE INDEX IF NOT EXISTS idx_exam_results_status ON public.exam_results(status);
+
+-- 6. Tabel Akun Staf & RBAC (Proktor, Guru Mapel, Administrator)
+CREATE TABLE IF NOT EXISTS public.staff_accounts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role_type TEXT NOT NULL DEFAULT 'guru_mapel' CHECK (role_type IN ('admin', 'proktor', 'guru_mapel', 'custom')),
+  role_label TEXT NOT NULL DEFAULT 'Guru Mapel',
+  allowed_tabs TEXT[] NOT NULL DEFAULT '{}',
+  assigned_subjects TEXT[] NOT NULL DEFAULT '{}',
+  restrict_to_assigned_subjects BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================================
 -- AKTIFKAN ROW LEVEL SECURITY (RLS) & HAK AKSES TABEL (GRANT)
@@ -321,6 +365,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.school_profile TO anon, aut
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.participants TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.exam_schedules TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.exam_results TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.staff_accounts TO anon, authenticated;
 
 -- Blokir akses SELECT langsung tabel questions dari role anon agar correct_answer aman
 REVOKE ALL ON TABLE public.questions FROM anon;
@@ -331,6 +376,7 @@ ALTER TABLE public.participants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.exam_schedules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.exam_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff_accounts ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "Public read school_profile" ON public.school_profile;
 DROP POLICY IF EXISTS "Allow insert school_profile" ON public.school_profile;
@@ -381,9 +427,27 @@ CREATE POLICY "Allow delete exam_results" ON public.exam_results
 CREATE POLICY "Read exam_results for recap" ON public.exam_results
   FOR SELECT USING (true);
 
+DROP POLICY IF EXISTS "Public read staff_accounts" ON public.staff_accounts;
+DROP POLICY IF EXISTS "Allow insert staff_accounts" ON public.staff_accounts;
+DROP POLICY IF EXISTS "Allow update staff_accounts" ON public.staff_accounts;
+DROP POLICY IF EXISTS "Allow delete staff_accounts" ON public.staff_accounts;
+CREATE POLICY "Public read staff_accounts" ON public.staff_accounts FOR SELECT USING (true);
+CREATE POLICY "Allow insert staff_accounts" ON public.staff_accounts FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow update staff_accounts" ON public.staff_accounts FOR UPDATE USING (true) WITH CHECK (true);
+CREATE POLICY "Allow delete staff_accounts" ON public.staff_accounts FOR DELETE USING (true);
+
 -- ============================================================================
--- FUNGSI RPC AMAN (SECURITY DEFINER) — TANPA MEMBOCORKAN KUNCI JAWABAN
+-- FUNGSI RPC AMAN (SECURITY DEFINER) — WAKTU SERVER, GUARD, & PENILAIAN
 -- ============================================================================
+CREATE OR REPLACE FUNCTION public.get_server_time()
+RETURNS TIMESTAMPTZ
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT NOW();
+$$;
+
 CREATE OR REPLACE FUNCTION public.get_student_questions(p_class_name TEXT, p_subject TEXT DEFAULT NULL)
 RETURNS TABLE (
   id TEXT,
@@ -406,6 +470,73 @@ AS $$
   ORDER BY q.order_index ASC, q.id ASC;
 $$;
 
+-- Guard Atomik Progres Ujian: menolak menimpa baris yang sudah submitted/flagged
+CREATE OR REPLACE FUNCTION public.upsert_exam_progress(
+  p_result_id TEXT,
+  p_participant_id TEXT,
+  p_participant_number TEXT,
+  p_student_name TEXT,
+  p_class_name TEXT,
+  p_exam_id TEXT,
+  p_exam_title TEXT,
+  p_subject TEXT,
+  p_answers JSONB,
+  p_flagged_questions TEXT[],
+  p_total_questions INTEGER,
+  p_tab_switch_count INTEGER,
+  p_started_at TIMESTAMPTZ,
+  p_question_ids TEXT[] DEFAULT NULL
+)
+RETURNS TABLE (
+  applied BOOLEAN,
+  current_status TEXT,
+  submitted_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_existing_status TEXT;
+  v_existing_submitted TIMESTAMPTZ;
+BEGIN
+  SELECT er.status, er.submitted_at
+  INTO v_existing_status, v_existing_submitted
+  FROM public.exam_results er
+  WHERE er.participant_number = p_participant_number
+    AND er.exam_id = p_exam_id;
+
+  IF FOUND AND (v_existing_status <> 'in_progress' OR v_existing_submitted IS NOT NULL) THEN
+    RETURN QUERY SELECT FALSE, v_existing_status, v_existing_submitted;
+    RETURN;
+  END IF;
+
+  INSERT INTO public.exam_results (
+    id, participant_id, participant_number, student_name, class_name,
+    exam_id, exam_title, subject, answers, flagged_questions, question_ids,
+    correct_count, total_questions, score, tab_switch_count,
+    status, started_at, submitted_at, updated_at
+  )
+  VALUES (
+    p_result_id, p_participant_id, p_participant_number, p_student_name, p_class_name,
+    p_exam_id, p_exam_title, p_subject, p_answers, p_flagged_questions, p_question_ids,
+    0, p_total_questions, 0, p_tab_switch_count,
+    'in_progress', p_started_at, NULL, NOW()
+  )
+  ON CONFLICT (participant_number, exam_id) DO UPDATE SET
+    answers = EXCLUDED.answers,
+    flagged_questions = EXCLUDED.flagged_questions,
+    question_ids = COALESCE(EXCLUDED.question_ids, public.exam_results.question_ids),
+    total_questions = EXCLUDED.total_questions,
+    tab_switch_count = GREATEST(public.exam_results.tab_switch_count, EXCLUDED.tab_switch_count),
+    updated_at = NOW()
+  WHERE public.exam_results.status = 'in_progress'
+    AND public.exam_results.submitted_at IS NULL;
+
+  RETURN QUERY SELECT TRUE, 'in_progress'::TEXT, NULL::TIMESTAMPTZ;
+END;
+$$;
+
 -- Fungsi Penilaian Server-Side & Upsert Skor Akhir ke exam_results
 CREATE OR REPLACE FUNCTION public.submit_exam_and_score(
   p_result_id TEXT,
@@ -419,7 +550,9 @@ CREATE OR REPLACE FUNCTION public.submit_exam_and_score(
   p_answers JSONB,
   p_flagged_questions TEXT[],
   p_tab_switch_count INTEGER,
-  p_started_at TIMESTAMPTZ
+  p_started_at TIMESTAMPTZ,
+  p_max_tab_switches INTEGER DEFAULT 3,
+  p_question_ids TEXT[] DEFAULT NULL
 )
 RETURNS TABLE (
   correct_count INTEGER,
@@ -436,7 +569,19 @@ DECLARE
   v_correct INTEGER := 0;
   v_total_q INTEGER := 0;
   v_score NUMERIC(5,2) := 0;
+  v_existing RECORD;
 BEGIN
+  SELECT er.correct_count, er.total_questions, er.score, er.status, er.submitted_at
+  INTO v_existing
+  FROM public.exam_results er
+  WHERE er.participant_number = p_participant_number
+    AND er.exam_id = p_exam_id;
+
+  IF FOUND AND (v_existing.status <> 'in_progress' OR v_existing.submitted_at IS NOT NULL) THEN
+    RETURN QUERY SELECT v_existing.correct_count, v_existing.total_questions, v_existing.score;
+    RETURN;
+  END IF;
+
   SELECT
     COUNT(*),
     COALESCE(SUM(q.points), 0),
@@ -445,7 +590,8 @@ BEGIN
   INTO v_total_q, v_total_points, v_correct, v_earned_points
   FROM public.questions q
   WHERE p_class_name = ANY(q.target_classes)
-    AND (p_subject IS NULL OR p_subject = '' OR q.subject = p_subject);
+    AND (p_subject IS NULL OR p_subject = '' OR q.subject = p_subject)
+    AND (p_question_ids IS NULL OR array_length(p_question_ids, 1) IS NULL OR q.id = ANY(p_question_ids));
 
   IF v_total_points > 0 THEN
     v_score := ROUND((v_earned_points::NUMERIC / v_total_points::NUMERIC) * 100, 2);
@@ -453,27 +599,30 @@ BEGIN
 
   INSERT INTO public.exam_results (
     id, participant_id, participant_number, student_name, class_name,
-    exam_id, exam_title, subject, answers, flagged_questions,
+    exam_id, exam_title, subject, answers, flagged_questions, question_ids,
     correct_count, total_questions, score, tab_switch_count,
     status, started_at, submitted_at, updated_at
   )
   VALUES (
     p_result_id, p_participant_id, p_participant_number, p_student_name, p_class_name,
-    p_exam_id, p_exam_title, p_subject, p_answers, p_flagged_questions,
+    p_exam_id, p_exam_title, p_subject, p_answers, p_flagged_questions, p_question_ids,
     v_correct, v_total_q, v_score, p_tab_switch_count,
-    CASE WHEN p_tab_switch_count >= 3 THEN 'flagged' ELSE 'submitted' END,
+    CASE WHEN p_tab_switch_count >= COALESCE(p_max_tab_switches, 3) THEN 'flagged' ELSE 'submitted' END,
     p_started_at, NOW(), NOW()
   )
   ON CONFLICT (participant_number, exam_id) DO UPDATE SET
     answers = EXCLUDED.answers,
     flagged_questions = EXCLUDED.flagged_questions,
+    question_ids = COALESCE(EXCLUDED.question_ids, public.exam_results.question_ids),
     correct_count = EXCLUDED.correct_count,
     total_questions = EXCLUDED.total_questions,
     score = EXCLUDED.score,
-    tab_switch_count = EXCLUDED.tab_switch_count,
+    tab_switch_count = GREATEST(public.exam_results.tab_switch_count, EXCLUDED.tab_switch_count),
     status = EXCLUDED.status,
     submitted_at = NOW(),
-    updated_at = NOW();
+    updated_at = NOW()
+  WHERE public.exam_results.status = 'in_progress'
+    AND public.exam_results.submitted_at IS NULL;
 
   RETURN QUERY SELECT v_correct, v_total_q, v_score;
 END;
@@ -528,9 +677,38 @@ AS $$
   DELETE FROM public.questions WHERE id = p_id;
 $$;
 
+GRANT EXECUTE ON FUNCTION public.get_server_time() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_student_questions(TEXT, TEXT) TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.submit_exam_and_score(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT[], INTEGER, TIMESTAMPTZ) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.upsert_exam_progress(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT[], INTEGER, INTEGER, TIMESTAMPTZ, TEXT[]) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.submit_exam_and_score(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT[], INTEGER, TIMESTAMPTZ, INTEGER, TEXT[]) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.upsert_questions_batch(JSONB) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.delete_question_by_id(TEXT) TO anon, authenticated;
+
+-- Aktifkan Publikasi Realtime agar Dashboard Proktor & Browser Siswa Sinkron Otomatis
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.exam_results;
+EXCEPTION WHEN duplicate_object OR undefined_object THEN NULL;
+END $$;
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.exam_schedules;
+EXCEPTION WHEN duplicate_object OR undefined_object THEN NULL;
+END $$;
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.participants;
+EXCEPTION WHEN duplicate_object OR undefined_object THEN NULL;
+END $$;
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.school_profile;
+EXCEPTION WHEN duplicate_object OR undefined_object THEN NULL;
+END $$;
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.staff_accounts;
+EXCEPTION WHEN duplicate_object OR undefined_object THEN NULL;
+END $$;
 `;
 

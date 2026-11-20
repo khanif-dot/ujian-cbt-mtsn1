@@ -16,6 +16,8 @@ import { MathText } from '@/src/components/MathText';
 import {
   clearActiveSessionLocal,
   flushExamProgressKeepalive,
+  getServerNowMs,
+  lockoutExamSession,
   saveActiveSessionLocal,
   submitFinalExam,
   upsertExamProgress,
@@ -26,7 +28,7 @@ interface ExamRoomProps {
   profile: SchoolProfile;
   initialSession: ActiveExamSession;
   onExamCompleted: (result: ExamResult) => void;
-  onExamLocked: () => void;
+  onExamLocked: (result?: ExamResult) => void;
 }
 
 function formatRemainingTime(seconds: number): string {
@@ -40,6 +42,15 @@ function formatRemainingTime(seconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+function computeAuthoritativeEndsAtMs(sess: ActiveExamSession): number {
+  const startedMs = new Date(sess.startedAt).getTime();
+  const maxAllowedMs = startedMs + Math.max(1, sess.schedule.durationMinutes) * 60 * 1000;
+  const endsMs = new Date(sess.endsAt).getTime();
+  if (!Number.isFinite(startedMs)) return endsMs;
+  if (!Number.isFinite(endsMs)) return maxAllowedMs;
+  return Math.min(endsMs, maxAllowedMs);
+}
+
 export const ExamRoom: React.FC<ExamRoomProps> = ({
   profile,
   initialSession,
@@ -48,15 +59,15 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
 }) => {
   const [session, setSession] = useState<ActiveExamSession>(initialSession);
   const [remainingSeconds, setRemainingSeconds] = useState<number>(() => {
-    return Math.max(
-      0,
-      Math.floor((new Date(initialSession.endsAt).getTime() - Date.now()) / 1000)
-    );
+    const endMs = computeAuthoritativeEndsAtMs(initialSession);
+    return Math.max(0, Math.floor((endMs - getServerNowMs()) / 1000));
   });
   const [syncIndicator, setSyncIndicator] = useState<'synced' | 'syncing' | 'offline'>('synced');
   const [showNavDrawer, setShowNavDrawer] = useState(false);
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isFinalizingLockout, setIsFinalizingLockout] = useState(false);
+  const [lockedResult, setLockedResult] = useState<ExamResult | undefined>(undefined);
   const [cheatWarningOpen, setCheatWarningOpen] = useState(false);
   const [isViolationLocked, setIsViolationLocked] = useState<boolean>(
     () => initialSession.tabSwitchCount >= initialSession.schedule.maxTabSwitches
@@ -69,10 +80,13 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   sessionRef.current = session;
   const submittingRef = useRef(false);
   const lastViolationTsRef = useRef(0);
+  const lastViewportResizeTsRef = useRef(0);
   const isUnloadingRef = useRef(false);
+  const unloadResetTimerRef = useRef<number | null>(null);
   const blurTimerRef = useRef<number | null>(null);
   const lockedRef = useRef(isViolationLocked);
   lockedRef.current = isViolationLocked;
+  const lockoutPromiseRef = useRef<Promise<ExamResult> | null>(null);
 
   const currentQuestion = session.questions[session.currentIndex];
   const answeredCount = useMemo(
@@ -80,8 +94,23 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     [session.answers]
   );
 
+  const triggerLockoutFinalize = useCallback((lockedSession: ActiveExamSession) => {
+    if (lockoutPromiseRef.current) return lockoutPromiseRef.current;
+    setIsFinalizingLockout(true);
+    const p = lockoutExamSession(lockedSession)
+      .then((res) => {
+        setLockedResult(res);
+        return res;
+      })
+      .finally(() => {
+        setIsFinalizingLockout(false);
+      });
+    lockoutPromiseRef.current = p;
+    return p;
+  }, []);
+
   const handleFinalizeExam = useCallback(async () => {
-    if (submittingRef.current) return;
+    if (submittingRef.current || lockedRef.current) return;
     submittingRef.current = true;
     setIsSubmitting(true);
     try {
@@ -99,13 +128,14 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     }
   }, [onExamCompleted]);
 
-  // Countdown timer synced to endsAt timestamp
+  // Countdown timer synced to server clock & clamped to startedAt + durationMinutes
   useEffect(() => {
+    if (isViolationLocked) return;
+
     const checkAndTick = () => {
-      const left = Math.max(
-        0,
-        Math.floor((new Date(sessionRef.current.endsAt).getTime() - Date.now()) / 1000)
-      );
+      if (lockedRef.current) return true;
+      const endMs = computeAuthoritativeEndsAtMs(sessionRef.current);
+      const left = Math.max(0, Math.floor((endMs - getServerNowMs()) / 1000));
       setRemainingSeconds(left);
       if (left <= 0) {
         void handleFinalizeExam();
@@ -122,9 +152,9 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [handleFinalizeExam]);
+  }, [handleFinalizeExam, isViolationLocked]);
 
-  // Protect active exam from accidental browser refresh & avoid false violations during reload
+  // Protect active exam from accidental browser refresh & clean up timers
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       isUnloadingRef.current = true;
@@ -132,9 +162,12 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         window.clearTimeout(blurTimerRef.current);
         blurTimerRef.current = null;
       }
-      // If user cancels reload dialog, re-enable monitoring after 2s
-      window.setTimeout(() => {
+      if (unloadResetTimerRef.current) {
+        window.clearTimeout(unloadResetTimerRef.current);
+      }
+      unloadResetTimerRef.current = window.setTimeout(() => {
         isUnloadingRef.current = false;
+        unloadResetTimerRef.current = null;
       }, 2000);
 
       if (!submittingRef.current && !lockedRef.current) {
@@ -158,12 +191,15 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('pagehide', handlePageHide);
     return () => {
+      if (unloadResetTimerRef.current) {
+        window.clearTimeout(unloadResetTimerRef.current);
+      }
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('pagehide', handlePageHide);
     };
   }, []);
 
-  // Anti-Cheating: Page Visibility API + Window Blur + Fullscreen Monitoring
+  // Anti-Cheating: Page Visibility API + Window Blur + Keyboard Shortcut Block
   useEffect(() => {
     const recordViolation = () => {
       if (isUnloadingRef.current || submittingRef.current || lockedRef.current) return;
@@ -177,13 +213,15 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           ...prev,
           tabSwitchCount: nextCount,
         };
-        saveActiveSessionLocal(updated);
-        void upsertExamProgress(updated);
         if (nextCount >= prev.schedule.maxTabSwitches) {
+          lockedRef.current = true;
           setIsViolationLocked(true);
           setCheatWarningOpen(false);
           clearActiveSessionLocal();
+          void triggerLockoutFinalize(updated);
         } else {
+          saveActiveSessionLocal(updated);
+          void upsertExamProgress(updated);
           setCheatWarningOpen(true);
         }
         return updated;
@@ -203,6 +241,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       }
     };
 
+    const onViewportResize = () => {
+      lastViewportResizeTsRef.current = Date.now();
+    };
+
     const onBlur = () => {
       if (isUnloadingRef.current) return;
       if (blurTimerRef.current) {
@@ -210,10 +252,15 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       }
       blurTimerRef.current = window.setTimeout(() => {
         blurTimerRef.current = null;
-        if (!isUnloadingRef.current && !document.hasFocus()) {
+        const recentMobileResize = Date.now() - lastViewportResizeTsRef.current < 600;
+        if (
+          !isUnloadingRef.current &&
+          !document.hasFocus() &&
+          (!recentMobileResize || document.hidden)
+        ) {
           recordViolation();
         }
-      }, 300);
+      }, 350);
     };
 
     const onFocus = () => {
@@ -227,10 +274,23 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       setIsFullscreen(Boolean(document.fullscreenElement));
     };
 
+    const onKeyDown = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      if (
+        e.key === 'F12' ||
+        ((e.ctrlKey || e.metaKey) && ['c', 'x', 'u', 's', 'p'].includes(key)) ||
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && ['i', 'j', 'c'].includes(key))
+      ) {
+        e.preventDefault();
+      }
+    };
+
     document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('blur', onBlur);
     window.addEventListener('focus', onFocus);
+    window.addEventListener('keydown', onKeyDown);
     document.addEventListener('fullscreenchange', onFullscreenChange);
+    window.visualViewport?.addEventListener('resize', onViewportResize);
 
     return () => {
       if (blurTimerRef.current) {
@@ -239,9 +299,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener('keydown', onKeyDown);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
+      window.visualViewport?.removeEventListener('resize', onViewportResize);
     };
-  }, []);
+  }, [triggerLockoutFinalize]);
 
   const persistProgress = useCallback(async (updated: ActiveExamSession) => {
     setSyncIndicator('syncing');
@@ -324,11 +386,20 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const selectedAnswer = session.answers[currentQuestion.id];
   const isFlagged = session.flaggedQuestions.includes(currentQuestion.id);
   const isTimeCritical = remainingSeconds <= 300;
+  const isContentObscured = cheatWarningOpen || isViolationLocked;
+  const visibleOptions = useMemo(() => {
+    const filtered = currentQuestion.options.filter(
+      (opt) => (opt.text && opt.text.trim() !== '') || Boolean(opt.imageUrl)
+    );
+    return filtered.length >= 2 ? filtered : currentQuestion.options;
+  }, [currentQuestion]);
 
   return (
     <div
       className="min-h-screen bg-slate-100 flex flex-col select-none"
       onContextMenu={(e) => e.preventDefault()}
+      onCopy={(e) => e.preventDefault()}
+      onCut={(e) => e.preventDefault()}
     >
       {/* Top Exam Bar */}
       <header className="sticky top-0 z-30 bg-[#064e3b] text-white border-b border-emerald-900/50 shadow-sm">
@@ -383,10 +454,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
             <button
               type="button"
               onClick={() => setShowSubmitModal(true)}
-              className="hidden sm:inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-emerald-950 hover:bg-emerald-50 text-xs sm:text-sm font-bold transition-colors cursor-pointer whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2 rounded-lg bg-white text-emerald-950 hover:bg-emerald-50 text-xs sm:text-sm font-bold transition-colors cursor-pointer whitespace-nowrap"
             >
               <Send className="w-3.5 h-3.5" />
-              <span>Akhiri Ujian</span>
+              <span className="sm:hidden">Selesai</span>
+              <span className="hidden sm:inline">Akhiri Ujian</span>
             </button>
           </div>
         </div>
@@ -416,8 +488,12 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         </div>
       </div>
 
-      {/* Main Content Split: Question Stage + Question Palette */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      {/* Main Content Split: Question Stage + Question Palette (blurred behind cheat modals) */}
+      <main
+        className={`flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start transition-all ${
+          isContentObscured ? 'blur-md pointer-events-none select-none opacity-40' : ''
+        }`}
+      >
         {/* Question Canvas */}
         <section className="lg:col-span-8 bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
           <div className="px-5 sm:px-7 py-4 border-b border-slate-100 flex items-center justify-between gap-4 bg-slate-50/70">
@@ -454,7 +530,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
             </div>
 
             <div className="space-y-3" role="radiogroup" aria-label="Pilihan Jawaban">
-              {currentQuestion.options.map((opt) => {
+              {visibleOptions.map((opt) => {
                 const isSelected = selectedAnswer === opt.key;
                 return (
                   <button
@@ -751,16 +827,20 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
             </div>
             <button
               type="button"
-              onClick={() => {
+              disabled={isFinalizingLockout}
+              onClick={async () => {
+                const res = lockoutPromiseRef.current
+                  ? await lockoutPromiseRef.current.catch(() => lockedResult)
+                  : lockedResult;
                 clearActiveSessionLocal();
                 if (document.fullscreenElement && document.exitFullscreen) {
                   void document.exitFullscreen().catch(() => {});
                 }
-                onExamLocked();
+                onExamLocked(res);
               }}
-              className="w-full py-3 rounded-xl bg-red-700 hover:bg-red-800 text-white font-semibold text-sm cursor-pointer"
+              className="w-full py-3 rounded-xl bg-red-700 hover:bg-red-800 text-white font-semibold text-sm cursor-pointer disabled:opacity-60"
             >
-              Kembali ke Halaman Login
+              {isFinalizingLockout ? 'Menyimpan Jawaban Terakhir...' : 'Kembali ke Halaman Login'}
             </button>
           </div>
         </div>

@@ -30,10 +30,16 @@ export const ExamCompletedView: React.FC<ExamCompletedViewProps> = ({
           )}
           <div className="inline-flex items-center justify-center gap-1.5 text-emerald-200 text-xs font-semibold">
             <CheckCircle2 className="w-4 h-4" />
-            <span>Ujian Berhasil Dikumpulkan</span>
+            <span>
+              {result.status === 'flagged'
+                ? 'Ujian Dikumpulkan (Tercatat Pelanggaran Tab)'
+                : 'Ujian Berhasil Dikumpulkan'}
+            </span>
           </div>
           <h1 className="font-display text-2xl font-bold tracking-tight text-balance">
-            Selamat, Anda Telah Menyelesaikan Ujian!
+            {result.status === 'flagged'
+              ? 'Sesi Ujian Anda Telah Dihentikan & Disimpan'
+              : 'Selamat, Anda Telah Menyelesaikan Ujian!'}
           </h1>
           <p className="text-sm text-emerald-100/90">
             {profile.examTitle} · {result.subject || result.examTitle}

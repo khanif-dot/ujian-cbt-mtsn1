@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertOctagon,
   ArrowRight,
@@ -20,6 +20,8 @@ interface StudentLoginPageProps {
   profile: SchoolProfile;
   schedules: ExamSchedule[];
   results: ExamResult[];
+  sessionNotice?: string;
+  onDismissNotice?: () => void;
   onStartExam: (participant: Participant, schedule: ExamSchedule) => Promise<void>;
   onOpenAdmin: () => void;
 }
@@ -28,6 +30,8 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   profile,
   schedules,
   results,
+  sessionNotice,
+  onDismissNotice,
   onStartExam,
   onOpenAdmin,
 }) => {
@@ -46,6 +50,36 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   const [errorMsg, setErrorMsg] = useState('');
   const [isChecking, setIsChecking] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const adminTapCountRef = useRef(0);
+  const adminTapTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (adminTapTimerRef.current !== null) {
+        window.clearTimeout(adminTapTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleAdminTriggerClick = () => {
+    if (adminTapTimerRef.current !== null) {
+      window.clearTimeout(adminTapTimerRef.current);
+      adminTapTimerRef.current = null;
+    }
+
+    const nextCount = adminTapCountRef.current + 1;
+    if (nextCount >= 7) {
+      adminTapCountRef.current = 0;
+      onOpenAdmin();
+      return;
+    }
+
+    adminTapCountRef.current = nextCount;
+    adminTapTimerRef.current = window.setTimeout(() => {
+      adminTapCountRef.current = 0;
+      adminTapTimerRef.current = null;
+    }, 3000);
+  };
 
   const availableSubjects = useMemo(() => {
     const active = schedules.filter((s) => s.isActive);
@@ -67,12 +101,10 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   ): ExamResult | null => {
     if (!participant || !schedule) return null;
     const normNum = participant.participantNumber.trim().toUpperCase();
-    const normSubj = schedule.subject.trim().toLowerCase();
     return (
       results.find(
         (r) =>
-          r.participantNumber.trim().toUpperCase() === normNum &&
-          (r.examId === schedule.id || r.subject.trim().toLowerCase() === normSubj)
+          r.participantNumber.trim().toUpperCase() === normNum && r.examId === schedule.id
       ) || null
     );
   };
@@ -151,7 +183,12 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
           activeSelectedSchedule
         );
         if (lockCheck.locked) {
-          if (lockCheck.reason === 'submitted') {
+          if (lockCheck.reason === 'network_error') {
+            setErrorMsg(
+              lockCheck.errorMessage ||
+                'Gagal memeriksa status ujian ke server. Periksa koneksi internet lalu coba lagi.'
+            );
+          } else if (lockCheck.reason === 'submitted') {
             setErrorMsg(
               `Anda sudah menyelesaikan ujian mata pelajaran ${activeSelectedSchedule.subject}. Peserta tidak dapat mengulang ujian yang sudah selesai.`
             );
@@ -262,7 +299,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
       </div>
 
       {/* Top Subtle Utility Bar */}
-      <header className="relative z-10 w-full max-w-6xl mx-auto px-6 py-5 flex items-center justify-between gap-4">
+      <header className="relative z-10 w-full max-w-6xl mx-auto px-6 py-5 flex items-center justify-between gap-4 opacity-0">
         <div className="flex items-center gap-2.5 text-sky-950 text-sm">
           <ShieldCheck className="w-4 h-4 text-sky-700 shrink-0" />
           <span className="font-semibold tracking-tight whitespace-nowrap">
@@ -271,7 +308,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
         </div>
         <button
           type="button"
-          onClick={onOpenAdmin}
+          onClick={handleAdminTriggerClick}
           className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-white/80 hover:bg-white text-sky-950 text-xs font-semibold backdrop-blur-sm border border-sky-200/90 shadow-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
           <Lock className="w-3.5 h-3.5 text-sky-700" />
@@ -422,6 +459,24 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                   </select>
                 </div>
               </div>
+
+              {sessionNotice && (
+                <div
+                  role="status"
+                  className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 text-xs sm:text-sm leading-relaxed flex items-start justify-between gap-2"
+                >
+                  <span>{sessionNotice}</span>
+                  {onDismissNotice && (
+                    <button
+                      type="button"
+                      onClick={onDismissNotice}
+                      className="text-amber-800 hover:text-amber-950 font-bold text-xs shrink-0 cursor-pointer"
+                    >
+                      Tutup
+                    </button>
+                  )}
+                </div>
+              )}
 
               {errorMsg && (
                 <div

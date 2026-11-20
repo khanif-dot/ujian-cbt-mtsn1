@@ -117,6 +117,7 @@ export interface ExamResult {
   subject: string;
   answers: Record<string, OptionKey>;
   flaggedQuestions: string[];
+  questionIds?: string[];
   correctCount: number;
   totalQuestions: number;
   score: number;
@@ -138,4 +139,30 @@ export interface ActiveExamSession {
   tabSwitchCount: number;
   startedAt: string;
   endsAt: string;
+}
+
+export type RecapAttendanceStatus =
+  | 'completed'
+  | 'flagged'
+  | 'in_progress'
+  | 'not_attended';
+
+export interface RecapEntry {
+  id: string;
+  hasResult: boolean;
+  resultId?: string;
+  participantNumber: string;
+  studentName: string;
+  className: string;
+  examId: string;
+  examTitle: string;
+  subject: string;
+  correctCount: number;
+  totalQuestions: number;
+  score: number;
+  tabSwitchCount: number;
+  attendanceStatus: RecapAttendanceStatus;
+  submittedAt: string | null;
+  startedAt: string | null;
+  rawResult?: ExamResult;
 }

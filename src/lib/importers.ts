@@ -10,6 +10,8 @@ import {
   type OptionKey,
   type Participant,
   type Question,
+  type QuestionOption,
+  type RecapEntry,
   type SchoolProfile,
 } from '@/src/types/cbt';
 
@@ -20,6 +22,14 @@ export function generateRandomToken(length = 6): string {
     result += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return result;
+}
+
+function generateUuidLikeId(prefix: string): string {
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `${prefix}-${Date.now().toString(36)}-${rand}`;
 }
 
 /**
@@ -195,7 +205,7 @@ export async function parseParticipantsExcel(file: File): Promise<{
     }
 
     participants.push({
-      id: `ptc-${participantNumber.toLowerCase().replace(/[^a-z0-9-]/g, '')}-${idx}`,
+      id: generateUuidLikeId('ptc'),
       participantNumber: participantNumber.toUpperCase(),
       token: rawToken || generateRandomToken(6),
       fullName,
@@ -224,6 +234,7 @@ export async function parseQuestionsExcel(file: File): Promise<{
 
   const questions: Question[] = [];
   const errors: string[] = [];
+  const subjectOrderCounter = new Map<string, number>();
 
   rows.forEach((row, idx) => {
     const map: Record<string, string> = {};
@@ -245,33 +256,60 @@ export async function parseQuestionsExcel(file: File): Promise<{
     const imgB = map['gambar opsi b'] || map['gambar b'] || map['opsi b gambar'] || '';
     const imgC = map['gambar opsi c'] || map['gambar c'] || map['opsi c gambar'] || '';
     const imgD = map['gambar opsi d'] || map['gambar d'] || map['opsi d gambar'] || '';
-    const rawKey = (map['kunci jawaban'] || map['kunci'] || map['correct_answer'] || 'A').toUpperCase();
-    const points = Number(map['bobot'] || map['poin'] || map['points'] || 10) || 10;
+    const rawKey = (
+      map['kunci jawaban'] ||
+      map['kunci'] ||
+      map['correct_answer'] ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+    const rawPoints = Number(map['bobot'] || map['poin'] || map['points'] || 10);
+    const points = Number.isFinite(rawPoints) && rawPoints > 0 ? rawPoints : 10;
 
-    if (!questionText || (!optA && !imgA) || (!optB && !imgB)) {
-      errors.push(`Baris ${idx + 2}: Teks soal atau opsi A/B belum lengkap.`);
+    if ((!questionText && !questionImageUrl) || (!optA && !imgA) || (!optB && !imgB)) {
+      errors.push(`Baris ${idx + 2}: Teks/gambar soal atau opsi A/B belum lengkap.`);
       return;
     }
 
-    const correctAnswer: OptionKey = (['A', 'B', 'C', 'D'].includes(rawKey)
-      ? rawKey
-      : 'A') as OptionKey;
+    if (!['A', 'B', 'C', 'D'].includes(rawKey)) {
+      errors.push(
+        `Baris ${idx + 2}: Kunci jawaban "${rawKey || '(kosong)'}" tidak valid (wajib A, B, C, atau D).`
+      );
+      return;
+    }
+
+    const correctAnswer = rawKey as OptionKey;
+    const allBuiltOptions: QuestionOption[] = [
+      { key: 'A', text: optA, imageUrl: imgA || undefined },
+      { key: 'B', text: optB, imageUrl: imgB || undefined },
+      { key: 'C', text: optC, imageUrl: imgC || undefined },
+      { key: 'D', text: optD, imageUrl: imgD || undefined },
+    ];
+    const filteredOptions = allBuiltOptions.filter(
+      (opt) => opt.key === 'A' || opt.key === 'B' || Boolean(opt.text || opt.imageUrl)
+    );
+    if (!filteredOptions.some((opt) => opt.key === correctAnswer)) {
+      errors.push(
+        `Baris ${idx + 2}: Kunci jawaban "${correctAnswer}" menunjuk ke opsi yang kosong.`
+      );
+      return;
+    }
+
+    const subjKey = subject.trim().toLowerCase();
+    const nextOrder = (subjectOrderCounter.get(subjKey) ?? 0) + 1;
+    subjectOrderCounter.set(subjKey, nextOrder);
 
     questions.push({
-      id: `q-imp-${Date.now()}-${idx}`,
+      id: `q-imp-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
       subject,
       targetClasses: targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES],
       questionText,
       questionImageUrl: questionImageUrl || undefined,
-      options: [
-        { key: 'A', text: optA, imageUrl: imgA || undefined },
-        { key: 'B', text: optB, imageUrl: imgB || undefined },
-        { key: 'C', text: optC || (imgC ? '' : '-'), imageUrl: imgC || undefined },
-        { key: 'D', text: optD || (imgD ? '' : '-'), imageUrl: imgD || undefined },
-      ],
+      options: filteredOptions,
       correctAnswer,
       points,
-      orderIndex: idx + 1,
+      orderIndex: nextOrder,
     });
   });
 
@@ -279,7 +317,8 @@ export async function parseQuestionsExcel(file: File): Promise<{
 }
 
 /**
- * Import Questions from Word (.docx) supporting LaTeX ($...$), Gambar: <url>, Mapel:, Kelas:
+ * Import Questions from Word (.docx) supporting embedded Word images, LaTeX ($...$),
+ * Gambar: <url>, Mapel:, Kelas:, Bobot:/Poin:
  */
 export async function parseQuestionsDocx(
   file: File,
@@ -287,55 +326,147 @@ export async function parseQuestionsDocx(
   defaultSubject = 'Matematika'
 ): Promise<{ questions: Question[]; errors: string[] }> {
   const arrayBuffer = await file.arrayBuffer();
-  const { value: rawText } = await mammoth.extractRawText({ arrayBuffer });
+  const { value: htmlContent } = await mammoth.convertToHtml({ arrayBuffer });
 
-  const lines = rawText
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
+  // Ekstrak blok paragraf & gambar embedded dari HTML hasil mammoth
+  const tokens: Array<{ type: 'text'; value: string } | { type: 'image'; src: string }> = [];
+  if (typeof DOMParser !== 'undefined') {
+    const doc = new DOMParser().parseFromString(htmlContent, 'text/html');
+    const walkBlock = (el: Element) => {
+      const imgs = el.querySelectorAll('img');
+      const text = (el.textContent || '').replace(/\u00a0/g, ' ').trim();
+      if (text) {
+        text
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .forEach((line) => tokens.push({ type: 'text', value: line }));
+      }
+      imgs.forEach((img) => {
+        const src = img.getAttribute('src')?.trim();
+        if (src) tokens.push({ type: 'image', src });
+      });
+    };
+
+    const blocks = doc.body.querySelectorAll('p, li, h1, h2, h3, h4, td, th');
+    if (blocks.length > 0) {
+      blocks.forEach((b) => {
+        // Avoid double-reading nested <p> inside <li> or <td>
+        if ((b.tagName === 'LI' || b.tagName === 'TD' || b.tagName === 'TH') && b.querySelector('p')) {
+          return;
+        }
+        walkBlock(b);
+      });
+    } else {
+      const fallbackText = (doc.body.textContent || '').trim();
+      fallbackText
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .forEach((line) => tokens.push({ type: 'text', value: line }));
+    }
+  } else {
+    const { value: rawText } = await mammoth.extractRawText({ arrayBuffer });
+    rawText
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .forEach((line) => tokens.push({ type: 'text', value: line }));
+  }
 
   let currentSubject = defaultSubject;
   let currentClasses = defaultTargetClasses.length > 0 ? defaultTargetClasses : [...ALL_CLASSES];
 
   const questions: Question[] = [];
   const errors: string[] = [];
+  const subjectOrderCounter = new Map<string, number>();
 
   let activeQ: {
     questionText: string;
     questionImageUrl?: string;
     options: Partial<Record<OptionKey, string>>;
-    correctAnswer: OptionKey;
+    optionImages: Partial<Record<OptionKey, string>>;
+    lastOptionKey: OptionKey | null;
+    correctAnswer: OptionKey | null;
+    points: number;
   } | null = null;
 
   const flushQuestion = () => {
     if (!activeQ) return;
-    if (activeQ.questionText && activeQ.options.A && activeQ.options.B) {
+    const hasPrompt = Boolean(activeQ.questionText.trim() || activeQ.questionImageUrl);
+    const hasOptA = Boolean(activeQ.options.A?.trim() || activeQ.optionImages.A);
+    const hasOptB = Boolean(activeQ.options.B?.trim() || activeQ.optionImages.B);
+
+    if (hasPrompt && hasOptA && hasOptB) {
+      if (!activeQ.correctAnswer) {
+        errors.push(
+          `Soal "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." tidak memiliki baris "Kunci: A/B/C/D" yang valid.`
+        );
+        activeQ = null;
+        return;
+      }
+
+      const docxOptions: QuestionOption[] = (
+        [
+          { key: 'A', text: (activeQ.options.A || '').trim(), imageUrl: activeQ.optionImages.A },
+          { key: 'B', text: (activeQ.options.B || '').trim(), imageUrl: activeQ.optionImages.B },
+          { key: 'C', text: (activeQ.options.C || '').trim(), imageUrl: activeQ.optionImages.C },
+          { key: 'D', text: (activeQ.options.D || '').trim(), imageUrl: activeQ.optionImages.D },
+        ] as QuestionOption[]
+      ).filter((opt) => opt.key === 'A' || opt.key === 'B' || Boolean(opt.text || opt.imageUrl));
+
+      if (!docxOptions.some((opt) => opt.key === activeQ!.correctAnswer)) {
+        errors.push(
+          `Soal "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." memiliki kunci "${activeQ.correctAnswer}" tetapi opsi tersebut kosong.`
+        );
+        activeQ = null;
+        return;
+      }
+
+      const subjKey = currentSubject.trim().toLowerCase();
+      const nextOrder = (subjectOrderCounter.get(subjKey) ?? 0) + 1;
+      subjectOrderCounter.set(subjKey, nextOrder);
+
       questions.push({
-        id: `q-docx-${Date.now()}-${questions.length + 1}`,
+        id: `q-docx-${Date.now()}-${questions.length + 1}-${Math.random().toString(36).slice(2, 5)}`,
         subject: currentSubject,
         targetClasses: [...currentClasses],
         questionText: activeQ.questionText.trim(),
         questionImageUrl: activeQ.questionImageUrl,
-        options: [
-          { key: 'A', text: activeQ.options.A || '-' },
-          { key: 'B', text: activeQ.options.B || '-' },
-          { key: 'C', text: activeQ.options.C || '-' },
-          { key: 'D', text: activeQ.options.D || '-' },
-        ],
+        options: docxOptions,
         correctAnswer: activeQ.correctAnswer,
-        points: 10,
-        orderIndex: questions.length + 1,
+        points: activeQ.points,
+        orderIndex: nextOrder,
       });
-    } else if (activeQ.questionText) {
-      errors.push(`Soal "${activeQ.questionText.slice(0, 35)}..." dilewati karena opsi A/B kurang.`);
+    } else if (hasPrompt) {
+      errors.push(
+        `Soal "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." dilewati karena opsi A/B kurang.`
+      );
     }
     activeQ = null;
   };
 
-  for (const line of lines) {
+  let expectedNum = 1;
+
+  for (const token of tokens) {
+    if (token.type === 'image') {
+      if (activeQ) {
+        if (activeQ.lastOptionKey && !activeQ.optionImages[activeQ.lastOptionKey]) {
+          activeQ.optionImages[activeQ.lastOptionKey] = token.src;
+        } else if (!activeQ.questionImageUrl) {
+          activeQ.questionImageUrl = token.src;
+        }
+      }
+      continue;
+    }
+
+    const line = token.value;
+
     const subjectMatch = line.match(/^(?:mapel|mata pelajaran)\s*[:=]\s*(.+)$/i);
     if (subjectMatch) {
+      flushQuestion();
       currentSubject = subjectMatch[1].trim();
+      expectedNum = 1;
       continue;
     }
 
@@ -348,36 +479,64 @@ export async function parseQuestionsDocx(
 
     const qStart = line.match(/^(\d+)[\.\)]\s*(.+)$/);
     if (qStart) {
-      flushQuestion();
-      activeQ = {
-        questionText: qStart[2].trim(),
-        options: {},
-        correctAnswer: 'A',
-      };
-      continue;
+      const numVal = Number(qStart[1]);
+      const optCount = activeQ ? Object.keys(activeQ.options).length : 0;
+      // Hindari salah deteksi tahun/angka di tengah teks soal (mis. "2026. ..." atau sebelum opsi dimulai)
+      const isLikelyQuestionStart =
+        !activeQ ||
+        (numVal > 0 &&
+          numVal <= 300 &&
+          (numVal === expectedNum || optCount >= 2 || Boolean(activeQ.correctAnswer)));
+
+      if (isLikelyQuestionStart) {
+        flushQuestion();
+        expectedNum = numVal + 1;
+        activeQ = {
+          questionText: qStart[2].trim(),
+          options: {},
+          optionImages: {},
+          lastOptionKey: null,
+          correctAnswer: null,
+          points: 10,
+        };
+        continue;
+      }
     }
 
-    const imgMatch = line.match(/^(?:gambar|image)\s*[:=]\s*(https?:\/\/\S+)$/i);
+    const imgMatch = line.match(/^(?:gambar|image)\s*[:=]\s*((?:https?:\/\/|data:image\/)\S+)$/i);
     if (imgMatch && activeQ) {
       activeQ.questionImageUrl = imgMatch[1].trim();
       continue;
     }
 
-    const optMatch = line.match(/^([A-Da-d])[\.\)]\s*(.+)$/);
+    const pointsMatch = line.match(/^(?:bobot|poin|points)\s*[:=]\s*(\d+)$/i);
+    if (pointsMatch && activeQ) {
+      const pVal = Number(pointsMatch[1]);
+      if (Number.isFinite(pVal) && pVal > 0) activeQ.points = pVal;
+      continue;
+    }
+
+    const optMatch = line.match(/^([A-Da-d])[\.\)]\s*(.*)$/);
     if (optMatch && activeQ) {
       const key = optMatch[1].toUpperCase() as OptionKey;
       activeQ.options[key] = optMatch[2].trim();
+      activeQ.lastOptionKey = key;
       continue;
     }
 
-    const keyMatch = line.match(/^(?:kunci|jawaban)\s*[:=]\s*([A-Da-d])/i);
+    const keyMatch = line.match(/^(?:kunci(?:\s+jawaban)?|jawaban)\s*[:=]\s*([A-Da-d])\b/i);
     if (keyMatch && activeQ) {
       activeQ.correctAnswer = keyMatch[1].toUpperCase() as OptionKey;
+      activeQ.lastOptionKey = null;
       continue;
     }
 
-    if (activeQ && Object.keys(activeQ.options).length === 0) {
-      activeQ.questionText += ` ${line}`;
+    if (activeQ) {
+      if (activeQ.lastOptionKey) {
+        activeQ.options[activeQ.lastOptionKey] = `${activeQ.options[activeQ.lastOptionKey] || ''} ${line}`.trim();
+      } else {
+        activeQ.questionText += ` ${line}`;
+      }
     }
   }
 
@@ -496,19 +655,35 @@ function getKkmForSubject(schedules: ExamSchedule[], subject: string): number {
   return matched ? matched.kkm : 75;
 }
 
+type ExportableResultRow = ExamResult | RecapEntry;
+
+function getExportAttendanceStatus(
+  row: ExportableResultRow
+): 'completed' | 'flagged' | 'in_progress' | 'not_attended' {
+  if ('attendanceStatus' in row) {
+    return row.attendanceStatus;
+  }
+  if (row.status === 'in_progress') return 'in_progress';
+  if (row.status === 'flagged') return 'flagged';
+  return 'completed';
+}
+
 export function exportExamResultsExcel(
-  results: ExamResult[],
+  results: ExportableResultRow[],
   schedules: ExamSchedule[],
   schoolName: string
 ): void {
   const rows = results.map((r, index) => {
     const kkm = getKkmForSubject(schedules, r.subject);
+    const attStatus = getExportAttendanceStatus(r);
     const kkmLabel =
-      r.status === 'in_progress'
-        ? 'Sedang Ujian'
-        : r.score >= kkm
-          ? 'Tuntas'
-          : 'Belum Tuntas';
+      attStatus === 'not_attended'
+        ? 'Tidak Ikut Ujian'
+        : attStatus === 'in_progress'
+          ? 'Sedang Ujian'
+          : r.score >= kkm
+            ? 'Tuntas'
+            : 'Belum Tuntas';
 
     return {
       No: index + 1,
@@ -516,10 +691,10 @@ export function exportExamResultsExcel(
       'Nama Peserta': r.studentName,
       Kelas: r.className,
       'Mata Pelajaran': r.subject || '-',
-      'Jawaban Benar': r.correctCount,
+      'Jawaban Benar': attStatus === 'not_attended' ? 0 : r.correctCount,
       'Total Soal': r.totalQuestions,
       KKM: kkm,
-      'Nilai Akhir': r.status === 'in_progress' ? 0 : r.score,
+      'Nilai Akhir': attStatus === 'in_progress' || attStatus === 'not_attended' ? 0 : r.score,
       Ketuntasan: kkmLabel,
       'Pelanggaran Tab': r.tabSwitchCount,
       'Waktu Selesai': r.submittedAt ? new Date(r.submittedAt).toLocaleString('id-ID') : '-',
@@ -534,10 +709,10 @@ export function exportExamResultsExcel(
 }
 
 export function exportExamResultsPdf(
-  results: ExamResult[],
+  results: ExportableResultRow[],
   schedules: ExamSchedule[],
   profile: SchoolProfile,
-  filters: { subject: string; className: string }
+  filters: { subject: string; className: string; statusLabel?: string }
 ): void {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
 
@@ -557,29 +732,39 @@ export function exportExamResultsPdf(
   doc.setFontSize(9);
   const mapelText = filters.subject === 'ALL' ? 'Semua Mata Pelajaran' : filters.subject;
   const kelasText = filters.className === 'ALL' ? 'Semua Kelas (7A–9I)' : `Kelas ${filters.className}`;
+  const statusSuffix = filters.statusLabel ? `  |  Status: ${filters.statusLabel}` : '';
   doc.text(
-    `Tahun Ajaran: ${profile.academicYear}  |  Filter Mapel: ${mapelText}  |  Filter Kelas: ${kelasText}`,
+    `Tahun Ajaran: ${profile.academicYear}  |  Filter Mapel: ${mapelText}  |  Filter Kelas: ${kelasText}${statusSuffix}`,
     14,
     34
   );
 
   const tableRows = results.map((r, idx) => {
     const kkm = getKkmForSubject(schedules, r.subject);
+    const attStatus = getExportAttendanceStatus(r);
     const statusText =
-      r.status === 'in_progress'
-        ? 'Aktif'
-        : r.score >= kkm
-          ? 'Tuntas'
-          : 'Belum Tuntas';
+      attStatus === 'not_attended'
+        ? 'Tidak Ikut'
+        : attStatus === 'in_progress'
+          ? 'Aktif'
+          : r.score >= kkm
+            ? 'Tuntas'
+            : 'Belum Tuntas';
     return [
       String(idx + 1),
       r.participantNumber,
       r.studentName,
       r.className,
       r.subject || '-',
-      `${r.correctCount}/${r.totalQuestions}`,
+      attStatus === 'not_attended' && r.totalQuestions === 0
+        ? '-'
+        : `${r.correctCount}/${r.totalQuestions}`,
       String(kkm),
-      r.status === 'in_progress' ? '-' : r.score.toFixed(1),
+      attStatus === 'in_progress'
+        ? '-'
+        : attStatus === 'not_attended'
+          ? '0.0'
+          : r.score.toFixed(1),
       statusText,
     ];
   });
@@ -619,9 +804,31 @@ export function exportExamResultsPdf(
 async function convertDataUrlToPng(dataUrl: string): Promise<string | null> {
   if (!dataUrl) return null;
   if (dataUrl.startsWith('data:image/png')) return dataUrl;
+
+  let effectiveSrc = dataUrl;
+  let revokeObjectUrl: string | null = null;
+  if (/^https?:\/\//i.test(dataUrl)) {
+    try {
+      const resp = await fetch(dataUrl, { mode: 'cors' });
+      if (resp.ok) {
+        const blob = await resp.blob();
+        effectiveSrc = URL.createObjectURL(blob);
+        revokeObjectUrl = effectiveSrc;
+      }
+    } catch {
+      // Fallback to direct <img> load below
+    }
+  }
+
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
+    const cleanup = () => {
+      if (revokeObjectUrl) {
+        URL.revokeObjectURL(revokeObjectUrl);
+        revokeObjectUrl = null;
+      }
+    };
     img.onload = () => {
       try {
         const size = 240;
@@ -630,6 +837,7 @@ async function convertDataUrlToPng(dataUrl: string): Promise<string | null> {
         canvas.height = size;
         const ctx = canvas.getContext('2d');
         if (!ctx) {
+          cleanup();
           resolve(null);
           return;
         }
@@ -638,13 +846,19 @@ async function convertDataUrlToPng(dataUrl: string): Promise<string | null> {
         const w = img.width * scale;
         const h = img.height * scale;
         ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
-        resolve(canvas.toDataURL('image/png'));
+        const png = canvas.toDataURL('image/png');
+        cleanup();
+        resolve(png);
       } catch {
+        cleanup();
         resolve(null);
       }
     };
-    img.onerror = () => resolve(null);
-    img.src = dataUrl;
+    img.onerror = () => {
+      cleanup();
+      resolve(null);
+    };
+    img.src = effectiveSrc;
   });
 }
 
