@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -8,6 +9,7 @@ import {
   Flag,
   LayoutGrid,
   Maximize2,
+  RotateCcw,
   Send,
   ShieldAlert,
   X,
@@ -22,6 +24,13 @@ import {
   submitFinalExam,
   upsertExamProgress,
 } from '@/src/lib/dataStore';
+import {
+  getEffectiveQuestionType,
+  isQuestionAnswered,
+  parseMatchingMap,
+  QUESTION_TYPE_LABELS,
+  TRUE_FALSE_DEFAULT_OPTIONS,
+} from '@/src/lib/questionUtils';
 import type { ActiveExamSession, ExamResult, OptionKey, SchoolProfile } from '@/src/types/cbt';
 
 interface ExamRoomProps {
@@ -84,33 +93,87 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const isUnloadingRef = useRef(false);
   const unloadResetTimerRef = useRef<number | null>(null);
   const blurTimerRef = useRef<number | null>(null);
+  const progressTimerRef = useRef<number | null>(null);
+  const expiryPendingRef = useRef(false);
+  const expiryJitterTimerRef = useRef<number | null>(null);
   const lockedRef = useRef(isViolationLocked);
   lockedRef.current = isViolationLocked;
   const lockoutPromiseRef = useRef<Promise<ExamResult> | null>(null);
 
-  const currentQuestion = session.questions[session.currentIndex];
-  const answeredCount = useMemo(
-    () => Object.keys(session.answers).length,
-    [session.answers]
-  );
+  const [activeMatchingLeftId, setActiveMatchingLeftId] = useState<string | null>(null);
 
-  const triggerLockoutFinalize = useCallback((lockedSession: ActiveExamSession) => {
-    if (lockoutPromiseRef.current) return lockoutPromiseRef.current;
-    setIsFinalizingLockout(true);
-    const p = lockoutExamSession(lockedSession)
-      .then((res) => {
-        setLockedResult(res);
-        return res;
-      })
-      .finally(() => {
-        setIsFinalizingLockout(false);
-      });
-    lockoutPromiseRef.current = p;
-    return p;
+  const currentQuestion = session.questions[session.currentIndex];
+  const currentQuestionType = useMemo(
+    () => (currentQuestion ? getEffectiveQuestionType(currentQuestion) : 'multiple_choice'),
+    [currentQuestion]
+  );
+  const answeredCount = useMemo(
+    () =>
+      session.questions.filter((q) => isQuestionAnswered(q, session.answers[q.id])).length,
+    [session.questions, session.answers]
+  );
+  const flaggedQuestionSet = useMemo(
+    () => new Set(session.flaggedQuestions),
+    [session.flaggedQuestions]
+  );
+  const visibleOptions = useMemo(() => {
+    if (!currentQuestion) return [];
+    if (currentQuestionType === 'true_false') {
+      return Array.isArray(currentQuestion.options) && currentQuestion.options.length >= 2
+        ? currentQuestion.options.slice(0, 2)
+        : TRUE_FALSE_DEFAULT_OPTIONS;
+    }
+    const filtered = currentQuestion.options.filter(
+      (opt) => (opt.text && opt.text.trim() !== '') || Boolean(opt.imageUrl)
+    );
+    return filtered.length >= 2 ? filtered : currentQuestion.options;
+  }, [currentQuestion, currentQuestionType]);
+
+  const currentMatchingMap = useMemo(() => {
+    if (!currentQuestion || currentQuestionType !== 'matching') return {};
+    return parseMatchingMap(session.answers[currentQuestion.id]);
+  }, [currentQuestion, currentQuestionType, session.answers]);
+
+  useEffect(() => {
+    if (!currentQuestion || getEffectiveQuestionType(currentQuestion) !== 'matching') {
+      setActiveMatchingLeftId(null);
+      return;
+    }
+    const leftItems = currentQuestion.matchingData?.leftItems || [];
+    const existingMap = parseMatchingMap(sessionRef.current.answers[currentQuestion.id]);
+    const firstUnpaired = leftItems.find((item) => !existingMap[item.id]);
+    setActiveMatchingLeftId(firstUnpaired?.id || leftItems[0]?.id || null);
+  }, [currentQuestion?.id]);
+
+  const clearPendingProgressTimer = useCallback(() => {
+    if (progressTimerRef.current !== null) {
+      window.clearTimeout(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
   }, []);
+
+  const triggerLockoutFinalize = useCallback(
+    (lockedSession: ActiveExamSession) => {
+      clearPendingProgressTimer();
+      if (lockoutPromiseRef.current) return lockoutPromiseRef.current;
+      setIsFinalizingLockout(true);
+      const p = lockoutExamSession(lockedSession)
+        .then((res) => {
+          setLockedResult(res);
+          return res;
+        })
+        .finally(() => {
+          setIsFinalizingLockout(false);
+        });
+      lockoutPromiseRef.current = p;
+      return p;
+    },
+    [clearPendingProgressTimer]
+  );
 
   const handleFinalizeExam = useCallback(async () => {
     if (submittingRef.current || lockedRef.current) return;
+    clearPendingProgressTimer();
     submittingRef.current = true;
     setIsSubmitting(true);
     try {
@@ -126,7 +189,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     } finally {
       setIsSubmitting(false);
     }
-  }, [onExamCompleted]);
+  }, [clearPendingProgressTimer, onExamCompleted]);
 
   // Countdown timer synced to server clock & clamped to startedAt + durationMinutes
   useEffect(() => {
@@ -138,20 +201,41 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       const left = Math.max(0, Math.floor((endMs - getServerNowMs()) / 1000));
       setRemainingSeconds(left);
       if (left <= 0) {
-        void handleFinalizeExam();
+        if (!submittingRef.current && !expiryPendingRef.current) {
+          expiryPendingRef.current = true;
+          setIsSubmitting(true);
+          const jitterMs = Math.floor(Math.random() * 45_000);
+          expiryJitterTimerRef.current = window.setTimeout(() => {
+            expiryJitterTimerRef.current = null;
+            void handleFinalizeExam();
+          }, jitterMs);
+        }
         return true;
       }
       return false;
     };
 
-    if (checkAndTick()) return;
+    if (checkAndTick()) {
+      return () => {
+        if (expiryJitterTimerRef.current !== null) {
+          window.clearTimeout(expiryJitterTimerRef.current);
+          expiryJitterTimerRef.current = null;
+        }
+      };
+    }
 
     const timer = window.setInterval(() => {
       if (checkAndTick()) {
         window.clearInterval(timer);
       }
     }, 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      if (expiryJitterTimerRef.current !== null) {
+        window.clearTimeout(expiryJitterTimerRef.current);
+        expiryJitterTimerRef.current = null;
+      }
+    };
   }, [handleFinalizeExam, isViolationLocked]);
 
   // Protect active exam from accidental browser refresh & clean up timers
@@ -217,11 +301,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           lockedRef.current = true;
           setIsViolationLocked(true);
           setCheatWarningOpen(false);
-          clearActiveSessionLocal();
           void triggerLockoutFinalize(updated);
         } else {
           saveActiveSessionLocal(updated);
-          void upsertExamProgress(updated);
+          clearPendingProgressTimer();
+          void upsertExamProgress(updated, { includeQuestionIds: false });
           setCheatWarningOpen(true);
         }
         return updated;
@@ -230,9 +314,6 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
 
     const onVisibilityChange = () => {
       if (document.hidden && !isUnloadingRef.current) {
-        if (!submittingRef.current && !lockedRef.current) {
-          flushExamProgressKeepalive(sessionRef.current);
-        }
         window.setTimeout(() => {
           if (document.hidden && !isUnloadingRef.current) {
             recordViolation();
@@ -260,7 +341,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         ) {
           recordViolation();
         }
-      }, 350);
+      }, 1200);
     };
 
     const onFocus = () => {
@@ -293,6 +374,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     window.visualViewport?.addEventListener('resize', onViewportResize);
 
     return () => {
+      clearPendingProgressTimer();
       if (blurTimerRef.current) {
         window.clearTimeout(blurTimerRef.current);
       }
@@ -303,19 +385,32 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       window.visualViewport?.removeEventListener('resize', onViewportResize);
     };
-  }, [triggerLockoutFinalize]);
+  }, [clearPendingProgressTimer, triggerLockoutFinalize]);
 
-  const persistProgress = useCallback(async (updated: ActiveExamSession) => {
-    setSyncIndicator('syncing');
-    try {
-      const res = await upsertExamProgress(updated);
-      setSyncIndicator(res.syncStatus === 'synced' ? 'synced' : 'offline');
-    } catch {
-      setSyncIndicator('offline');
-    }
-  }, []);
+  const persistProgress = useCallback(
+    (updated: ActiveExamSession) => {
+      setSyncIndicator('syncing');
+      clearPendingProgressTimer();
+      progressTimerRef.current = window.setTimeout(() => {
+        progressTimerRef.current = null;
+        if (submittingRef.current || lockedRef.current) return;
+        void (async () => {
+          try {
+            const res = await upsertExamProgress(sessionRef.current || updated, {
+              includeQuestionIds: false,
+            });
+            setSyncIndicator(res.syncStatus === 'synced' ? 'synced' : 'offline');
+          } catch {
+            setSyncIndicator('offline');
+          }
+        })();
+      }, 3500);
+    },
+    [clearPendingProgressTimer]
+  );
 
   const handleSelectOption = (questionId: string, key: OptionKey) => {
+    if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
     const updated: ActiveExamSession = {
       ...session,
       answers: {
@@ -328,8 +423,81 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     void persistProgress(updated);
   };
 
+  const commitMatchingMap = (questionId: string, nextMap: Record<string, string>) => {
+    if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
+    const nextAnswers = { ...session.answers };
+    if (Object.keys(nextMap).length === 0) {
+      delete nextAnswers[questionId];
+    } else {
+      nextAnswers[questionId] = JSON.stringify(nextMap);
+    }
+    const updated: ActiveExamSession = {
+      ...session,
+      answers: nextAnswers,
+    };
+    saveActiveSessionLocal(updated);
+    setSession(updated);
+    void persistProgress(updated);
+  };
+
+  const handlePairMatchingRight = (rightId: string) => {
+    if (!currentQuestion || !currentQuestion.matchingData) return;
+    const leftItems = currentQuestion.matchingData.leftItems;
+    if (leftItems.length === 0) return;
+
+    const targetLeftId =
+      activeMatchingLeftId && leftItems.some((l) => l.id === activeMatchingLeftId)
+        ? activeMatchingLeftId
+        : leftItems.find((l) => !currentMatchingMap[l.id])?.id || leftItems[0].id;
+
+    const nextMap: Record<string, string> = { ...currentMatchingMap };
+    const wasSamePair = nextMap[targetLeftId] === rightId;
+
+    // Ensure 1-to-1 assignment: remove any existing pairing to this rightId
+    for (const [lId, rId] of Object.entries(nextMap)) {
+      if (rId === rightId) {
+        delete nextMap[lId];
+      }
+    }
+
+    if (!wasSamePair) {
+      nextMap[targetLeftId] = rightId;
+      // Advance active left slot to next unpaired item if any
+      const curIdx = leftItems.findIndex((l) => l.id === targetLeftId);
+      let nextUnpaired: string | null = null;
+      for (let offset = 1; offset <= leftItems.length; offset++) {
+        const candidate = leftItems[(curIdx + offset) % leftItems.length];
+        if (!nextMap[candidate.id]) {
+          nextUnpaired = candidate.id;
+          break;
+        }
+      }
+      if (nextUnpaired) {
+        setActiveMatchingLeftId(nextUnpaired);
+      }
+    }
+
+    commitMatchingMap(currentQuestion.id, nextMap);
+  };
+
+  const handleUnpairMatchingLeft = (leftId: string) => {
+    if (!currentQuestion) return;
+    const nextMap = { ...currentMatchingMap };
+    delete nextMap[leftId];
+    commitMatchingMap(currentQuestion.id, nextMap);
+    setActiveMatchingLeftId(leftId);
+  };
+
+  const handleResetMatching = () => {
+    if (!currentQuestion) return;
+    commitMatchingMap(currentQuestion.id, {});
+    const firstLeft = currentQuestion.matchingData?.leftItems[0]?.id || null;
+    setActiveMatchingLeftId(firstLeft);
+  };
+
   const handleToggleFlag = (questionId: string) => {
-    const exists = session.flaggedQuestions.includes(questionId);
+    if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
+    const exists = flaggedQuestionSet.has(questionId);
     const updated: ActiveExamSession = {
       ...session,
       flaggedQuestions: exists
@@ -350,7 +518,6 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     saveActiveSessionLocal(updated);
     setSession(updated);
     setShowNavDrawer(false);
-    void persistProgress(updated);
   };
 
   const handleEnterFullscreen = async () => {
@@ -373,7 +540,13 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           </p>
           <button
             type="button"
-            onClick={() => void handleFinalizeExam()}
+            onClick={() => {
+              clearActiveSessionLocal();
+              if (document.fullscreenElement && document.exitFullscreen) {
+                void document.exitFullscreen().catch(() => {});
+              }
+              onExamLocked();
+            }}
             className="px-4 py-2.5 rounded-xl bg-emerald-800 text-white text-sm font-semibold cursor-pointer"
           >
             Kembali
@@ -384,15 +557,9 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   }
 
   const selectedAnswer = session.answers[currentQuestion.id];
-  const isFlagged = session.flaggedQuestions.includes(currentQuestion.id);
+  const isFlagged = flaggedQuestionSet.has(currentQuestion.id);
   const isTimeCritical = remainingSeconds <= 300;
   const isContentObscured = cheatWarningOpen || isViolationLocked;
-  const visibleOptions = useMemo(() => {
-    const filtered = currentQuestion.options.filter(
-      (opt) => (opt.text && opt.text.trim() !== '') || Boolean(opt.imageUrl)
-    );
-    return filtered.length >= 2 ? filtered : currentQuestion.options;
-  }, [currentQuestion]);
 
   return (
     <div
@@ -496,10 +663,21 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       >
         {/* Question Canvas */}
         <section className="lg:col-span-8 bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-          <div className="px-5 sm:px-7 py-4 border-b border-slate-100 flex items-center justify-between gap-4 bg-slate-50/70">
-            <div className="flex items-center gap-3 text-sm">
+          <div className="px-5 sm:px-7 py-4 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3 bg-slate-50/70">
+            <div className="flex flex-wrap items-center gap-2 sm:gap-3 text-sm">
               <span className="font-display font-bold text-slate-900">
                 Soal Nomor <span className="font-mono tabular-nums">{session.currentIndex + 1}</span>
+              </span>
+              <span
+                className={`px-2 py-0.5 rounded-md text-xs font-semibold border ${
+                  currentQuestionType === 'matching'
+                    ? 'bg-amber-50 border-amber-200 text-amber-800'
+                    : currentQuestionType === 'true_false'
+                      ? 'bg-sky-50 border-sky-200 text-sky-800'
+                      : 'bg-slate-100 border-slate-200 text-slate-700'
+                }`}
+              >
+                {QUESTION_TYPE_LABELS[currentQuestionType]}
               </span>
               <span className="text-slate-300" aria-hidden="true">/</span>
               <span className="text-slate-600 font-medium">{currentQuestion.subject}</span>
@@ -529,50 +707,299 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
               <MathText text={currentQuestion.questionText} />
             </div>
 
-            <div className="space-y-3" role="radiogroup" aria-label="Pilihan Jawaban">
-              {visibleOptions.map((opt) => {
-                const isSelected = selectedAnswer === opt.key;
+            {currentQuestionType === 'matching' && currentQuestion.matchingData ? (
+              (() => {
+                const { leftItems, rightItems } = currentQuestion.matchingData;
+                const rightById = new Map(
+                  rightItems.map((r, rIdx) => [
+                    r.id,
+                    { item: r, letter: String.fromCharCode(65 + rIdx) },
+                  ])
+                );
+                const leftIndexByRightId = new Map<string, number>();
+                leftItems.forEach((l, lIdx) => {
+                  const assignedRight = currentMatchingMap[l.id];
+                  if (assignedRight) {
+                    leftIndexByRightId.set(assignedRight, lIdx + 1);
+                  }
+                });
+                const pairedCount = leftItems.filter((l) => Boolean(currentMatchingMap[l.id])).length;
+
                 return (
-                  <button
-                    key={opt.key}
-                    type="button"
-                    role="radio"
-                    aria-checked={isSelected}
-                    onClick={() => handleSelectOption(currentQuestion.id, opt.key)}
-                    className={`w-full text-left p-4 rounded-xl border transition-all flex items-start gap-4 cursor-pointer min-h-[52px] ${
-                      isSelected
-                        ? 'bg-emerald-50 border-emerald-700 ring-1 ring-emerald-700 text-emerald-950'
-                        : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-800'
-                    }`}
-                  >
-                    <span
-                      className={`w-8 h-8 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 transition-colors ${
-                        isSelected
-                          ? 'bg-[#064e3b] text-white'
-                          : 'bg-slate-100 text-slate-700'
-                      }`}
-                    >
-                      {opt.key}
-                    </span>
-                    <div className="pt-0.5 text-sm sm:text-base leading-relaxed flex-1 space-y-2">
-                      {opt.text && (
-                        <div>
-                          <MathText text={opt.text} />
-                        </div>
-                      )}
-                      {opt.imageUrl && (
-                        <img
-                          src={opt.imageUrl}
-                          alt={`Gambar Opsi ${opt.key}`}
-                          referrerPolicy="no-referrer"
-                          className="max-h-40 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
-                        />
+                  <div className="space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-amber-50/80 border border-amber-200 text-xs text-amber-950">
+                      <div className="flex items-center gap-2">
+                        <ArrowLeftRight className="w-4 h-4 text-amber-700 shrink-0" />
+                        <span>
+                          Klik pernyataan di <strong>kolom kiri</strong>, lalu klik pasangan jawaban yang sesuai di <strong>kolom kanan</strong>. ({' '}
+                          <strong className="font-mono tabular-nums">
+                            {pairedCount}/{leftItems.length}
+                          </strong>{' '}
+                          terjodohkan )
+                        </span>
+                      </div>
+                      {pairedCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleResetMatching}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 font-semibold cursor-pointer"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Reset Pasangan</span>
+                        </button>
                       )}
                     </div>
-                  </button>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+                      {/* Left Column: Prompts */}
+                      <div className="space-y-2.5">
+                        <div className="text-xs font-bold uppercase tracking-wide text-slate-500 px-1">
+                          Kolom Soal / Pernyataan ({leftItems.length})
+                        </div>
+                        {leftItems.map((left, idx) => {
+                          const assignedRightId = currentMatchingMap[left.id];
+                          const matchedRight = assignedRightId
+                            ? rightById.get(assignedRightId)
+                            : undefined;
+                          const isActive = activeMatchingLeftId === left.id;
+
+                          return (
+                            <div
+                              key={left.id}
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => setActiveMatchingLeftId(left.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  setActiveMatchingLeftId(left.id);
+                                }
+                              }}
+                              className={`w-full text-left p-3.5 rounded-xl border transition-all cursor-pointer space-y-2.5 ${
+                                isActive
+                                  ? 'bg-emerald-50/90 border-[#064e3b] ring-2 ring-[#064e3b]/30 shadow-xs'
+                                  : matchedRight
+                                    ? 'bg-emerald-50/40 border-emerald-300 hover:border-emerald-500'
+                                    : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50'
+                              }`}
+                            >
+                              <div className="flex items-start gap-3">
+                                <span
+                                  className={`w-7 h-7 rounded-lg flex items-center justify-center font-mono font-bold text-xs shrink-0 ${
+                                    isActive
+                                      ? 'bg-[#064e3b] text-white'
+                                      : matchedRight
+                                        ? 'bg-emerald-700 text-white'
+                                        : 'bg-slate-100 text-slate-700'
+                                  }`}
+                                >
+                                  {idx + 1}
+                                </span>
+                                <div className="min-w-0 flex-1 space-y-1.5 pt-0.5 text-sm text-slate-900">
+                                  {left.text && (
+                                    <div className="break-words">
+                                      <MathText text={left.text} />
+                                    </div>
+                                  )}
+                                  {left.imageUrl && (
+                                    <img
+                                      src={left.imageUrl}
+                                      alt={`Soal Pasangan ${idx + 1}`}
+                                      referrerPolicy="no-referrer"
+                                      className="max-h-32 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
+                                    />
+                                  )}
+                                </div>
+                              </div>
+
+                              {matchedRight ? (
+                                <div className="flex items-center justify-between gap-2 pl-10 pr-2 py-1.5 rounded-lg bg-white border border-emerald-200 text-xs">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <span className="font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-700 text-white shrink-0">
+                                      ↔ {matchedRight.letter}
+                                    </span>
+                                    <span className="text-emerald-950 font-medium truncate">
+                                      {matchedRight.item.text ? (
+                                        <MathText text={matchedRight.item.text} />
+                                      ) : (
+                                        `Gambar ${matchedRight.letter}`
+                                      )}
+                                    </span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    title="Lepas pasangan"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleUnpairMatchingLeft(left.id);
+                                    }}
+                                    className="p-1 rounded hover:bg-rose-50 text-slate-400 hover:text-rose-600 cursor-pointer shrink-0"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="pl-10 text-[11px] font-medium text-slate-500">
+                                  {isActive
+                                    ? 'Aktif dipilih — klik jawaban di kolom kanan →'
+                                    : 'Klik kartu ini lalu pilih pasangan di kanan'}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Right Column: Shuffled Answers */}
+                      <div className="space-y-2.5">
+                        <div className="text-xs font-bold uppercase tracking-wide text-emerald-800 px-1">
+                          Pilihan Pasangan Jawaban (Teracak)
+                        </div>
+                        {rightItems.map((right, rIdx) => {
+                          const letter = String.fromCharCode(65 + rIdx);
+                          const pairedLeftNumber = leftIndexByRightId.get(right.id);
+                          const isAssigned = pairedLeftNumber !== undefined;
+                          const isAssignedToActive =
+                            activeMatchingLeftId !== null &&
+                            currentMatchingMap[activeMatchingLeftId] === right.id;
+
+                          return (
+                            <button
+                              key={right.id}
+                              type="button"
+                              onClick={() => handlePairMatchingRight(right.id)}
+                              className={`w-full text-left p-3.5 rounded-xl border transition-all flex items-start gap-3 cursor-pointer ${
+                                isAssignedToActive
+                                  ? 'bg-emerald-100/80 border-[#064e3b] ring-1 ring-[#064e3b] text-emerald-950'
+                                  : isAssigned
+                                    ? 'bg-emerald-50/70 border-emerald-300 text-emerald-950 hover:border-emerald-500'
+                                    : activeMatchingLeftId
+                                      ? 'bg-white border-slate-200 hover:border-[#064e3b] hover:bg-emerald-50/30 text-slate-800'
+                                      : 'bg-white border-slate-200 hover:border-slate-300 text-slate-800'
+                              }`}
+                            >
+                              <span
+                                className={`w-7 h-7 rounded-lg flex items-center justify-center font-mono font-bold text-xs shrink-0 ${
+                                  isAssigned
+                                    ? 'bg-[#064e3b] text-white'
+                                    : 'bg-slate-100 text-slate-700'
+                                }`}
+                              >
+                                {letter}
+                              </span>
+                              <div className="min-w-0 flex-1 space-y-1.5 pt-0.5 text-sm">
+                                {right.text && (
+                                  <div className="break-words">
+                                    <MathText text={right.text} />
+                                  </div>
+                                )}
+                                {right.imageUrl && (
+                                  <img
+                                    src={right.imageUrl}
+                                    alt={`Pilihan Jawaban ${letter}`}
+                                    referrerPolicy="no-referrer"
+                                    className="max-h-32 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
+                                  />
+                                )}
+                              </div>
+                              {isAssigned && (
+                                <span className="px-2 py-0.5 rounded-md bg-white border border-emerald-300 text-emerald-900 font-mono font-bold text-[11px] shrink-0">
+                                  ↔ No. {pairedLeftNumber}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
                 );
-              })}
-            </div>
+              })()
+            ) : currentQuestionType === 'true_false' ? (
+              <div
+                className="grid grid-cols-1 sm:grid-cols-2 gap-3"
+                role="radiogroup"
+                aria-label="Pilihan Benar atau Salah"
+              >
+                {visibleOptions.map((opt) => {
+                  const isSelected = selectedAnswer === opt.key;
+                  const labelText = opt.text || (opt.key === 'A' ? 'Benar' : 'Salah');
+                  return (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      role="radio"
+                      aria-checked={isSelected}
+                      onClick={() => handleSelectOption(currentQuestion.id, opt.key)}
+                      className={`w-full text-left p-4 rounded-xl border transition-all flex items-center justify-between gap-3 cursor-pointer min-h-[60px] ${
+                        isSelected
+                          ? 'bg-emerald-50 border-emerald-700 ring-1 ring-emerald-700 text-emerald-950'
+                          : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-800'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3.5">
+                        <span
+                          className={`w-9 h-9 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 transition-colors ${
+                            isSelected
+                              ? 'bg-[#064e3b] text-white'
+                              : 'bg-slate-100 text-slate-700'
+                          }`}
+                        >
+                          {opt.key === 'A' ? 'B' : 'S'}
+                        </span>
+                        <span className="font-display font-bold text-base">{labelText}</span>
+                      </div>
+                      {isSelected && <Check className="w-5 h-5 text-[#064e3b] shrink-0" />}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="space-y-3" role="radiogroup" aria-label="Pilihan Jawaban">
+                {visibleOptions.map((opt) => {
+                  const isSelected = selectedAnswer === opt.key;
+                  return (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      role="radio"
+                      aria-checked={isSelected}
+                      onClick={() => handleSelectOption(currentQuestion.id, opt.key)}
+                      className={`w-full text-left p-4 rounded-xl border transition-all flex items-start gap-4 cursor-pointer min-h-[52px] ${
+                        isSelected
+                          ? 'bg-emerald-50 border-emerald-700 ring-1 ring-emerald-700 text-emerald-950'
+                          : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-800'
+                      }`}
+                    >
+                      <span
+                        className={`w-8 h-8 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 transition-colors ${
+                          isSelected
+                            ? 'bg-[#064e3b] text-white'
+                            : 'bg-slate-100 text-slate-700'
+                        }`}
+                      >
+                        {opt.key}
+                      </span>
+                      <div className="pt-0.5 text-sm sm:text-base leading-relaxed flex-1 space-y-2">
+                        {opt.text && (
+                          <div>
+                            <MathText text={opt.text} />
+                          </div>
+                        )}
+                        {opt.imageUrl && (
+                          <img
+                            src={opt.imageUrl}
+                            alt={`Gambar Opsi ${opt.key}`}
+                            referrerPolicy="no-referrer"
+                            className="max-h-40 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
+                          />
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Bottom Question Navigation Footer */}
@@ -636,8 +1063,8 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           <div className="grid grid-cols-5 gap-2">
             {session.questions.map((q, idx) => {
               const isCurrent = idx === session.currentIndex;
-              const isAnswered = Boolean(session.answers[q.id]);
-              const qFlagged = session.flaggedQuestions.includes(q.id);
+              const isAnswered = isQuestionAnswered(q, session.answers[q.id]);
+              const qFlagged = flaggedQuestionSet.has(q.id);
 
               let cellStyle = 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100';
               if (qFlagged) {
@@ -731,8 +1158,8 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
             <div className="grid grid-cols-5 gap-2 max-h-72 overflow-y-auto py-1">
               {session.questions.map((q, idx) => {
                 const isCurrent = idx === session.currentIndex;
-                const isAnswered = Boolean(session.answers[q.id]);
-                const qFlagged = session.flaggedQuestions.includes(q.id);
+                const isAnswered = isQuestionAnswered(q, session.answers[q.id]);
+                const qFlagged = flaggedQuestionSet.has(q.id);
                 let cellStyle = 'bg-slate-50 border-slate-200 text-slate-700';
                 if (qFlagged) cellStyle = 'bg-amber-100 border-amber-400 text-amber-900';
                 else if (isAnswered) cellStyle = 'bg-emerald-700 border-emerald-800 text-white';

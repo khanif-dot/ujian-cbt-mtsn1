@@ -1,8 +1,29 @@
-import { Document, Packer, Paragraph, TextRun } from 'docx';
+import {
+  AlignmentType,
+  BorderStyle,
+  Document,
+  HeightRule,
+  ImageRun,
+  Packer,
+  PageBreak,
+  Paragraph,
+  ShadingType,
+  Table,
+  TableCell,
+  TableLayoutType,
+  TableRow,
+  TextRun,
+  VerticalAlignTable,
+  WidthType,
+} from 'docx';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
+import {
+  KEMENAG_HEADER_TITLE,
+  KEMENAG_LOGO_DATA_URL,
+} from '@/src/lib/seedData';
 import {
   ALL_CLASSES,
   type ExamResult,
@@ -141,6 +162,43 @@ async function compressImageFile(
   });
 }
 
+export async function compressDataUrlImage(
+  dataUrl: string,
+  maxWidth = 820,
+  maxHeight = 620,
+  quality = 0.82
+): Promise<string> {
+  const trimmed = (dataUrl || '').trim();
+  if (!trimmed.startsWith('data:image/') || typeof document === 'undefined') {
+    return trimmed;
+  }
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
+      const width = Math.max(1, Math.round(img.width * scale));
+      const height = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(trimmed);
+        return;
+      }
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      const compressed = canvas.toDataURL('image/webp', quality);
+      const candidate = compressed.startsWith('data:image/webp')
+        ? compressed
+        : canvas.toDataURL('image/png');
+      resolve(candidate.length < trimmed.length ? candidate : trimmed);
+    };
+    img.onerror = () => resolve(trimmed);
+    img.src = trimmed;
+  });
+}
+
 /**
  * Import Participants from Excel (.xlsx / .xls / .csv) including Token column
  */
@@ -267,6 +325,65 @@ export async function parseQuestionsExcel(file: File): Promise<{
     const rawPoints = Number(map['bobot'] || map['poin'] || map['points'] || 10);
     const points = Number.isFinite(rawPoints) && rawPoints > 0 ? rawPoints : 10;
 
+    const rawType = (
+      map['jenis soal'] ||
+      map['tipe soal'] ||
+      map['question_type'] ||
+      map['jenis'] ||
+      ''
+    )
+      .trim()
+      .toLowerCase();
+    const isTrueFalse =
+      rawType === 'true_false' ||
+      rawType === 'benar salah' ||
+      rawType === 'benar/salah' ||
+      rawType === 'benar / salah' ||
+      rawType === 'bs';
+
+    const subjKey = subject.trim().toLowerCase();
+    const resolvedClasses = targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES];
+    const groupOrderKey = `${subjKey}::${[...resolvedClasses].sort().join(',')}`;
+    const nextOrder = (subjectOrderCounter.get(groupOrderKey) ?? 0) + 1;
+    subjectOrderCounter.set(groupOrderKey, nextOrder);
+
+    if (isTrueFalse) {
+      if (!questionText && !questionImageUrl) {
+        errors.push(`Baris ${idx + 2}: Teks/gambar pernyataan Benar Salah belum diisi.`);
+        return;
+      }
+      let tfCorrect: OptionKey | null = null;
+      if (rawKey === 'BENAR' || rawKey === 'A' || rawKey === 'TRUE' || rawKey === 'B') {
+        tfCorrect = rawKey === 'B' && optB.toUpperCase() === 'SALAH' ? 'B' : 'A';
+      }
+      if (rawKey === 'SALAH' || rawKey === 'S' || rawKey === 'FALSE') {
+        tfCorrect = 'B';
+      }
+      if (!tfCorrect) {
+        errors.push(
+          `Baris ${idx + 2}: Kunci jawaban Benar/Salah "${rawKey || '(kosong)'}" tidak valid (gunakan BENAR atau SALAH).`
+        );
+        return;
+      }
+
+      questions.push({
+        id: `q-imp-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+        subject,
+        targetClasses: targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES],
+        questionType: 'true_false',
+        questionText,
+        questionImageUrl: questionImageUrl || undefined,
+        options: [
+          { key: 'A', text: 'Benar' },
+          { key: 'B', text: 'Salah' },
+        ],
+        correctAnswer: tfCorrect,
+        points,
+        orderIndex: nextOrder,
+      });
+      return;
+    }
+
     if ((!questionText && !questionImageUrl) || (!optA && !imgA) || (!optB && !imgB)) {
       errors.push(`Baris ${idx + 2}: Teks/gambar soal atau opsi A/B belum lengkap.`);
       return;
@@ -296,14 +413,11 @@ export async function parseQuestionsExcel(file: File): Promise<{
       return;
     }
 
-    const subjKey = subject.trim().toLowerCase();
-    const nextOrder = (subjectOrderCounter.get(subjKey) ?? 0) + 1;
-    subjectOrderCounter.set(subjKey, nextOrder);
-
     questions.push({
       id: `q-imp-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
       subject,
       targetClasses: targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES],
+      questionType: 'multiple_choice',
       questionText,
       questionImageUrl: questionImageUrl || undefined,
       options: filteredOptions,
@@ -424,8 +538,9 @@ export async function parseQuestionsDocx(
       }
 
       const subjKey = currentSubject.trim().toLowerCase();
-      const nextOrder = (subjectOrderCounter.get(subjKey) ?? 0) + 1;
-      subjectOrderCounter.set(subjKey, nextOrder);
+      const groupOrderKey = `${subjKey}::${[...currentClasses].sort().join(',')}`;
+      const nextOrder = (subjectOrderCounter.get(groupOrderKey) ?? 0) + 1;
+      subjectOrderCounter.set(groupOrderKey, nextOrder);
 
       questions.push({
         id: `q-docx-${Date.now()}-${questions.length + 1}-${Math.random().toString(36).slice(2, 5)}`,
@@ -648,11 +763,32 @@ export async function downloadQuestionsWordTemplate(): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-function getKkmForSubject(schedules: ExamSchedule[], subject: string): number {
-  const matched = schedules.find(
-    (s) => s.subject.toLowerCase() === subject.toLowerCase()
-  );
-  return matched ? matched.kkm : 75;
+export const PDF_RECAP_MAX_ROWS = 1500;
+
+function buildScheduleLookups(schedules: ExamSchedule[]) {
+  const byId = new Map<string, ExamSchedule>();
+  const bySubject = new Map<string, ExamSchedule>();
+  for (const s of schedules) {
+    byId.set(s.id, s);
+    const norm = (s.subject || '').trim().toLowerCase();
+    if (norm && !bySubject.has(norm)) {
+      bySubject.set(norm, s);
+    }
+  }
+  return { byId, bySubject };
+}
+
+function resolveScheduleForExport(
+  lookups: ReturnType<typeof buildScheduleLookups>,
+  examId: string | undefined,
+  subject: string
+): ExamSchedule | undefined {
+  if (examId) {
+    const matchedById = lookups.byId.get(examId);
+    if (matchedById) return matchedById;
+  }
+  const normSubj = (subject || '').trim().toLowerCase();
+  return normSubj ? lookups.bySubject.get(normSubj) : undefined;
 }
 
 type ExportableResultRow = ExamResult | RecapEntry;
@@ -673,8 +809,11 @@ export function exportExamResultsExcel(
   schedules: ExamSchedule[],
   schoolName: string
 ): void {
+  const lookups = buildScheduleLookups(schedules);
   const rows = results.map((r, index) => {
-    const kkm = getKkmForSubject(schedules, r.subject);
+    const sched = resolveScheduleForExport(lookups, r.examId, r.subject);
+    const kkm = sched ? sched.kkm : 75;
+    const displaySubject = sched?.subject || r.subject || '-';
     const attStatus = getExportAttendanceStatus(r);
     const kkmLabel =
       attStatus === 'not_attended'
@@ -690,7 +829,7 @@ export function exportExamResultsExcel(
       'Nomor Peserta': r.participantNumber,
       'Nama Peserta': r.studentName,
       Kelas: r.className,
-      'Mata Pelajaran': r.subject || '-',
+      'Mata Pelajaran': displaySubject,
       'Jawaban Benar': attStatus === 'not_attended' ? 0 : r.correctCount,
       'Total Soal': r.totalQuestions,
       KKM: kkm,
@@ -708,39 +847,70 @@ export function exportExamResultsExcel(
   XLSX.writeFile(wb, `Rekap_Nilai_${safeName}_${new Date().toISOString().slice(0, 10)}.xlsx`);
 }
 
-export function exportExamResultsPdf(
+export interface PdfExportResult {
+  ok: boolean;
+  reason?: 'too_many_rows';
+  rowCount: number;
+}
+
+export async function exportExamResultsPdf(
   results: ExportableResultRow[],
   schedules: ExamSchedule[],
   profile: SchoolProfile,
   filters: { subject: string; className: string; statusLabel?: string }
-): void {
+): Promise<PdfExportResult> {
+  if (results.length > PDF_RECAP_MAX_ROWS) {
+    return {
+      ok: false,
+      reason: 'too_many_rows',
+      rowCount: results.length,
+    };
+  }
+
+  const lookups = buildScheduleLookups(schedules);
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const [kemenagPng, schoolLogoPng] = await Promise.all([
+    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
+  ]);
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(14);
-  doc.text(profile.schoolName.toUpperCase(), 14, 16);
+  const marginX = 12;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+
+  let cursorY = drawPdfInstitutionKop(
+    doc,
+    profile,
+    kemenagPng,
+    schoolLogoPng,
+    'REKAPITULASI NILAI HASIL UJIAN',
+    `${(profile.examTitle || 'UJIAN CBT').toUpperCase()} — TAHUN AJARAN ${profile.academicYear}`
+  );
 
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
-  doc.text(profile.address, 14, 21);
-
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.text(`REKAPITULASI NILAI — ${profile.examTitle.toUpperCase()}`, 14, 29);
-
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
+  doc.setFontSize(8.5);
+  doc.setTextColor(51, 65, 85);
   const mapelText = filters.subject === 'ALL' ? 'Semua Mata Pelajaran' : filters.subject;
   const kelasText = filters.className === 'ALL' ? 'Semua Kelas (7A–9I)' : `Kelas ${filters.className}`;
   const statusSuffix = filters.statusLabel ? `  |  Status: ${filters.statusLabel}` : '';
   doc.text(
-    `Tahun Ajaran: ${profile.academicYear}  |  Filter Mapel: ${mapelText}  |  Filter Kelas: ${kelasText}${statusSuffix}`,
-    14,
-    34
+    fitTextSingleLine(
+      doc,
+      `Mata Pelajaran: ${mapelText}  |  Kelas: ${kelasText}${statusSuffix}`,
+      pageWidth - marginX * 2
+    ),
+    pageWidth / 2,
+    cursorY,
+    { align: 'center' }
   );
+  cursorY += 4;
+
+  const omitClassCol = filters.className !== 'ALL';
 
   const tableRows = results.map((r, idx) => {
-    const kkm = getKkmForSubject(schedules, r.subject);
+    const sched = resolveScheduleForExport(lookups, r.examId, r.subject);
+    const kkm = sched ? sched.kkm : 75;
+    const displaySubject = sched?.subject || r.subject || '-';
     const attStatus = getExportAttendanceStatus(r);
     const statusText =
       attStatus === 'not_attended'
@@ -750,12 +920,16 @@ export function exportExamResultsPdf(
           : r.score >= kkm
             ? 'Tuntas'
             : 'Belum Tuntas';
-    return [
+    const baseRow = [
       String(idx + 1),
       r.participantNumber,
       r.studentName,
-      r.className,
-      r.subject || '-',
+    ];
+    if (!omitClassCol) {
+      baseRow.push(r.className);
+    }
+    baseRow.push(
+      displaySubject,
       attStatus === 'not_attended' && r.totalQuestions === 0
         ? '-'
         : `${r.correctCount}/${r.totalQuestions}`,
@@ -765,40 +939,110 @@ export function exportExamResultsPdf(
         : attStatus === 'not_attended'
           ? '0.0'
           : r.score.toFixed(1),
-      statusText,
-    ];
+      statusText
+    );
+    return baseRow;
   });
+
+  // Compact row padding so a full class (~35-45 students) fits on 1 A4 page with signature
+  const rowCount = results.length;
+  let fontSize = 8;
+  let padV = 1.5;
+  if (rowCount > 28 && rowCount <= 36) {
+    fontSize = 7.6;
+    padV = 1.15;
+  } else if (rowCount > 36 && rowCount <= 45) {
+    fontSize = 7.2;
+    padV = 0.85;
+  } else if (rowCount > 45) {
+    fontSize = 7.5;
+    padV = 1.1;
+  }
 
   autoTable(doc, {
-    startY: 39,
+    startY: cursorY,
+    margin: { left: marginX, right: marginX, top: 8, bottom: 8 },
+    rowPageBreak: 'avoid',
     head: [
-      ['No', 'No. Peserta', 'Nama Peserta', 'Kelas', 'Mata Pelajaran', 'Benar', 'KKM', 'Nilai', 'Ket.'],
+      omitClassCol
+        ? ['No', 'No. Peserta', 'Nama Peserta', 'Mata Pelajaran', 'Benar', 'KKM', 'Nilai', 'Ket.']
+        : ['No', 'No. Peserta', 'Nama Peserta', 'Kelas', 'Mata Pelajaran', 'Benar', 'KKM', 'Nilai', 'Ket.'],
     ],
     body: tableRows,
-    styles: { fontSize: 8, cellPadding: 2.2 },
-    headStyles: { fillColor: [6, 78, 59], textColor: 255, fontStyle: 'bold' },
-    alternateRowStyles: { fillColor: [248, 250, 252] },
-    columnStyles: {
-      0: { halign: 'center', cellWidth: 8 },
-      3: { halign: 'center', cellWidth: 13 },
-      5: { halign: 'center', cellWidth: 14 },
-      6: { halign: 'center', cellWidth: 12 },
-      7: { halign: 'right', cellWidth: 14 },
-      8: { halign: 'center', cellWidth: 22 },
+    styles: {
+      fontSize,
+      cellPadding: { top: padV, right: 1.8, bottom: padV, left: 1.8 },
+      valign: 'middle',
     },
+    headStyles: {
+      fillColor: [6, 78, 59],
+      textColor: 255,
+      fontStyle: 'bold',
+      halign: 'center',
+      cellPadding: { top: 2, right: 1.5, bottom: 2, left: 1.5 },
+    },
+    alternateRowStyles: { fillColor: [248, 250, 252] },
+    columnStyles: omitClassCol
+      ? {
+          0: { halign: 'center', cellWidth: 9 },
+          1: { halign: 'center', cellWidth: 28, fontStyle: 'bold' },
+          2: { halign: 'left', cellWidth: 52 },
+          3: { halign: 'left', cellWidth: 37 },
+          4: { halign: 'center', cellWidth: 14 },
+          5: { halign: 'center', cellWidth: 12 },
+          6: { halign: 'right', cellWidth: 13 },
+          7: { halign: 'center', cellWidth: 21 },
+        }
+      : {
+          0: { halign: 'center', cellWidth: 8 },
+          1: { halign: 'center', cellWidth: 27, fontStyle: 'bold' },
+          2: { halign: 'left', cellWidth: 46 },
+          3: { halign: 'center', cellWidth: 12 },
+          4: { halign: 'left', cellWidth: 34 },
+          5: { halign: 'center', cellWidth: 14 },
+          6: { halign: 'center', cellWidth: 12 },
+          7: { halign: 'right', cellWidth: 13 },
+          8: { halign: 'center', cellWidth: 20 },
+        },
   });
 
-  const finalY = (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ?? 120;
-  if (finalY < 255) {
-    doc.setFontSize(9);
-    doc.text('Mengetahui,', 140, finalY + 12);
-    doc.text('Kepala Sekolah / Ketua Panitia', 140, finalY + 17);
-    doc.setFont('helvetica', 'bold');
-    doc.text(profile.principalName, 140, finalY + 34);
+  doc.setPage(doc.getNumberOfPages());
+  const finalY =
+    (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ?? 120;
+
+  const signX = Math.max(122, pageWidth - 78);
+  const maxWidth = pageWidth - signX - marginX;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8.5);
+  const principalLines = doc.splitTextToSize(profile.principalName || '-', maxWidth) as string[];
+  const nameLineHeight = 3.8;
+  const blockHeight = 20 + Math.max(1, principalLines.length) * nameLineHeight;
+
+  let signY = finalY + 6;
+  if (signY + blockHeight > pageHeight - 8) {
+    doc.addPage();
+    signY = 20;
   }
+
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8.5);
+  doc.text('Mengetahui,', signX, signY);
+  doc.text('Kepala Sekolah / Ketua Panitia', signX, signY + 4.2);
+
+  const nameY = signY + 17;
+  doc.setFont('helvetica', 'bold');
+  doc.text(principalLines, signX, nameY);
+
+  const lineY = nameY + Math.max(1, principalLines.length) * nameLineHeight + 0.8;
+  doc.setDrawColor(100, 116, 139);
+  doc.setLineWidth(0.3);
+  doc.line(signX, lineY, signX + maxWidth, lineY);
 
   const safeName = profile.schoolName.replace(/[^a-zA-Z0-9]/g, '_');
   doc.save(`Rekap_Nilai_${safeName}_${new Date().toISOString().slice(0, 10)}.pdf`);
+  return { ok: true, rowCount: results.length };
 }
 
 async function convertDataUrlToPng(dataUrl: string): Promise<string | null> {
@@ -862,6 +1106,24 @@ async function convertDataUrlToPng(dataUrl: string): Promise<string | null> {
   });
 }
 
+async function dataUrlToPngUint8Array(dataUrl: string): Promise<Uint8Array | null> {
+  const pngDataUrl = await convertDataUrlToPng(dataUrl);
+  if (!pngDataUrl) return null;
+  const commaIdx = pngDataUrl.indexOf(',');
+  if (commaIdx === -1) return null;
+  try {
+    const b64 = pngDataUrl.slice(commaIdx + 1);
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
 function fitTextSingleLine(doc: jsPDF, text: string, maxWidth: number): string {
   const clean = (text || '').trim();
   if (!clean) return '';
@@ -879,14 +1141,17 @@ export async function exportExamCardsPdf(
   classFilter = 'ALL'
 ): Promise<void> {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-  const logoPng = profile.logoDataUrl ? await convertDataUrlToPng(profile.logoDataUrl) : null;
+  const [kemenagPng, schoolLogoPng] = await Promise.all([
+    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
+  ]);
 
   const marginX = 8;
   const marginY = 8.5;
   const cardW = 97; // 2 cols = 194mm
   const cardH = 56; // 5 rows = 280mm
-  const padX = 3.5;
-  const padY = 3;
+  const padX = 3;
+  const padY = 2.5;
 
   participants.forEach((student, idx) => {
     const indexOnPage = idx % 10;
@@ -908,69 +1173,90 @@ export async function exportExamCardsPdf(
     doc.rect(x, y, cardW, cardH, 'S');
     doc.setLineDashPattern([], 0);
 
-    // Kop Instansi
-    const logoSize = 11.5;
+    // Kop Instansi: Logo Kemenag (Kiri) + Teks Kop (Tengah) + Logo Sekolah (Kanan)
+    const logoSize = 9.5;
     const kopTop = y + padY;
-    const hasLogo = Boolean(logoPng);
-    if (logoPng) {
+    if (kemenagPng) {
       try {
-        doc.addImage(logoPng, 'PNG', x + padX, kopTop + 0.5, logoSize, logoSize);
+        doc.addImage(kemenagPng, 'PNG', x + padX, kopTop + 0.2, logoSize, logoSize);
+      } catch {
+        // Skip image if unreadable
+      }
+    }
+    if (schoolLogoPng) {
+      try {
+        doc.addImage(
+          schoolLogoPng,
+          'PNG',
+          x + cardW - padX - logoSize,
+          kopTop + 0.2,
+          logoSize,
+          logoSize
+        );
       } catch {
         // Skip image if unreadable
       }
     }
 
-    const textAreaLeft = x + padX + (hasLogo ? logoSize + 2 : 0);
-    const textAreaWidth = cardW - padX * 2 - (hasLogo ? logoSize + 2 : 0);
-    const textCenterX = textAreaLeft + textAreaWidth / 2;
+    const textAreaWidth = cardW - padX * 2 - (logoSize + 2) * 2;
+    const textCenterX = x + cardW / 2;
 
     doc.setTextColor(15, 23, 42);
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8);
+    doc.setFontSize(6);
+    doc.text(
+      fitTextSingleLine(doc, KEMENAG_HEADER_TITLE, textAreaWidth),
+      textCenterX,
+      kopTop + 2.5,
+      { align: 'center' }
+    );
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
     doc.text(
       fitTextSingleLine(doc, profile.schoolName.toUpperCase(), textAreaWidth),
       textCenterX,
-      kopTop + 2.8,
+      kopTop + 5.7,
       { align: 'center' }
     );
 
     doc.setTextColor(71, 85, 105);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(6);
+    doc.setFont('helvetica', 'italic');
+    doc.setFontSize(5.5);
     doc.text(
       fitTextSingleLine(doc, profile.address, textAreaWidth),
       textCenterX,
-      kopTop + 6,
-      { align: 'center' }
-    );
-
-    // "KARTU PESERTA" berada di baris sendiri center di antara alamat lembaga dan judul ujian
-    doc.setTextColor(15, 23, 42);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(7.5);
-    doc.text('KARTU PESERTA', textCenterX, kopTop + 9.6, { align: 'center' });
-
-    doc.setTextColor(6, 78, 59);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(7);
-    doc.text(
-      fitTextSingleLine(doc, `${profile.examTitle} (${profile.academicYear})`, textAreaWidth),
-      textCenterX,
-      kopTop + 13,
+      kopTop + 8.6,
       { align: 'center' }
     );
 
     // Kop bottom border line
-    const kopBottomY = kopTop + 15.2;
+    const kopBottomY = kopTop + 10.4;
     doc.setDrawColor(30, 41, 59);
     doc.setLineWidth(0.35);
     doc.line(x + padX, kopBottomY, x + cardW - padX, kopBottomY);
+
+    // "KARTU PESERTA" & judul ujian di bawah garis kop
+    doc.setTextColor(15, 23, 42);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
+    doc.text('KARTU PESERTA', textCenterX, kopBottomY + 3.4, { align: 'center' });
+
+    doc.setTextColor(6, 78, 59);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(6.5);
+    doc.text(
+      fitTextSingleLine(doc, `${profile.examTitle} (${profile.academicYear})`, cardW - padX * 2),
+      textCenterX,
+      kopBottomY + 6.4,
+      { align: 'center' }
+    );
 
     // Student fields
     const labelX = x + padX;
     const valueX = x + padX + 24;
     const valueMaxW = cardW - padX * 2 - 24;
-    let curY = kopBottomY + 5;
+    let curY = kopBottomY + 11.2;
 
     doc.setFontSize(7.5);
     doc.setTextColor(71, 85, 105);
@@ -980,7 +1266,7 @@ export async function exportExamCardsPdf(
     doc.setFont('helvetica', 'bold');
     doc.text(`: ${fitTextSingleLine(doc, student.fullName, valueMaxW - 2)}`, valueX, curY);
 
-    curY += 4.5;
+    curY += 4.3;
     doc.setTextColor(71, 85, 105);
     doc.setFont('helvetica', 'normal');
     doc.text('Kelas', labelX, curY);
@@ -988,21 +1274,23 @@ export async function exportExamCardsPdf(
     doc.setFont('courier', 'bold');
     doc.text(`: ${student.className}`, valueX, curY);
 
-    curY += 5;
+    curY += 4.8;
     doc.setTextColor(51, 65, 85);
     doc.setFont('helvetica', 'bold');
     doc.text('No. Peserta', labelX, curY);
 
+    const boxX = valueX + 1.5;
+    const boxW = valueMaxW - 2;
     doc.setFillColor(241, 245, 249);
     doc.setDrawColor(203, 213, 225);
     doc.setLineWidth(0.2);
-    doc.roundedRect(valueX + 1.5, curY - 3.3, valueMaxW - 2, 4.6, 0.8, 0.8, 'FD');
+    doc.roundedRect(boxX, curY - 3.3, boxW, 4.6, 0.8, 0.8, 'FD');
     doc.setTextColor(15, 23, 42);
     doc.setFont('courier', 'bold');
     doc.setFontSize(8);
-    doc.text(student.participantNumber, valueX + 3, curY);
+    doc.text(student.participantNumber, boxX + boxW / 2, curY, { align: 'center' });
 
-    curY += 5.2;
+    curY += 5.0;
     doc.setFontSize(7.5);
     doc.setTextColor(51, 65, 85);
     doc.setFont('helvetica', 'bold');
@@ -1013,7 +1301,7 @@ export async function exportExamCardsPdf(
     doc.text(`: ${student.token || '-'}`, valueX, curY);
 
     // Bottom Footer & Signature
-    const footerY = y + cardH - padY - 1;
+    const footerY = y + cardH - padY - 0.8;
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6);
     doc.setTextColor(100, 116, 139);
@@ -1022,7 +1310,7 @@ export async function exportExamCardsPdf(
     const signRightX = x + cardW - padX;
     doc.setTextColor(51, 65, 85);
     doc.setFontSize(6.5);
-    doc.text('Ketua Panitia,', signRightX, footerY - 6.8, { align: 'right' });
+    doc.text('Ketua Panitia,', signRightX, footerY - 6.5, { align: 'right' });
 
     doc.setFont('helvetica', 'bold');
     doc.setTextColor(15, 23, 42);
@@ -1037,4 +1325,1328 @@ export async function exportExamCardsPdf(
   const safeSchool = profile.schoolName.replace(/[^a-zA-Z0-9]/g, '_');
   const scopeSuffix = classFilter === 'ALL' ? 'Semua_Kelas' : `Kelas_${classFilter}`;
   doc.save(`Kartu_Peserta_${safeSchool}_${scopeSuffix}.pdf`);
+}
+
+export interface ExamDocumentMeta {
+  subject: string;
+  className: string;
+  roomName: string;
+  examDate: string;
+  timeRange: string;
+  sessionLabel: string;
+  supervisor1: string;
+  supervisor2: string;
+  notes: string;
+  splitByClass?: boolean;
+  signatureStyle?: 'zigzag' | 'single';
+}
+
+interface IndonesianDateParts {
+  hari: string;
+  tanggal: string;
+  bulan: string;
+  tahun: string;
+  full: string;
+}
+
+const INDONESIAN_DAYS = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+const INDONESIAN_MONTHS = [
+  'Januari',
+  'Februari',
+  'Maret',
+  'April',
+  'Mei',
+  'Juni',
+  'Juli',
+  'Agustus',
+  'September',
+  'Oktober',
+  'November',
+  'Desember',
+];
+
+function formatIndonesianDateParts(dateStr: string): IndonesianDateParts {
+  const clean = (dateStr || '').trim();
+  const match = clean.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (match) {
+    const year = Number(match[1]);
+    const monthIdx = Number(match[2]) - 1;
+    const day = Number(match[3]);
+    const dt = new Date(year, monthIdx, day);
+    if (
+      !Number.isNaN(dt.getTime()) &&
+      dt.getFullYear() === year &&
+      dt.getMonth() === monthIdx &&
+      dt.getDate() === day
+    ) {
+      const hari = INDONESIAN_DAYS[dt.getDay()] || '................';
+      const bulan = INDONESIAN_MONTHS[monthIdx] || '................';
+      const tanggal = String(day);
+      const tahun = String(year);
+      return {
+        hari,
+        tanggal,
+        bulan,
+        tahun,
+        full: `${hari}, ${day} ${bulan} ${year}`,
+      };
+    }
+  }
+  return {
+    hari: '....................',
+    tanggal: '......',
+    bulan: '....................',
+    tahun: '20....',
+    full: '...................., ...... .................... 20....',
+  };
+}
+
+function triggerBlobDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function sanitizeFilenamePart(value: string, fallback = 'Dokumen'): string {
+  const cleaned = (value || '').trim().replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+  return cleaned || fallback;
+}
+
+function groupAttendanceParticipants(
+  participants: Participant[],
+  meta: ExamDocumentMeta
+): Array<{ classLabel: string; items: Participant[] }> {
+  const sorted = [...participants].sort((a, b) =>
+    a.className !== b.className
+      ? a.className.localeCompare(b.className, 'id', { numeric: true })
+      : a.participantNumber.localeCompare(b.participantNumber, 'id', { numeric: true }) ||
+        a.fullName.localeCompare(b.fullName, 'id')
+  );
+
+  if (meta.splitByClass && meta.className === 'ALL') {
+    const groups = new Map<string, Participant[]>();
+    for (const p of sorted) {
+      const key = p.className || '-';
+      const list = groups.get(key) || [];
+      list.push(p);
+      groups.set(key, list);
+    }
+    return Array.from(groups.entries()).map(([cls, items]) => ({
+      classLabel: `Kelas ${cls}`,
+      items,
+    }));
+  }
+
+  return [
+    {
+      classLabel:
+        meta.className === 'ALL'
+          ? 'Semua Kelas'
+          : `Kelas ${meta.className}`,
+      items: sorted,
+    },
+  ];
+}
+
+function drawPdfInstitutionKop(
+  doc: jsPDF,
+  profile: SchoolProfile,
+  kemenagPng: string | null,
+  schoolLogoPng: string | null,
+  documentTitle: string,
+  subtitle: string
+): number {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const marginX = 12;
+  const logoSize = 15;
+  const kopTopY = 8.5;
+
+  // Logo Kiri: Kementerian Agama RI
+  if (kemenagPng) {
+    try {
+      doc.addImage(kemenagPng, 'PNG', marginX, kopTopY, logoSize, logoSize);
+    } catch {
+      // Ignore logo render failure
+    }
+  }
+
+  // Logo Kanan: Sekolah / Madrasah
+  if (schoolLogoPng) {
+    try {
+      doc.addImage(
+        schoolLogoPng,
+        'PNG',
+        pageWidth - marginX - logoSize,
+        kopTopY,
+        logoSize,
+        logoSize
+      );
+    } catch {
+      // Ignore logo render failure
+    }
+  }
+
+  const textCenterX = pageWidth / 2;
+  const textMaxW = pageWidth - marginX * 2 - (logoSize + 4) * 2;
+
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(10);
+  doc.text(fitTextSingleLine(doc, KEMENAG_HEADER_TITLE, textMaxW), textCenterX, 12.2, {
+    align: 'center',
+  });
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(12.5);
+  doc.text(fitTextSingleLine(doc, profile.schoolName.toUpperCase(), textMaxW), textCenterX, 17, {
+    align: 'center',
+  });
+
+  doc.setFont('helvetica', 'italic');
+  doc.setFontSize(8.2);
+  doc.setTextColor(51, 65, 85);
+  const addrLines = doc.splitTextToSize(profile.address || '', textMaxW) as string[];
+  doc.text(addrLines.slice(0, 2), textCenterX, 21, { align: 'center' });
+
+  const dividerY = Math.max(25.5, 21 + Math.min(2, addrLines.length) * 3.4 + 0.8);
+  doc.setDrawColor(15, 23, 42);
+  doc.setLineWidth(0.7);
+  doc.line(marginX, dividerY, pageWidth - marginX, dividerY);
+  doc.setLineWidth(0.25);
+  doc.line(marginX, dividerY + 1, pageWidth - marginX, dividerY + 1);
+
+  const titleY = dividerY + 6.2;
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11);
+  doc.text(documentTitle, pageWidth / 2, titleY, { align: 'center' });
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8.8);
+  doc.setTextColor(6, 78, 59);
+  doc.text(subtitle, pageWidth / 2, titleY + 4.2, { align: 'center' });
+
+  return titleY + 8.5;
+}
+
+export async function exportAttendancePdf(
+  participants: Participant[],
+  profile: SchoolProfile,
+  meta: ExamDocumentMeta
+): Promise<void> {
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const [kemenagPng, schoolLogoPng] = await Promise.all([
+    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
+  ]);
+  const dateParts = formatIndonesianDateParts(meta.examDate);
+  const groups = groupAttendanceParticipants(participants, meta);
+  const signatureStyle = meta.signatureStyle || 'zigzag';
+
+  const subjectDisplay =
+    meta.subject && meta.subject !== 'ALL'
+      ? meta.subject
+      : '..................................................';
+  const roomSessionDisplay = [meta.roomName.trim(), meta.sessionLabel.trim()]
+    .filter(Boolean)
+    .join(' / ') || '....................................';
+  const timeDisplay = meta.timeRange.trim() || '............ s.d. ............ WIB';
+
+  groups.forEach((group, groupIdx) => {
+    if (groupIdx > 0) {
+      doc.addPage();
+    }
+
+    let cursorY = drawPdfInstitutionKop(
+      doc,
+      profile,
+      kemenagPng,
+      schoolLogoPng,
+      'DAFTAR HADIR PESERTA UJIAN',
+      `${(profile.examTitle || 'UJIAN CBT').toUpperCase()} — TAHUN AJARAN ${profile.academicYear}`
+    );
+
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const marginX = 12;
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(15, 23, 42);
+
+    const col1LabelX = marginX;
+    const col1ValX = marginX + 28;
+    const col2LabelX = 112;
+    const col2ValX = 138;
+
+    doc.text('Mata Pelajaran', col1LabelX, cursorY);
+    doc.text(`: ${fitTextSingleLine(doc, subjectDisplay, 50)}`, col1ValX, cursorY);
+    doc.text('Hari / Tanggal', col2LabelX, cursorY);
+    doc.text(`: ${fitTextSingleLine(doc, dateParts.full, 58)}`, col2ValX, cursorY);
+
+    cursorY += 4.1;
+    doc.text('Kelas', col1LabelX, cursorY);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`: ${group.classLabel}`, col1ValX, cursorY);
+    doc.setFont('helvetica', 'normal');
+    doc.text('Waktu / Pukul', col2LabelX, cursorY);
+    doc.text(`: ${fitTextSingleLine(doc, timeDisplay, 58)}`, col2ValX, cursorY);
+
+    cursorY += 4.1;
+    doc.text('Ruang / Sesi', col1LabelX, cursorY);
+    doc.text(`: ${fitTextSingleLine(doc, roomSessionDisplay, 50)}`, col1ValX, cursorY);
+    doc.text('Jumlah Peserta', col2LabelX, cursorY);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`: ${group.items.length} Siswa`, col2ValX, cursorY);
+    doc.setFont('helvetica', 'normal');
+
+    cursorY += 3.5;
+
+    const tableBody = group.items.map((p, idx) => {
+      const rowNum = idx + 1;
+      const sigLabel =
+        signatureStyle === 'zigzag'
+          ? rowNum % 2 === 1
+            ? `${rowNum}. ........................`
+            : `                       ${rowNum}. ........................`
+          : `${rowNum}. ........................................`;
+
+      return [
+        String(rowNum),
+        p.participantNumber,
+        p.fullName,
+        sigLabel,
+        '',
+      ];
+    });
+
+    // Reduce row spacing so a full class fits cleanly on 1 A4 page
+    const rowCount = group.items.length;
+    let bodyFontSize = 8.2;
+    let padV = 1.4;
+    if (rowCount > 24 && rowCount <= 32) {
+      bodyFontSize = 7.8;
+      padV = 1.1;
+    } else if (rowCount > 32 && rowCount <= 38) {
+      bodyFontSize = 7.4;
+      padV = 0.85;
+    } else if (rowCount > 38 && rowCount <= 44) {
+      bodyFontSize = 7.0;
+      padV = 0.65;
+    } else if (rowCount > 44 && rowCount <= 50) {
+      bodyFontSize = 6.7;
+      padV = 0.5;
+    } else if (rowCount > 50) {
+      bodyFontSize = 7.4;
+      padV = 0.9;
+    }
+
+    autoTable(doc, {
+      startY: cursorY,
+      margin: { left: marginX, right: marginX, top: 8, bottom: 7 },
+      rowPageBreak: 'avoid',
+      head: [['No', 'Nomor Peserta', 'Nama Peserta', 'Tanda Tangan', 'Ket.']],
+      body: tableBody,
+      theme: 'grid',
+      styles: {
+        fontSize: bodyFontSize,
+        textColor: [15, 23, 42],
+        lineColor: [148, 163, 184],
+        lineWidth: 0.2,
+        cellPadding: { top: padV, right: 2, bottom: padV, left: 2 },
+        valign: 'middle',
+      },
+      headStyles: {
+        fillColor: [6, 78, 59],
+        textColor: 255,
+        fontStyle: 'bold',
+        halign: 'center',
+        cellPadding: { top: 1.8, right: 2, bottom: 1.8, left: 2 },
+      },
+      columnStyles: {
+        0: { halign: 'center', cellWidth: 9 },
+        1: { halign: 'center', cellWidth: 33, fontStyle: 'bold' },
+        2: { halign: 'left', cellWidth: 68 },
+        3: {
+          halign: 'left',
+          cellWidth: 56,
+          fontSize: Math.max(6.5, bodyFontSize - 0.4),
+          textColor: [100, 116, 139],
+        },
+        4: { halign: 'center', cellWidth: 20 },
+      },
+    });
+
+    doc.setPage(doc.getNumberOfPages());
+    const tableEndY =
+      (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ??
+      cursorY + 30;
+
+    const neededFooterHeight = 27;
+    let footerY = tableEndY + 3.5;
+    if (footerY + neededFooterHeight > pageHeight - 6) {
+      doc.addPage();
+      footerY = 16;
+    }
+
+    // Tally box (filled during/after exam)
+    doc.setDrawColor(148, 163, 184);
+    doc.setLineWidth(0.25);
+    doc.setFillColor(248, 250, 252);
+    doc.roundedRect(marginX, footerY, pageWidth - marginX * 2, 7.5, 1.2, 1.2, 'FD');
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.setTextColor(15, 23, 42);
+    doc.text(
+      `Jumlah Peserta Seharusnya: ${group.items.length} siswa    |    Hadir: ........... siswa    |    Tidak Hadir: ........... siswa`,
+      pageWidth / 2,
+      footerY + 4.9,
+      { align: 'center' }
+    );
+
+    const signTopY = footerY + 11.5;
+    const leftSignX = marginX + 6;
+    const rightSignX = pageWidth - marginX - 58;
+    const sup1Name = meta.supervisor1.trim() || '............................................';
+    const sup2Name = meta.supervisor2.trim() || '............................................';
+
+    doc.setFontSize(8.5);
+    doc.text('Pengawas Ruang 1,', leftSignX, signTopY);
+    doc.text('Pengawas Ruang 2 / Proktor,', rightSignX, signTopY);
+
+    doc.setFont('helvetica', 'bold');
+    doc.text(fitTextSingleLine(doc, sup1Name, 60), leftSignX, signTopY + 13);
+    doc.text(fitTextSingleLine(doc, sup2Name, 60), rightSignX, signTopY + 13);
+  });
+
+  const safeSchool = sanitizeFilenamePart(profile.schoolName, 'Sekolah');
+  const safeClass =
+    meta.className === 'ALL' ? 'Semua_Kelas' : sanitizeFilenamePart(meta.className, 'Kelas');
+  doc.save(`Daftar_Hadir_Peserta_${safeSchool}_${safeClass}.pdf`);
+}
+
+function buildDocxNoBorders() {
+  return {
+    top: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+    bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+    left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+    right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+    insideHorizontal: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+    insideVertical: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+  };
+}
+
+function buildDocxGridBorders() {
+  return {
+    top: { style: BorderStyle.SINGLE, size: 6, color: '475569' },
+    bottom: { style: BorderStyle.SINGLE, size: 6, color: '475569' },
+    left: { style: BorderStyle.SINGLE, size: 6, color: '475569' },
+    right: { style: BorderStyle.SINGLE, size: 6, color: '475569' },
+    insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: '94A3B8' },
+    insideVertical: { style: BorderStyle.SINGLE, size: 4, color: '94A3B8' },
+  };
+}
+
+function buildDocxKopElements(
+  profile: SchoolProfile,
+  kemenagBytes: Uint8Array | null,
+  schoolLogoBytes: Uint8Array | null,
+  title: string,
+  subtitle: string
+): Array<Paragraph | Table> {
+  const logoImgCell = (bytes: Uint8Array | null, align: (typeof AlignmentType)[keyof typeof AlignmentType]) =>
+    new TableCell({
+      width: { size: 13, type: WidthType.PERCENTAGE },
+      verticalAlign: VerticalAlignTable.CENTER,
+      margins: { top: 20, bottom: 20, left: 20, right: 20 },
+      children: [
+        new Paragraph({
+          alignment: align,
+          spacing: { after: 0 },
+          children: bytes
+            ? [
+                new ImageRun({
+                  type: 'png',
+                  data: bytes,
+                  transformation: { width: 50, height: 50 },
+                }),
+              ]
+            : [],
+        }),
+      ],
+    });
+
+  const kopTable = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    layout: TableLayoutType.FIXED,
+    borders: buildDocxNoBorders(),
+    rows: [
+      new TableRow({
+        cantSplit: true,
+        children: [
+          logoImgCell(kemenagBytes, AlignmentType.LEFT),
+          new TableCell({
+            width: { size: 74, type: WidthType.PERCENTAGE },
+            verticalAlign: VerticalAlignTable.CENTER,
+            margins: { top: 20, bottom: 20, left: 40, right: 40 },
+            children: [
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { after: 20 },
+                children: [
+                  new TextRun({
+                    text: KEMENAG_HEADER_TITLE,
+                    bold: true,
+                    size: 21,
+                    font: 'Calibri',
+                  }),
+                ],
+              }),
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { after: 20 },
+                children: [
+                  new TextRun({
+                    text: profile.schoolName.toUpperCase(),
+                    bold: true,
+                    size: 25,
+                    font: 'Calibri',
+                  }),
+                ],
+              }),
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { after: 0 },
+                children: [
+                  new TextRun({
+                    text: profile.address || '-',
+                    italics: true,
+                    size: 17,
+                    color: '334155',
+                    font: 'Calibri',
+                  }),
+                ],
+              }),
+            ],
+          }),
+          logoImgCell(schoolLogoBytes, AlignmentType.RIGHT),
+        ],
+      }),
+    ],
+  });
+
+  return [
+    kopTable,
+    new Paragraph({
+      spacing: { before: 20, after: 80 },
+      border: {
+        bottom: {
+          style: BorderStyle.DOUBLE,
+          size: 12,
+          color: '0F172A',
+          space: 4,
+        },
+      },
+      children: [],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 40, after: 20 },
+      children: [
+        new TextRun({
+          text: title,
+          bold: true,
+          size: 22,
+          font: 'Calibri',
+        }),
+      ],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 100 },
+      children: [
+        new TextRun({
+          text: subtitle,
+          bold: true,
+          size: 18,
+          color: '064E3B',
+          font: 'Calibri',
+        }),
+      ],
+    }),
+  ];
+}
+
+export async function exportAttendanceWord(
+  participants: Participant[],
+  profile: SchoolProfile,
+  meta: ExamDocumentMeta
+): Promise<void> {
+  const [kemenagBytes, schoolLogoBytes] = await Promise.all([
+    dataUrlToPngUint8Array(KEMENAG_LOGO_DATA_URL),
+    profile.logoDataUrl ? dataUrlToPngUint8Array(profile.logoDataUrl) : Promise.resolve(null),
+  ]);
+  const dateParts = formatIndonesianDateParts(meta.examDate);
+  const groups = groupAttendanceParticipants(participants, meta);
+  const signatureStyle = meta.signatureStyle || 'zigzag';
+
+  const subjectDisplay =
+    meta.subject && meta.subject !== 'ALL'
+      ? meta.subject
+      : '..................................................';
+  const roomSessionDisplay = [meta.roomName.trim(), meta.sessionLabel.trim()]
+    .filter(Boolean)
+    .join(' / ') || '....................................';
+  const timeDisplay = meta.timeRange.trim() || '............ s.d. ............ WIB';
+  const sup1Name = meta.supervisor1.trim() || '............................................';
+  const sup2Name = meta.supervisor2.trim() || '............................................';
+
+  const children: Array<Paragraph | Table> = [];
+
+  groups.forEach((group, groupIdx) => {
+    if (groupIdx > 0) {
+      children.push(new Paragraph({ children: [new PageBreak()] }));
+    }
+
+    children.push(
+      ...buildDocxKopElements(
+        profile,
+        kemenagBytes,
+        schoolLogoBytes,
+        'DAFTAR HADIR PESERTA UJIAN',
+        `${(profile.examTitle || 'UJIAN CBT').toUpperCase()} — TAHUN AJARAN ${profile.academicYear}`
+      )
+    );
+
+    const makeMetaCell = (text: string, bold = false, widthPct = 25) =>
+      new TableCell({
+        width: { size: widthPct, type: WidthType.PERCENTAGE },
+        margins: { top: 20, bottom: 20, left: 40, right: 40 },
+        children: [
+          new Paragraph({
+            spacing: { after: 0 },
+            children: [
+              new TextRun({
+                text,
+                bold,
+                size: 18,
+                font: 'Calibri',
+              }),
+            ],
+          }),
+        ],
+      });
+
+    children.push(
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        layout: TableLayoutType.FIXED,
+        borders: buildDocxNoBorders(),
+        rows: [
+          new TableRow({
+            children: [
+              makeMetaCell('Mata Pelajaran', false, 18),
+              makeMetaCell(`: ${subjectDisplay}`, true, 32),
+              makeMetaCell('Hari / Tanggal', false, 18),
+              makeMetaCell(`: ${dateParts.full}`, false, 32),
+            ],
+          }),
+          new TableRow({
+            children: [
+              makeMetaCell('Kelas', false, 18),
+              makeMetaCell(`: ${group.classLabel}`, true, 32),
+              makeMetaCell('Waktu / Pukul', false, 18),
+              makeMetaCell(`: ${timeDisplay}`, false, 32),
+            ],
+          }),
+          new TableRow({
+            children: [
+              makeMetaCell('Ruang / Sesi', false, 18),
+              makeMetaCell(`: ${roomSessionDisplay}`, false, 32),
+              makeMetaCell('Jumlah Peserta', false, 18),
+              makeMetaCell(`: ${group.items.length} Siswa`, true, 32),
+            ],
+          }),
+        ],
+      })
+    );
+
+    children.push(new Paragraph({ spacing: { after: 60 } }));
+
+    const makeHeaderCell = (label: string, widthPct: number) =>
+      new TableCell({
+        width: { size: widthPct, type: WidthType.PERCENTAGE },
+        verticalAlign: VerticalAlignTable.CENTER,
+        shading: { fill: '064E3B', type: ShadingType.CLEAR, color: 'auto' },
+        margins: { top: 50, bottom: 50, left: 70, right: 70 },
+        children: [
+          new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 0 },
+            children: [
+              new TextRun({
+                text: label,
+                bold: true,
+                color: 'FFFFFF',
+                size: 17,
+                font: 'Calibri',
+              }),
+            ],
+          }),
+        ],
+      });
+
+    const headerRow = new TableRow({
+      tableHeader: true,
+      cantSplit: true,
+      children: [
+        makeHeaderCell('No', 6),
+        makeHeaderCell('Nomor Peserta', 20),
+        makeHeaderCell('Nama Peserta', 36),
+        makeHeaderCell('Tanda Tangan', 26),
+        makeHeaderCell('Ket.', 12),
+      ],
+    });
+
+    const dataRows = group.items.map((p, idx) => {
+      const rowNum = idx + 1;
+      const isZigzagRight = signatureStyle === 'zigzag' && rowNum % 2 === 0;
+      const sigText =
+        signatureStyle === 'zigzag'
+          ? `${rowNum}. .......................`
+          : `${rowNum}. .............................`;
+
+      return new TableRow({
+        cantSplit: true,
+        height: { value: 280, rule: HeightRule.ATLEAST },
+        children: [
+          new TableCell({
+            width: { size: 6, type: WidthType.PERCENTAGE },
+            verticalAlign: VerticalAlignTable.CENTER,
+            margins: { top: 24, bottom: 24, left: 60, right: 60 },
+            children: [
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { after: 0 },
+                children: [new TextRun({ text: String(rowNum), size: 17, font: 'Calibri' })],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: 20, type: WidthType.PERCENTAGE },
+            verticalAlign: VerticalAlignTable.CENTER,
+            margins: { top: 24, bottom: 24, left: 60, right: 60 },
+            children: [
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { after: 0 },
+                children: [
+                  new TextRun({
+                    text: p.participantNumber,
+                    bold: true,
+                    size: 17,
+                    font: 'Consolas',
+                  }),
+                ],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: 36, type: WidthType.PERCENTAGE },
+            verticalAlign: VerticalAlignTable.CENTER,
+            margins: { top: 24, bottom: 24, left: 75, right: 75 },
+            children: [
+              new Paragraph({
+                spacing: { after: 0 },
+                children: [new TextRun({ text: p.fullName, size: 17, font: 'Calibri' })],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: 26, type: WidthType.PERCENTAGE },
+            verticalAlign: VerticalAlignTable.CENTER,
+            margins: { top: 24, bottom: 24, left: 80, right: 80 },
+            children: [
+              new Paragraph({
+                alignment: isZigzagRight ? AlignmentType.RIGHT : AlignmentType.LEFT,
+                spacing: { after: 0 },
+                children: [
+                  new TextRun({
+                    text: sigText,
+                    size: 16,
+                    color: '64748B',
+                    font: 'Calibri',
+                  }),
+                ],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: 12, type: WidthType.PERCENTAGE },
+            verticalAlign: VerticalAlignTable.CENTER,
+            margins: { top: 24, bottom: 24, left: 60, right: 60 },
+            children: [new Paragraph({ spacing: { after: 0 }, children: [] })],
+          }),
+        ],
+      });
+    });
+
+    children.push(
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        layout: TableLayoutType.FIXED,
+        borders: buildDocxGridBorders(),
+        rows: [headerRow, ...dataRows],
+      })
+    );
+
+    children.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 100, after: 120 },
+        children: [
+          new TextRun({
+            text: `Jumlah Peserta Seharusnya: ${group.items.length} siswa    |    Hadir: ............ siswa    |    Tidak Hadir: ............ siswa`,
+            size: 17,
+            font: 'Calibri',
+          }),
+        ],
+      })
+    );
+
+    children.push(
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        layout: TableLayoutType.FIXED,
+        borders: buildDocxNoBorders(),
+        rows: [
+          new TableRow({
+            cantSplit: true,
+            children: [
+              new TableCell({
+                width: { size: 50, type: WidthType.PERCENTAGE },
+                children: [
+                  new Paragraph({
+                    spacing: { after: 440 },
+                    children: [new TextRun({ text: 'Pengawas Ruang 1,', size: 18, font: 'Calibri' })],
+                  }),
+                  new Paragraph({
+                    spacing: { after: 0 },
+                    children: [new TextRun({ text: sup1Name, bold: true, size: 18, font: 'Calibri' })],
+                  }),
+                ],
+              }),
+              new TableCell({
+                width: { size: 50, type: WidthType.PERCENTAGE },
+                children: [
+                  new Paragraph({
+                    spacing: { after: 440 },
+                    children: [
+                      new TextRun({ text: 'Pengawas Ruang 2 / Proktor,', size: 18, font: 'Calibri' }),
+                    ],
+                  }),
+                  new Paragraph({
+                    spacing: { after: 0 },
+                    children: [new TextRun({ text: sup2Name, bold: true, size: 18, font: 'Calibri' })],
+                  }),
+                ],
+              }),
+            ],
+          }),
+        ],
+      })
+    );
+  });
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: { top: 480, right: 640, bottom: 480, left: 640 },
+          },
+        },
+        children,
+      },
+    ],
+  });
+
+  const blob = await Packer.toBlob(doc);
+  const safeSchool = sanitizeFilenamePart(profile.schoolName, 'Sekolah');
+  const safeClass =
+    meta.className === 'ALL' ? 'Semua_Kelas' : sanitizeFilenamePart(meta.className, 'Kelas');
+  triggerBlobDownload(blob, `Daftar_Hadir_Peserta_${safeSchool}_${safeClass}.docx`);
+}
+
+export async function exportBeritaAcaraPdf(
+  expectedParticipantsCount: number,
+  profile: SchoolProfile,
+  meta: ExamDocumentMeta
+): Promise<void> {
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const [kemenagPng, schoolLogoPng] = await Promise.all([
+    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
+  ]);
+  const dateParts = formatIndonesianDateParts(meta.examDate);
+
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const marginX = 14;
+  const contentWidth = pageWidth - marginX * 2;
+
+  let cursorY = drawPdfInstitutionKop(
+    doc,
+    profile,
+    kemenagPng,
+    schoolLogoPng,
+    'BERITA ACARA PELAKSANAAN UJIAN',
+    `${(profile.examTitle || 'UJIAN CBT').toUpperCase()} — TAHUN AJARAN ${profile.academicYear}`
+  );
+
+  cursorY += 2;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9.5);
+  doc.setTextColor(15, 23, 42);
+
+  const openingText =
+    `Pada hari ini ${dateParts.hari}, tanggal ${dateParts.tanggal} bulan ${dateParts.bulan} tahun ${dateParts.tahun}, ` +
+    `bertempat di ${profile.schoolName}, telah diselenggarakan kegiatan ${profile.examTitle} ` +
+    `Tahun Ajaran ${profile.academicYear} dengan rincian pelaksanaan sebagai berikut:`;
+
+  const openingLines = doc.splitTextToSize(openingText, contentWidth) as string[];
+  doc.text(openingLines, marginX, cursorY);
+  cursorY += openingLines.length * 4.6 + 3.5;
+
+  const subjectDisplay =
+    meta.subject && meta.subject !== 'ALL'
+      ? meta.subject
+      : '......................................................................';
+  const classDisplay =
+    meta.className === 'ALL' ? 'Semua Kelas' : `Kelas ${meta.className}`;
+  const roomSessionDisplay =
+    [meta.roomName.trim(), meta.sessionLabel.trim()].filter(Boolean).join(' / ') ||
+    '......................................................................';
+  const timeDisplay = meta.timeRange.trim() || '............ s.d. ............ WIB';
+  const expectedDisplay =
+    expectedParticipantsCount > 0
+      ? `${expectedParticipantsCount} orang`
+      : '............ orang';
+
+  const infoRows: Array<[string, string]> = [
+    ['1. Mata Pelajaran', subjectDisplay],
+    ['2. Kelas / Tingkat', classDisplay],
+    ['3. Ruang Ujian / Sesi', roomSessionDisplay],
+    ['4. Waktu Pelaksanaan', timeDisplay],
+    ['5. Jumlah Peserta Seharusnya', expectedDisplay],
+    ['6. Jumlah Peserta Hadir', '............ orang'],
+    ['7. Jumlah Peserta Tidak Hadir', '............ orang'],
+    [
+      '8. Nomor Peserta Tidak Hadir',
+      '..................................................................................',
+    ],
+    [
+      '',
+      '..................................................................................',
+    ],
+  ];
+
+  const labelW = 56;
+  for (const [label, val] of infoRows) {
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9.5);
+    doc.text(label, marginX + 2, cursorY);
+    doc.text(label ? ':' : ' ', marginX + labelW, cursorY);
+    doc.setFont('helvetica', label.startsWith('1.') || label.startsWith('5.') ? 'bold' : 'normal');
+    const wrappedVal = doc.splitTextToSize(val, contentWidth - labelW - 4) as string[];
+    doc.text(wrappedVal, marginX + labelW + 3, cursorY);
+    cursorY += Math.max(1, wrappedVal.length) * 4.6 + 1.0;
+  }
+
+  cursorY += 3;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.text('Catatan Kejadian Penting Selama Pelaksanaan Ujian:', marginX, cursorY);
+  cursorY += 2.5;
+
+  const trimmedNotes = meta.notes.trim();
+  const noteLines = trimmedNotes
+    ? (doc.splitTextToSize(trimmedNotes, contentWidth - 8) as string[])
+    : [];
+  const totalLinesInBox = Math.max(4, Math.min(6, noteLines.length + 1));
+  const boxHeight = totalLinesInBox * 5.6 + 4.5;
+
+  doc.setDrawColor(100, 116, 139);
+  doc.setLineWidth(0.3);
+  doc.roundedRect(marginX, cursorY, contentWidth, boxHeight, 1.5, 1.5, 'S');
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  let lineY = cursorY + 5.8;
+  for (let i = 0; i < totalLinesInBox; i++) {
+    if (i < noteLines.length) {
+      doc.setTextColor(15, 23, 42);
+      doc.text(noteLines[i], marginX + 4, lineY);
+    } else {
+      doc.setDrawColor(203, 213, 225);
+      doc.setLineDashPattern([1, 1.2], 0);
+      doc.line(marginX + 4, lineY, marginX + contentWidth - 4, lineY);
+      doc.setLineDashPattern([], 0);
+    }
+    lineY += 5.6;
+  }
+
+  cursorY += boxHeight + 5;
+
+  const closingText =
+    'Demikian Berita Acara pelaksanaan ujian ini dibuat dengan sebenar-benarnya untuk dapat dipergunakan sebagaimana mestinya.';
+  const closingLines = doc.splitTextToSize(closingText, contentWidth) as string[];
+
+  if (cursorY + closingLines.length * 4.5 + 56 > pageHeight - 8) {
+    doc.addPage();
+    cursorY = 18;
+  }
+
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9.5);
+  doc.text(closingLines, marginX, cursorY);
+  cursorY += closingLines.length * 4.6 + 6;
+
+  const sup1Name = meta.supervisor1.trim() || '............................................';
+  const sup2Name = meta.supervisor2.trim() || '............................................';
+  const chairName = (profile.committeeChairName || '').trim() || '............................................';
+  const principalName = (profile.principalName || '').trim() || '............................................';
+
+  const leftColX = marginX + 4;
+  const rightColX = pageWidth / 2 + 10;
+
+  doc.setFontSize(9);
+  doc.text('Pengawas Ruang 1,', leftColX, cursorY);
+  doc.text('Pengawas Ruang 2 / Proktor,', rightColX, cursorY);
+
+  doc.setFont('helvetica', 'bold');
+  doc.text(fitTextSingleLine(doc, sup1Name, 68), leftColX, cursorY + 17);
+  doc.text(fitTextSingleLine(doc, sup2Name, 68), rightColX, cursorY + 17);
+
+  cursorY += 26;
+  doc.setFont('helvetica', 'normal');
+  doc.text('Mengetahui,', pageWidth / 2, cursorY, { align: 'center' });
+  cursorY += 4.8;
+
+  doc.text('Ketua Panitia Ujian,', leftColX, cursorY);
+  doc.text('Kepala Sekolah,', rightColX, cursorY);
+
+  doc.setFont('helvetica', 'bold');
+  doc.text(fitTextSingleLine(doc, chairName, 68), leftColX, cursorY + 17);
+  doc.text(fitTextSingleLine(doc, principalName, 68), rightColX, cursorY + 17);
+
+  const safeSchool = sanitizeFilenamePart(profile.schoolName, 'Sekolah');
+  const safeSubj =
+    meta.subject && meta.subject !== 'ALL'
+      ? sanitizeFilenamePart(meta.subject, 'Ujian')
+      : 'Semua_Mapel';
+  doc.save(`Berita_Acara_Ujian_${safeSchool}_${safeSubj}.pdf`);
+}
+
+export async function exportBeritaAcaraWord(
+  expectedParticipantsCount: number,
+  profile: SchoolProfile,
+  meta: ExamDocumentMeta
+): Promise<void> {
+  const [kemenagBytes, schoolLogoBytes] = await Promise.all([
+    dataUrlToPngUint8Array(KEMENAG_LOGO_DATA_URL),
+    profile.logoDataUrl ? dataUrlToPngUint8Array(profile.logoDataUrl) : Promise.resolve(null),
+  ]);
+  const dateParts = formatIndonesianDateParts(meta.examDate);
+
+  const subjectDisplay =
+    meta.subject && meta.subject !== 'ALL'
+      ? meta.subject
+      : '......................................................................';
+  const classDisplay =
+    meta.className === 'ALL' ? 'Semua Kelas' : `Kelas ${meta.className}`;
+  const roomSessionDisplay =
+    [meta.roomName.trim(), meta.sessionLabel.trim()].filter(Boolean).join(' / ') ||
+    '......................................................................';
+  const timeDisplay = meta.timeRange.trim() || '............ s.d. ............ WIB';
+  const expectedDisplay =
+    expectedParticipantsCount > 0
+      ? `${expectedParticipantsCount} orang`
+      : '............ orang';
+
+  const sup1Name = meta.supervisor1.trim() || '............................................';
+  const sup2Name = meta.supervisor2.trim() || '............................................';
+  const chairName = (profile.committeeChairName || '').trim() || '............................................';
+  const principalName = (profile.principalName || '').trim() || '............................................';
+
+  const infoRows: Array<[string, string, boolean]> = [
+    ['1. Mata Pelajaran', subjectDisplay, true],
+    ['2. Kelas / Tingkat', classDisplay, false],
+    ['3. Ruang Ujian / Sesi', roomSessionDisplay, false],
+    ['4. Waktu Pelaksanaan', timeDisplay, false],
+    ['5. Jumlah Peserta Seharusnya', expectedDisplay, true],
+    ['6. Jumlah Peserta Hadir', '............ orang', false],
+    ['7. Jumlah Peserta Tidak Hadir', '............ orang', false],
+    [
+      '8. Nomor Peserta Tidak Hadir',
+      '...........................................................................',
+      false,
+    ],
+    [
+      '',
+      '...........................................................................',
+      false,
+    ],
+  ];
+
+  const detailTable = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    layout: TableLayoutType.FIXED,
+    borders: buildDocxNoBorders(),
+    rows: infoRows.map(
+      ([label, val, isBold]) =>
+        new TableRow({
+          cantSplit: true,
+          children: [
+            new TableCell({
+              width: { size: 35, type: WidthType.PERCENTAGE },
+              margins: { top: 30, bottom: 30, left: 50, right: 50 },
+              children: [
+                new Paragraph({
+                  spacing: { after: 0 },
+                  children: [new TextRun({ text: label, size: 19, font: 'Calibri' })],
+                }),
+              ],
+            }),
+            new TableCell({
+              width: { size: 4, type: WidthType.PERCENTAGE },
+              margins: { top: 30, bottom: 30, left: 20, right: 20 },
+              children: [
+                new Paragraph({
+                  spacing: { after: 0 },
+                  children: [new TextRun({ text: label ? ':' : '', size: 19, font: 'Calibri' })],
+                }),
+              ],
+            }),
+            new TableCell({
+              width: { size: 61, type: WidthType.PERCENTAGE },
+              margins: { top: 30, bottom: 30, left: 30, right: 50 },
+              children: [
+                new Paragraph({
+                  spacing: { after: 0 },
+                  children: [new TextRun({ text: val, bold: isBold, size: 19, font: 'Calibri' })],
+                }),
+              ],
+            }),
+          ],
+        })
+    ),
+  });
+
+  const noteLinesRaw = meta.notes.trim()
+    ? meta.notes
+        .trim()
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+    : [];
+  const totalNoteLines = Math.max(4, noteLinesRaw.length + 1);
+  const noteParagraphs: Paragraph[] = [];
+  for (let i = 0; i < totalNoteLines; i++) {
+    noteParagraphs.push(
+      new Paragraph({
+        spacing: { before: 25, after: 50 },
+        children: [
+          new TextRun({
+            text:
+              i < noteLinesRaw.length
+                ? noteLinesRaw[i]
+                : '....................................................................................................................',
+            size: 18,
+            color: i < noteLinesRaw.length ? '0F172A' : '94A3B8',
+            font: 'Calibri',
+          }),
+        ],
+      })
+    );
+  }
+
+  const notesBox = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    layout: TableLayoutType.FIXED,
+    borders: buildDocxGridBorders(),
+    rows: [
+      new TableRow({
+        cantSplit: true,
+        children: [
+          new TableCell({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            margins: { top: 70, bottom: 70, left: 120, right: 120 },
+            children: noteParagraphs,
+          }),
+        ],
+      }),
+    ],
+  });
+
+  const signTable = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    layout: TableLayoutType.FIXED,
+    borders: buildDocxNoBorders(),
+    rows: [
+      new TableRow({
+        cantSplit: true,
+        children: [
+          new TableCell({
+            width: { size: 50, type: WidthType.PERCENTAGE },
+            margins: { top: 40, bottom: 40, left: 50, right: 50 },
+            children: [
+              new Paragraph({
+                spacing: { after: 520 },
+                children: [new TextRun({ text: 'Pengawas Ruang 1,', size: 19, font: 'Calibri' })],
+              }),
+              new Paragraph({
+                spacing: { after: 100 },
+                children: [new TextRun({ text: sup1Name, bold: true, size: 19, font: 'Calibri' })],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: 50, type: WidthType.PERCENTAGE },
+            margins: { top: 40, bottom: 40, left: 50, right: 50 },
+            children: [
+              new Paragraph({
+                spacing: { after: 520 },
+                children: [
+                  new TextRun({ text: 'Pengawas Ruang 2 / Proktor,', size: 19, font: 'Calibri' }),
+                ],
+              }),
+              new Paragraph({
+                spacing: { after: 100 },
+                children: [new TextRun({ text: sup2Name, bold: true, size: 19, font: 'Calibri' })],
+              }),
+            ],
+          }),
+        ],
+      }),
+      new TableRow({
+        cantSplit: true,
+        children: [
+          new TableCell({
+            width: { size: 50, type: WidthType.PERCENTAGE },
+            margins: { top: 80, bottom: 40, left: 50, right: 50 },
+            children: [
+              new Paragraph({
+                spacing: { after: 20 },
+                children: [new TextRun({ text: 'Mengetahui,', size: 18, font: 'Calibri' })],
+              }),
+              new Paragraph({
+                spacing: { after: 520 },
+                children: [
+                  new TextRun({ text: 'Ketua Panitia Ujian,', size: 19, font: 'Calibri' }),
+                ],
+              }),
+              new Paragraph({
+                spacing: { after: 0 },
+                children: [new TextRun({ text: chairName, bold: true, size: 19, font: 'Calibri' })],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: 50, type: WidthType.PERCENTAGE },
+            margins: { top: 80, bottom: 40, left: 50, right: 50 },
+            children: [
+              new Paragraph({
+                spacing: { after: 20 },
+                children: [new TextRun({ text: ' ', size: 18, font: 'Calibri' })],
+              }),
+              new Paragraph({
+                spacing: { after: 520 },
+                children: [new TextRun({ text: 'Kepala Sekolah,', size: 19, font: 'Calibri' })],
+              }),
+              new Paragraph({
+                spacing: { after: 0 },
+                children: [
+                  new TextRun({ text: principalName, bold: true, size: 19, font: 'Calibri' }),
+                ],
+              }),
+            ],
+          }),
+        ],
+      }),
+    ],
+  });
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: { top: 520, right: 720, bottom: 520, left: 720 },
+          },
+        },
+        children: [
+          ...buildDocxKopElements(
+            profile,
+            kemenagBytes,
+            schoolLogoBytes,
+            'BERITA ACARA PELAKSANAAN UJIAN',
+            `${(profile.examTitle || 'UJIAN CBT').toUpperCase()} — TAHUN AJARAN ${profile.academicYear}`
+          ),
+          new Paragraph({
+            spacing: { before: 40, after: 100 },
+            children: [
+              new TextRun({
+                text:
+                  `Pada hari ini ${dateParts.hari}, tanggal ${dateParts.tanggal} bulan ${dateParts.bulan} tahun ${dateParts.tahun}, ` +
+                  `bertempat di ${profile.schoolName}, telah diselenggarakan kegiatan ${profile.examTitle} ` +
+                  `Tahun Ajaran ${profile.academicYear} dengan rincian pelaksanaan sebagai berikut:`,
+                size: 19,
+                font: 'Calibri',
+              }),
+            ],
+          }),
+          detailTable,
+          new Paragraph({
+            spacing: { before: 120, after: 60 },
+            children: [
+              new TextRun({
+                text: 'Catatan Kejadian Penting Selama Pelaksanaan Ujian:',
+                bold: true,
+                size: 19,
+                font: 'Calibri',
+              }),
+            ],
+          }),
+          notesBox,
+          new Paragraph({
+            spacing: { before: 120, after: 120 },
+            children: [
+              new TextRun({
+                text: 'Demikian Berita Acara pelaksanaan ujian ini dibuat dengan sebenar-benarnya untuk dapat dipergunakan sebagaimana mestinya.',
+                size: 19,
+                font: 'Calibri',
+              }),
+            ],
+          }),
+          signTable,
+        ],
+      },
+    ],
+  });
+
+  const blob = await Packer.toBlob(doc);
+  const safeSchool = sanitizeFilenamePart(profile.schoolName, 'Sekolah');
+  const safeSubj =
+    meta.subject && meta.subject !== 'ALL'
+      ? sanitizeFilenamePart(meta.subject, 'Ujian')
+      : 'Semua_Mapel';
+  triggerBlobDownload(blob, `Berita_Acara_Ujian_${safeSchool}_${safeSubj}.docx`);
 }

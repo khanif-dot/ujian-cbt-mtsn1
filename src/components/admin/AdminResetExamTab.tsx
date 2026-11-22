@@ -1,7 +1,9 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Lock,
   RotateCcw,
   Search,
@@ -45,20 +47,39 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
   const [confirmResetTargets, setConfirmResetTargets] = useState<ExamResult[]>([]);
   const [isResetting, setIsResetting] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const [listPage, setListPage] = useState(1);
+  const [showAllRows, setShowAllRows] = useState(false);
+
+  const normalizedAllowedSet = useMemo(
+    () => new Set(normalizedAllowed),
+    [normalizedAllowed]
+  );
+
+  const scheduleById = useMemo(
+    () => new Map(schedules.map((s) => [s.id, s])),
+    [schedules]
+  );
 
   const scopedSchedules = useMemo(() => {
     if (!isRestrictedBySubject) return schedules;
     return schedules.filter((s) =>
-      normalizedAllowed.includes(s.subject.trim().toLowerCase())
+      normalizedAllowedSet.has(s.subject.trim().toLowerCase())
     );
-  }, [schedules, isRestrictedBySubject, normalizedAllowed]);
+  }, [schedules, isRestrictedBySubject, normalizedAllowedSet]);
 
   const scopedResults = useMemo(() => {
     if (!isRestrictedBySubject) return results;
-    return results.filter((r) =>
-      normalizedAllowed.includes((r.subject || '').trim().toLowerCase())
-    );
-  }, [results, isRestrictedBySubject, normalizedAllowed]);
+    return results.filter((r) => {
+      const resolvedSubj = (
+        scheduleById.get(r.examId)?.subject ||
+        r.subject ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+      return normalizedAllowedSet.has(resolvedSubj);
+    });
+  }, [results, isRestrictedBySubject, normalizedAllowedSet, scheduleById]);
 
   const subjects = useMemo(() => {
     if (isRestrictedBySubject && allowedSubjects) {
@@ -66,10 +87,11 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
     }
     const set = new Set<string>(scopedSchedules.map((s) => s.subject));
     scopedResults.forEach((r) => {
-      if (r.subject) set.add(r.subject);
+      const subj = scheduleById.get(r.examId)?.subject || r.subject;
+      if (subj) set.add(subj);
     });
     return Array.from(set).sort();
-  }, [scopedSchedules, scopedResults, isRestrictedBySubject, allowedSubjects]);
+  }, [scopedSchedules, scopedResults, isRestrictedBySubject, allowedSubjects, scheduleById]);
 
   const counts = useMemo(() => {
     const needsUnlock = scopedResults.filter(
@@ -105,11 +127,17 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
         if (r.status !== 'submitted') return false;
       }
 
-      if (
-        subjectFilter !== 'ALL' &&
-        (r.subject || '').trim().toLowerCase() !== normSubjFilter
-      ) {
-        return false;
+      if (subjectFilter !== 'ALL') {
+        const resolvedSubj = (
+          scheduleById.get(r.examId)?.subject ||
+          r.subject ||
+          ''
+        )
+          .trim()
+          .toLowerCase();
+        if (resolvedSubj !== normSubjFilter) {
+          return false;
+        }
       }
       if (classFilter !== 'ALL' && r.className !== classFilter) return false;
       if (
@@ -121,11 +149,34 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
       }
       return true;
     });
-  }, [scopedResults, filterMode, subjectFilter, classFilter, searchQuery]);
+  }, [scopedResults, filterMode, subjectFilter, classFilter, searchQuery, scheduleById]);
+
+  useEffect(() => {
+    setListPage(1);
+  }, [filterMode, subjectFilter, classFilter, searchQuery]);
+
+  const PAGE_SIZE = 50;
+  const MAX_SHOW_ALL = 300;
+  const totalPages = Math.max(1, Math.ceil(filteredResults.length / PAGE_SIZE));
+  const safeListPage = Math.min(listPage, totalPages);
+  const displayedResults = useMemo(() => {
+    if (showAllRows) {
+      return filteredResults.length <= MAX_SHOW_ALL
+        ? filteredResults
+        : filteredResults.slice(0, MAX_SHOW_ALL);
+    }
+    if (filteredResults.length <= PAGE_SIZE) {
+      return filteredResults;
+    }
+    const start = (safeListPage - 1) * PAGE_SIZE;
+    return filteredResults.slice(start, start + PAGE_SIZE);
+  }, [filteredResults, showAllRows, safeListPage]);
+
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
   const allVisibleSelected =
     filteredResults.length > 0 &&
-    filteredResults.every((r) => selectedIds.includes(r.id));
+    filteredResults.every((r) => selectedIdSet.has(r.id));
 
   const toggleSelectAllVisible = () => {
     if (allVisibleSelected) {
@@ -149,8 +200,9 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
     setFeedback('');
     try {
       const ids = confirmResetTargets.map((r) => r.id);
+      const removedSet = new Set(ids);
       await onResetExamResults(ids);
-      setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
+      setSelectedIds((prev) => prev.filter((id) => !removedSet.has(id)));
       setFeedback(
         confirmResetTargets.length === 1
           ? `Ujian ${confirmResetTargets[0].subject} untuk ${confirmResetTargets[0].studentName} (${confirmResetTargets[0].participantNumber}) berhasil direset dan dibuka kuncinya.`
@@ -163,8 +215,8 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
   };
 
   const selectedRecords = useMemo(
-    () => scopedResults.filter((r) => selectedIds.includes(r.id)),
-    [scopedResults, selectedIds]
+    () => scopedResults.filter((r) => selectedIdSet.has(r.id)),
+    [scopedResults, selectedIdSet]
   );
 
   return (
@@ -344,8 +396,8 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
                   </td>
                 </tr>
               ) : (
-                filteredResults.map((res) => {
-                  const isChecked = selectedIds.includes(res.id);
+                displayedResults.map((res) => {
+                  const isChecked = selectedIdSet.has(res.id);
                   const isFlagged = res.status === 'flagged';
                   const hasWarning = res.tabSwitchCount > 0;
                   return (
@@ -420,6 +472,59 @@ export const AdminResetExamTab: React.FC<AdminResetExamTabProps> = ({
             </tbody>
           </table>
         </div>
+
+        {filteredResults.length > PAGE_SIZE && (
+          <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+            <div>
+              {showAllRows ? (
+                <span>
+                  {filteredResults.length > MAX_SHOW_ALL
+                    ? `Menampilkan ${MAX_SHOW_ALL} dari ${filteredResults.length} peserta (gunakan filter/pencarian untuk sisa data).`
+                    : `Menampilkan seluruh ${filteredResults.length} peserta sekaligus.`}
+                </span>
+              ) : (
+                <span>
+                  Menampilkan baris {(safeListPage - 1) * PAGE_SIZE + 1}–
+                  {Math.min(safeListPage * PAGE_SIZE, filteredResults.length)} dari{' '}
+                  {filteredResults.length} peserta (Halaman {safeListPage} dari {totalPages})
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!showAllRows && totalPages > 1 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={safeListPage <= 1}
+                    onClick={() => setListPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Sebelumnya</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeListPage >= totalPages}
+                    onClick={() => setListPage((p) => Math.min(totalPages, p + 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <span>Berikutnya</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAllRows((v) => !v)}
+                className="px-3 py-1.5 rounded-lg border border-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 font-semibold cursor-pointer"
+              >
+                {showAllRows
+                  ? `Bagi per ${PAGE_SIZE} Baris`
+                  : `Tampilkan Maks ${Math.min(filteredResults.length, MAX_SHOW_ALL)} (${filteredResults.length})`}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Confirmation Modal */}

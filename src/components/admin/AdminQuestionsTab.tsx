@@ -1,16 +1,25 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeftRight,
+  BookOpenCheck,
+  CheckCircle2,
   CheckSquare,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Clock,
+  Cloud,
   FileSpreadsheet,
   FileText,
+  Grid3X3,
   ImagePlus,
   Link2,
+  ListChecks,
   Pencil,
   Plus,
+  RefreshCw,
+  RotateCcw,
   Search,
   Shuffle,
   Sigma,
@@ -19,33 +28,62 @@ import {
   X,
 } from 'lucide-react';
 import { MathText } from '@/src/components/MathText';
+import { QuestionCoverageMatrix } from '@/src/components/admin/QuestionCoverageMatrix';
 import {
   ALL_CLASSES,
   type ExamResult,
   type ExamSchedule,
+  type MatchingPair,
   type OptionKey,
+  type Participant,
   type Question,
   type QuestionOption,
+  type QuestionType,
+  type StaffRoleType,
 } from '@/src/types/cbt';
 import {
+  compressDataUrlImage,
   compressQuestionImage,
   downloadQuestionsTemplate,
   downloadQuestionsWordTemplate,
   parseQuestionsDocx,
   parseQuestionsExcel,
 } from '@/src/lib/importers';
+import {
+  buildMatchingQuestionData,
+  getEffectiveQuestionType,
+  QUESTION_TYPE_LABELS,
+  reconstructMatchingPairs,
+  TRUE_FALSE_DEFAULT_OPTIONS,
+} from '@/src/lib/questionUtils';
+import {
+  syncAdminQuestionsFromCloud,
+  type AdminCloudSyncResult,
+} from '@/src/lib/dataStore';
+import {
+  hasSupabaseServiceRoleKey,
+  isLiveSupabaseConfigured,
+  uploadQuestionImageToStorage,
+} from '@/src/lib/supabase';
 import { usePersistedState } from '@/src/lib/usePersistedState';
+
+interface CloudWriteResult {
+  synced: boolean;
+  error?: string;
+}
 
 interface AdminQuestionsTabProps {
   schedules: ExamSchedule[];
   questions: Question[];
+  participants?: Participant[];
   results?: ExamResult[];
+  staffRoleType?: StaffRoleType;
   allowedSubjects?: string[];
-  onSaveSchedule: (schedule: ExamSchedule) => Promise<void>;
-  onDeleteSchedule: (id: string) => Promise<void>;
+  onSaveSchedule: (schedule: ExamSchedule) => Promise<CloudWriteResult | void>;
+  onDeleteSchedule: (id: string) => Promise<CloudWriteResult | void>;
   onDeleteAllSchedules: (allowedSubjects?: string[]) => Promise<void>;
-  onUpsertQuestions: (items: Question[]) => Promise<void>;
-  onDeleteQuestion: (id: string) => Promise<void>;
+  onUpsertQuestions: (items: Question[]) => Promise<CloudWriteResult | void>;
+  onDeleteQuestion: (id: string) => Promise<CloudWriteResult | void>;
   onDeleteQuestionsBatch: (ids: string[]) => Promise<void>;
   onDeleteAllQuestions: (allowedSubjects?: string[]) => Promise<void>;
 }
@@ -178,15 +216,25 @@ const ClassTargetSelector: React.FC<ClassTargetSelectorProps> = ({
   );
 };
 
+function createDefaultMatchingPairs(): MatchingPair[] {
+  return [
+    { id: 'L1', leftText: '', rightText: '' },
+    { id: 'L2', leftText: '', rightText: '' },
+    { id: 'L3', leftText: '', rightText: '' },
+  ];
+}
+
 interface QuestionFormState {
   id: string | null;
   orderIndex: number;
   subject: string;
+  questionType: QuestionType;
   targetClasses: string[];
   questionText: string;
   questionImageUrl: string;
   options: Record<OptionKey, { text: string; imageUrl: string }>;
-  correctAnswer: OptionKey;
+  matchingPairs: MatchingPair[];
+  correctAnswer: string;
   points: number;
 }
 
@@ -195,6 +243,7 @@ function createEmptyQuestionForm(defaultSubject: string, nextOrderIndex: number)
     id: null,
     orderIndex: nextOrderIndex,
     subject: defaultSubject,
+    questionType: 'multiple_choice',
     targetClasses: [...CLASSES_7],
     questionText: '',
     questionImageUrl: '',
@@ -204,19 +253,21 @@ function createEmptyQuestionForm(defaultSubject: string, nextOrderIndex: number)
       C: { text: '', imageUrl: '' },
       D: { text: '', imageUrl: '' },
     },
+    matchingPairs: createDefaultMatchingPairs(),
     correctAnswer: 'A',
     points: 20,
   };
 }
 
 function questionToFormState(q: Question): QuestionFormState {
+  const qType = getEffectiveQuestionType(q);
   const optMap: Record<OptionKey, { text: string; imageUrl: string }> = {
     A: { text: '', imageUrl: '' },
     B: { text: '', imageUrl: '' },
     C: { text: '', imageUrl: '' },
     D: { text: '', imageUrl: '' },
   };
-  for (const opt of q.options) {
+  for (const opt of Array.isArray(q.options) ? q.options : []) {
     if (opt.key in optMap) {
       optMap[opt.key] = {
         text: opt.text || '',
@@ -224,15 +275,38 @@ function questionToFormState(q: Question): QuestionFormState {
       };
     }
   }
+  const reconstructedPairs = qType === 'matching' ? reconstructMatchingPairs(q) : [];
+  const matchingPairs =
+    reconstructedPairs.length >= 2
+      ? reconstructedPairs.map((p, idx) => ({
+          id: p.id || `L${idx + 1}`,
+          leftText: p.leftText || '',
+          leftImageUrl: p.leftImageUrl || '',
+          rightText: p.rightText || '',
+          rightImageUrl: p.rightImageUrl || '',
+        }))
+      : createDefaultMatchingPairs();
+
+  const normalizedCorrect =
+    qType === 'true_false'
+      ? q.correctAnswer === 'B'
+        ? 'B'
+        : 'A'
+      : qType === 'multiple_choice'
+        ? (['A', 'B', 'C', 'D'].includes(q.correctAnswer) ? q.correctAnswer : 'A')
+        : q.correctAnswer;
+
   return {
     id: q.id,
     orderIndex: q.orderIndex || 1,
     subject: q.subject,
+    questionType: qType,
     targetClasses: [...q.targetClasses],
     questionText: q.questionText,
     questionImageUrl: q.questionImageUrl || '',
     options: optMap,
-    correctAnswer: q.correctAnswer,
+    matchingPairs,
+    correctAnswer: normalizedCorrect,
     points: q.points || 10,
   };
 }
@@ -296,7 +370,9 @@ const ScheduleInlineNumberInput: React.FC<ScheduleInlineNumberInputProps> = ({
 export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   schedules,
   questions,
+  participants = [],
   results = [],
+  staffRoleType,
   allowedSubjects,
   onSaveSchedule,
   onDeleteSchedule,
@@ -306,6 +382,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   onDeleteQuestionsBatch,
   onDeleteAllQuestions,
 }) => {
+  const canViewQuestionMatrix = staffRoleType === 'admin' || staffRoleType === 'proktor';
+  const [activeSubView, setActiveSubView] = useState<'manage' | 'matrix'>('manage');
   const isRestrictedBySubject = Boolean(allowedSubjects && allowedSubjects.length > 0);
   const normalizedAllowed = useMemo(
     () => (allowedSubjects || []).map((s) => s.trim().toLowerCase()),
@@ -364,6 +442,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   // Filters
   const [subjectFilter, setSubjectFilter] = usePersistedState('cbt_draft_q_filter_subj_v1', 'ALL');
   const [classFilter, setClassFilter] = usePersistedState('cbt_draft_q_filter_class_v1', 'ALL');
+  const [typeFilter, setTypeFilter] = usePersistedState<'ALL' | QuestionType>(
+    'cbt_draft_q_filter_type_v1',
+    'ALL'
+  );
   const [searchQuery, setSearchQuery] = usePersistedState('cbt_draft_q_filter_search_v1', '');
 
   // Word Import Target Settings
@@ -382,6 +464,42 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   const [showBulkDeleteMenu, setShowBulkDeleteMenu] = useState(false);
   const [bulkDeleteKind, setBulkDeleteKind] = useState<QuestionsBulkDeleteKind | null>(null);
   const [isDeletingBulk, setIsDeletingBulk] = useState(false);
+  const [isSyncingCloud, setIsSyncingCloud] = useState(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<AdminCloudSyncResult | null>(null);
+  const [listPage, setListPage] = useState(1);
+  const [showAllQuestions, setShowAllQuestions] = useState(false);
+
+  const liveSupabase = isLiveSupabaseConfigured();
+  const serviceRoleActive = hasSupabaseServiceRoleKey();
+
+  const handleSyncFromDatabase = useCallback(async (silent = false) => {
+    setIsSyncingCloud(true);
+    try {
+      const res = await syncAdminQuestionsFromCloud({ force: !silent });
+      setCloudSyncStatus(res);
+      if (!silent) {
+        if (!res.ok && res.error) {
+          setFeedback(`Gagal memuat soal dari database Supabase: ${res.error}`);
+        } else if (res.syncedFromCloud) {
+          setFeedback(
+            `Berhasil memuat seluruh ${res.questionCount} butir soal & ${res.scheduleCount} jadwal mapel langsung dari database Supabase.`
+          );
+        } else if (liveSupabase && !res.hasServiceRoleKey) {
+          setFeedback(
+            'Jadwal mapel tersinkron dari database. Isi Service Role Key pada menu Database & SQL agar seluruh soal & kunci jawaban dapat ditarik langsung.'
+          );
+        }
+      }
+    } finally {
+      setIsSyncingCloud(false);
+    }
+  }, [liveSupabase]);
+
+  useEffect(() => {
+    if (liveSupabase) {
+      void handleSyncFromDatabase(true);
+    }
+  }, [liveSupabase, serviceRoleActive, handleSyncFromDatabase]);
 
   // Question Create / Edit Modal State (survives refresh so teacher/admin doesn't lose question input)
   const [questionModalOpen, setQuestionModalOpen] = usePersistedState(
@@ -399,15 +517,23 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   const [formError, setFormError] = useState('');
   const [isSavingQuestion, setIsSavingQuestion] = useState(false);
 
+  const scheduleById = useMemo(
+    () => new Map(schedules.map((s) => [s.id, s])),
+    [schedules]
+  );
+
   const activeInProgressSubjectSet = useMemo(() => {
     const set = new Set<string>();
     results.forEach((r) => {
-      if (r.status === 'in_progress' && r.subject) {
-        set.add(r.subject.trim().toLowerCase());
+      if (r.status === 'in_progress') {
+        const resolvedSubject = scheduleById.get(r.examId)?.subject || r.subject;
+        if (resolvedSubject) {
+          set.add(resolvedSubject.trim().toLowerCase());
+        }
       }
     });
     return set;
-  }, [results]);
+  }, [results, scheduleById]);
 
   const effectiveSubjectFilter = useMemo(() => {
     if (isRestrictedBySubject && availableSubjects.length === 1) {
@@ -426,6 +552,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     const normFilter = effectiveSubjectFilter.trim().toLowerCase();
     return visibleQuestions
       .filter((item) => {
+        const itemType = getEffectiveQuestionType(item);
         if (
           effectiveSubjectFilter !== 'ALL' &&
           item.subject.trim().toLowerCase() !== normFilter
@@ -433,13 +560,23 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           return false;
         }
         if (classFilter !== 'ALL' && !item.targetClasses.includes(classFilter)) return false;
-        if (
-          q &&
-          !item.questionText.toLowerCase().includes(q) &&
-          !item.subject.toLowerCase().includes(q) &&
-          !String(item.orderIndex).includes(q)
-        ) {
-          return false;
+        if (typeFilter !== 'ALL' && itemType !== typeFilter) return false;
+        if (q) {
+          const pairsText =
+            itemType === 'matching'
+              ? reconstructMatchingPairs(item)
+                  .map((p) => `${p.leftText} ${p.rightText}`)
+                  .join(' ')
+                  .toLowerCase()
+              : '';
+          if (
+            !item.questionText.toLowerCase().includes(q) &&
+            !item.subject.toLowerCase().includes(q) &&
+            !String(item.orderIndex).includes(q) &&
+            !pairsText.includes(q)
+          ) {
+            return false;
+          }
         }
         return true;
       })
@@ -449,19 +586,50 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           a.orderIndex - b.orderIndex ||
           a.id.localeCompare(b.id)
       );
-  }, [visibleQuestions, effectiveSubjectFilter, classFilter, searchQuery]);
+  }, [visibleQuestions, effectiveSubjectFilter, classFilter, typeFilter, searchQuery]);
 
-  const openCreateQuestionModal = () => {
+  useEffect(() => {
+    setListPage(1);
+  }, [effectiveSubjectFilter, classFilter, typeFilter, searchQuery]);
+
+  const PAGE_SIZE = 100;
+  const MAX_SHOW_ALL = 300;
+  const totalPages = Math.max(1, Math.ceil(filteredQuestions.length / PAGE_SIZE));
+  const safeListPage = Math.min(listPage, totalPages);
+  const displayedQuestions = useMemo(() => {
+    if (showAllQuestions) {
+      return filteredQuestions.slice(0, MAX_SHOW_ALL);
+    }
+    if (filteredQuestions.length <= PAGE_SIZE) {
+      return filteredQuestions;
+    }
+    const start = (safeListPage - 1) * PAGE_SIZE;
+    return filteredQuestions.slice(start, start + PAGE_SIZE);
+  }, [filteredQuestions, showAllQuestions, safeListPage]);
+
+  const hasActiveQuestionFilter =
+    (!isRestrictedBySubject && effectiveSubjectFilter !== 'ALL') ||
+    (isRestrictedBySubject && availableSubjects.length > 1 && effectiveSubjectFilter !== 'ALL') ||
+    classFilter !== 'ALL' ||
+    typeFilter !== 'ALL' ||
+    searchQuery.trim() !== '';
+
+  const openCreateQuestionModal = (presetSubject?: string, presetClasses?: string[]) => {
     setFormError('');
     const defaultSubject =
-      effectiveSubjectFilter !== 'ALL'
+      presetSubject ??
+      (effectiveSubjectFilter !== 'ALL'
         ? effectiveSubjectFilter
-        : availableSubjects[0] || '';
+        : availableSubjects[0] || '');
     const normDefault = defaultSubject.trim().toLowerCase();
     const maxOrder = visibleQuestions
       .filter((q) => q.subject.trim().toLowerCase() === normDefault)
       .reduce((acc, q) => Math.max(acc, q.orderIndex || 0), 0);
-    setQForm(createEmptyQuestionForm(defaultSubject, maxOrder + 1));
+    const baseForm = createEmptyQuestionForm(defaultSubject, maxOrder + 1);
+    if (presetClasses && presetClasses.length > 0) {
+      baseForm.targetClasses = [...presetClasses];
+    }
+    setQForm(baseForm);
     setQuestionModalOpen(true);
   };
 
@@ -486,7 +654,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       return;
     }
 
-    await onSaveSchedule({
+    const writeRes = await onSaveSchedule({
       id: `exam-${subj.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${Date.now()}`,
       subject: subj,
       title: newSchedTitle.trim() || `Penilaian Akhir Semester — ${subj}`,
@@ -505,18 +673,32 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     setNewSchedTitle('');
     setNewSchedRandomize(false);
     setShowScheduleForm(false);
-    setFeedback(`Jadwal mata pelajaran "${subj}" (${formatTargetClassesSummary(newSchedClasses)}) berhasil ditambahkan.`);
+    if (writeRes && !writeRes.synced && writeRes.error) {
+      setFeedback(
+        `Jadwal "${subj}" disimpan di cache lokal, namun gagal sinkron ke Supabase: ${writeRes.error}`
+      );
+    } else {
+      setFeedback(
+        `Jadwal mata pelajaran "${subj}" (${formatTargetClassesSummary(newSchedClasses)}) berhasil ditambahkan${writeRes?.synced ? ' & tersimpan ke database' : ''}.`
+      );
+    }
   };
 
   const handleSaveScheduleClassesModal = async () => {
     if (!editingScheduleClasses || schedModalClasses.length === 0) return;
-    await onSaveSchedule({
+    const writeRes = await onSaveSchedule({
       ...editingScheduleClasses,
       targetClasses: schedModalClasses,
     });
-    setFeedback(
-      `Target kelas mata pelajaran "${editingScheduleClasses.subject}" diperbarui ke: ${formatTargetClassesSummary(schedModalClasses)}.`
-    );
+    if (writeRes && !writeRes.synced && writeRes.error) {
+      setFeedback(
+        `Target kelas "${editingScheduleClasses.subject}" diperbarui lokal, namun gagal ke Supabase: ${writeRes.error}`
+      );
+    } else {
+      setFeedback(
+        `Target kelas mata pelajaran "${editingScheduleClasses.subject}" diperbarui ke: ${formatTargetClassesSummary(schedModalClasses)}.`
+      );
+    }
     setEditingScheduleClasses(null);
   };
 
@@ -524,8 +706,38 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     sched: ExamSchedule,
     patch: Partial<ExamSchedule>
   ) => {
-    await onSaveSchedule({ ...sched, ...patch });
-    setFeedback(`Jadwal mata pelajaran "${sched.subject}" diperbarui.`);
+    const writeRes = await onSaveSchedule({ ...sched, ...patch });
+    if (writeRes && !writeRes.synced && writeRes.error) {
+      setFeedback(
+        `Perubahan jadwal "${sched.subject}" gagal dikirim ke Supabase: ${writeRes.error}`
+      );
+    } else {
+      setFeedback(`Jadwal mata pelajaran "${sched.subject}" diperbarui.`);
+    }
+  };
+
+  const handleDeleteSingleSchedule = async (sched: ExamSchedule) => {
+    const writeRes = await onDeleteSchedule(sched.id);
+    if (writeRes && !writeRes.synced && writeRes.error) {
+      setFeedback(
+        `Jadwal "${sched.subject}" dihapus lokal, namun gagal hapus di Supabase: ${writeRes.error}`
+      );
+    } else {
+      setFeedback(`Jadwal mata pelajaran "${sched.subject}" berhasil dihapus.`);
+    }
+  };
+
+  const handleDeleteSingleQuestion = async (q: Question) => {
+    const writeRes = await onDeleteQuestion(q.id);
+    if (writeRes && !writeRes.synced && writeRes.error) {
+      setFeedback(
+        `Soal Nomor ${q.orderIndex} dihapus lokal, namun gagal menghapus di database Supabase: ${writeRes.error}`
+      );
+    } else {
+      setFeedback(
+        `Soal Nomor ${q.orderIndex} (${q.subject}) berhasil dihapus${writeRes?.synced ? ' dari database' : ''}.`
+      );
+    }
   };
 
   const handleShuffleQuestionsAndNumbers = async () => {
@@ -537,26 +749,32 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
     setIsShuffling(true);
     try {
-      // Group by subject so each subject gets shuffled independently with sequential numbers 1..N
-      const bySubject = new Map<string, Question[]>();
+      // Kelompokkan per (mapel + kelompok kelas target) agar misalnya Matematika 7A-7B & 7C-7F diacak terpisah
+      const getGroupKey = (q: Question) =>
+        `${q.subject.trim().toLowerCase()}::${[...q.targetClasses].sort().join(',')}`;
+
+      const bySubjectGroup = new Map<string, Question[]>();
       for (const q of targets) {
-        const list = bySubject.get(q.subject) || [];
+        const key = getGroupKey(q);
+        const list = bySubjectGroup.get(key) || [];
         list.push(q);
-        bySubject.set(q.subject, list);
+        bySubjectGroup.set(key, list);
       }
 
       const updated: Question[] = [];
-      bySubject.forEach((group) => {
+      bySubjectGroup.forEach((group, groupKey) => {
         const shuffled = [...group];
         for (let i = shuffled.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
           [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
         }
-        // Also shuffle orderIndex pool if partial filter, or renumber 1..N cleanly
         const existingNumbers = group
           .map((item) => item.orderIndex)
           .sort((a, b) => a - b);
-        const useSequential = existingNumbers.length === visibleQuestions.filter((q) => q.subject === group[0].subject).length;
+        const fullGroupCount = visibleQuestions.filter(
+          (q) => getGroupKey(q) === groupKey
+        ).length;
+        const useSequential = existingNumbers.length === fullGroupCount;
         shuffled.forEach((item, idx) => {
           updated.push({
             ...item,
@@ -565,15 +783,76 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
         });
       });
 
-      await onUpsertQuestions(updated);
-      setFeedback(
-        `Urutan & nomor soal untuk ${updated.length} butir soal berhasil diacak (${
-          effectiveSubjectFilter === 'ALL' ? 'per mata pelajaran' : effectiveSubjectFilter
-        }).`
-      );
+      const writeRes = await onUpsertQuestions(updated);
+      if (writeRes && !writeRes.synced && writeRes.error) {
+        setFeedback(
+          `Urutan soal diacak lokal, namun gagal sinkron ke database Supabase: ${writeRes.error}`
+        );
+      } else {
+        setFeedback(
+          `Urutan & nomor soal untuk ${updated.length} butir soal berhasil diacak (${
+            effectiveSubjectFilter === 'ALL' ? 'per kelompok kelas & mapel' : effectiveSubjectFilter
+          }).`
+        );
+      }
     } finally {
       setIsShuffling(false);
     }
+  };
+
+  const optimizeImportedQuestionImages = async (items: Question[]): Promise<Question[]> => {
+    const processUrl = async (
+      rawUrl: string | undefined,
+      maxW: number,
+      maxH: number,
+      prefix: string
+    ): Promise<string | undefined> => {
+      if (!rawUrl || !rawUrl.startsWith('data:image/')) return rawUrl;
+      const compressed = await compressDataUrlImage(rawUrl, maxW, maxH, 0.78);
+      return uploadQuestionImageToStorage(compressed, prefix);
+    };
+
+    const result: Question[] = [];
+    const CHUNK = 5;
+    for (let i = 0; i < items.length; i += CHUNK) {
+      const chunk = items.slice(i, i + CHUNK);
+      const processedChunk = await Promise.all(
+        chunk.map(async (q) => {
+          const qImg = await processUrl(q.questionImageUrl, 820, 620, 'q');
+          const optImgs = await Promise.all(
+            (q.options || []).map(async (opt) => {
+              if (!opt.imageUrl || !opt.imageUrl.startsWith('data:image/')) return opt;
+              const uploaded = await processUrl(opt.imageUrl, 480, 360, 'opt');
+              return { ...opt, imageUrl: uploaded };
+            })
+          );
+          let matchingPairs = q.matchingPairs;
+          let matchingData = q.matchingData;
+          if (Array.isArray(q.matchingPairs) && q.matchingPairs.length > 0) {
+            matchingPairs = await Promise.all(
+              q.matchingPairs.map(async (pair) => ({
+                ...pair,
+                leftImageUrl: await processUrl(pair.leftImageUrl, 420, 320, 'match-l'),
+                rightImageUrl: await processUrl(pair.rightImageUrl, 420, 320, 'match-r'),
+              }))
+            );
+            if (matchingPairs.some((p, idx) => p !== q.matchingPairs?.[idx])) {
+              const built = buildMatchingQuestionData(matchingPairs);
+              matchingData = built.matchingData;
+            }
+          }
+          return {
+            ...q,
+            questionImageUrl: qImg,
+            options: optImgs,
+            matchingPairs,
+            matchingData,
+          };
+        })
+      );
+      result.push(...processedChunk);
+    }
+    return result;
   };
 
   const handleImportExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -597,6 +876,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       }
 
       if (finalQuestions.length > 0) {
+        finalQuestions = await optimizeImportedQuestionImages(finalQuestions);
         await onUpsertQuestions(finalQuestions);
       }
       setFeedback(
@@ -635,11 +915,12 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
         safeDocxSubject
       );
 
-      const finalQuestions = isRestrictedBySubject
+      let finalQuestions = isRestrictedBySubject
         ? parsed.map((q) => ({ ...q, subject: safeDocxSubject }))
         : parsed;
 
       if (finalQuestions.length > 0) {
+        finalQuestions = await optimizeImportedQuestionImages(finalQuestions);
         await onUpsertQuestions(finalQuestions);
       }
       setFeedback(
@@ -658,7 +939,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     if (!file) return;
     try {
       const compressed = await compressQuestionImage(file, 820);
-      setQForm((prev) => ({ ...prev, questionImageUrl: compressed }));
+      const uploadedUrl = await uploadQuestionImageToStorage(compressed, 'q');
+      setQForm((prev) => ({ ...prev, questionImageUrl: uploadedUrl }));
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Gagal memproses gambar soal.');
     }
@@ -673,11 +955,12 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     if (!file) return;
     try {
       const compressed = await compressQuestionImage(file, 480);
+      const uploadedUrl = await uploadQuestionImageToStorage(compressed, 'opt');
       setQForm((prev) => ({
         ...prev,
         options: {
           ...prev.options,
-          [key]: { ...prev.options[key], imageUrl: compressed },
+          [key]: { ...prev.options[key], imageUrl: uploadedUrl },
         },
       }));
     } catch (err) {
@@ -686,21 +969,77 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     e.target.value = '';
   };
 
+  const activeQuestionType: QuestionType = qForm.questionType || 'multiple_choice';
+  const activeMatchingPairs: MatchingPair[] =
+    Array.isArray(qForm.matchingPairs) && qForm.matchingPairs.length >= 2
+      ? qForm.matchingPairs
+      : createDefaultMatchingPairs();
+
+  const handleChangeQuestionType = (nextType: QuestionType) => {
+    setFormError('');
+    setQForm((prev) => {
+      const safePairs =
+        Array.isArray(prev.matchingPairs) && prev.matchingPairs.length >= 2
+          ? prev.matchingPairs
+          : createDefaultMatchingPairs();
+
+      let nextCorrect = prev.correctAnswer;
+      if (nextType === 'true_false') {
+        nextCorrect = prev.correctAnswer === 'B' ? 'B' : 'A';
+      } else if (nextType === 'multiple_choice') {
+        nextCorrect = ['A', 'B', 'C', 'D'].includes(prev.correctAnswer) ? prev.correctAnswer : 'A';
+      }
+
+      return {
+        ...prev,
+        questionType: nextType,
+        matchingPairs: safePairs,
+        correctAnswer: nextCorrect,
+      };
+    });
+  };
+
+  const handleUploadMatchingImage = async (
+    pairIndex: number,
+    side: 'left' | 'right',
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const compressed = await compressQuestionImage(file, 420);
+      const uploadedUrl = await uploadQuestionImageToStorage(
+        compressed,
+        side === 'left' ? 'match-l' : 'match-r'
+      );
+      setQForm((prev) => {
+        const currentPairs =
+          Array.isArray(prev.matchingPairs) && prev.matchingPairs.length >= 2
+            ? [...prev.matchingPairs]
+            : createDefaultMatchingPairs();
+        const target = currentPairs[pairIndex];
+        if (!target) return prev;
+        currentPairs[pairIndex] = {
+          ...target,
+          ...(side === 'left' ? { leftImageUrl: uploadedUrl } : { rightImageUrl: uploadedUrl }),
+        };
+        return { ...prev, matchingPairs: currentPairs };
+      });
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Gagal memproses gambar pasangan.');
+    }
+    e.target.value = '';
+  };
+
   const buildQuestionPayloadFromForm = (): Question | null => {
-    if (!qForm.questionText.trim() && !qForm.questionImageUrl.trim()) {
+    const qType = activeQuestionType;
+    if (qType !== 'matching' && !qForm.questionText.trim() && !qForm.questionImageUrl.trim()) {
       setFormError('Masukkan teks pertanyaan atau lampirkan gambar soal.');
       return null;
     }
     if (qForm.targetClasses.length === 0) {
       setFormError('Pilih minimal satu target kelas untuk soal ini.');
       return null;
-    }
-    for (const key of OPTION_KEYS) {
-      const opt = qForm.options[key];
-      if (!opt.text.trim() && !opt.imageUrl.trim()) {
-        setFormError(`Opsi ${key} harus diisi teks atau dilampirkan gambar.`);
-        return null;
-      }
     }
 
     const targetSubject = (qForm.subject || availableSubjects[0] || '').trim();
@@ -716,27 +1055,105 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       return null;
     }
 
+    const generatedId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `q-man-${crypto.randomUUID()}`
+        : `q-man-${Date.now()}`;
+    const finalId = qForm.id || generatedId;
+    const basePoints = Math.max(1, Number(qForm.points) || 10);
+    const baseOrder = Math.max(1, Number(qForm.orderIndex) || 1);
+
+    if (qType === 'true_false') {
+      const tfCorrect: OptionKey = qForm.correctAnswer === 'B' ? 'B' : 'A';
+      return {
+        id: finalId,
+        subject: targetSubject,
+        targetClasses: [...qForm.targetClasses],
+        questionType: 'true_false',
+        questionText: qForm.questionText.trim(),
+        questionImageUrl: qForm.questionImageUrl.trim() || undefined,
+        options: TRUE_FALSE_DEFAULT_OPTIONS.map((o) => ({ ...o })),
+        correctAnswer: tfCorrect,
+        points: basePoints,
+        orderIndex: baseOrder,
+      };
+    }
+
+    if (qType === 'matching') {
+      const rawPairs = activeMatchingPairs;
+      if (rawPairs.length < 2) {
+        setFormError('Soal menjodohkan minimal memuat 2 pasangan soal dan jawaban.');
+        return null;
+      }
+      for (let i = 0; i < rawPairs.length; i++) {
+        const pair = rawPairs[i];
+        const hasLeft = Boolean(pair.leftText.trim() || pair.leftImageUrl?.trim());
+        const hasRight = Boolean(pair.rightText.trim() || pair.rightImageUrl?.trim());
+        if (!hasLeft || !hasRight) {
+          setFormError(
+            `Pasangan ke-${i + 1} belum lengkap. Isi teks atau gambar untuk sisi kiri (soal) dan kanan (jawaban).`
+          );
+          return null;
+        }
+      }
+
+      const normalizedPairs: MatchingPair[] = rawPairs.map((pair, idx) => ({
+        id: pair.id || `L${idx + 1}`,
+        leftText: pair.leftText.trim(),
+        leftImageUrl: pair.leftImageUrl?.trim() || undefined,
+        rightText: pair.rightText.trim(),
+        rightImageUrl: pair.rightImageUrl?.trim() || undefined,
+      }));
+      const builtMatching = buildMatchingQuestionData(normalizedPairs);
+
+      return {
+        id: finalId,
+        subject: targetSubject,
+        targetClasses: [...qForm.targetClasses],
+        questionType: 'matching',
+        questionText:
+          qForm.questionText.trim() ||
+          'Jodohkan pernyataan di kolom kiri dengan pasangan jawaban yang tepat di kolom kanan.',
+        questionImageUrl: qForm.questionImageUrl.trim() || undefined,
+        options: [],
+        matchingPairs: builtMatching.matchingPairs,
+        matchingData: builtMatching.matchingData,
+        correctAnswer: builtMatching.correctAnswer,
+        points: basePoints,
+        orderIndex: baseOrder,
+      };
+    }
+
+    // Default: multiple_choice
+    for (const key of OPTION_KEYS) {
+      const opt = qForm.options[key];
+      if (!opt.text.trim() && !opt.imageUrl.trim()) {
+        setFormError(`Opsi ${key} harus diisi teks atau dilampirkan gambar.`);
+        return null;
+      }
+    }
+
     const builtOptions: QuestionOption[] = OPTION_KEYS.map((key) => ({
       key,
       text: qForm.options[key].text.trim(),
       imageUrl: qForm.options[key].imageUrl.trim() || undefined,
     }));
 
-    const generatedId =
-      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-        ? `q-man-${crypto.randomUUID()}`
-        : `q-man-${Date.now()}`;
+    const mcCorrect: OptionKey = ['A', 'B', 'C', 'D'].includes(qForm.correctAnswer)
+      ? (qForm.correctAnswer as OptionKey)
+      : 'A';
 
     return {
-      id: qForm.id || generatedId,
+      id: finalId,
       subject: targetSubject,
       targetClasses: [...qForm.targetClasses],
+      questionType: 'multiple_choice',
       questionText: qForm.questionText.trim(),
       questionImageUrl: qForm.questionImageUrl.trim() || undefined,
       options: builtOptions,
-      correctAnswer: qForm.correctAnswer,
-      points: Math.max(1, Number(qForm.points) || 10),
-      orderIndex: Math.max(1, Number(qForm.orderIndex) || 1),
+      correctAnswer: mcCorrect,
+      points: basePoints,
+      orderIndex: baseOrder,
     };
   };
 
@@ -755,11 +1172,18 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
     setIsSavingQuestion(true);
     try {
-      await onUpsertQuestions([payload]);
+      const writeRes = await onUpsertQuestions([payload]);
+      if (writeRes && !writeRes.synced && writeRes.error) {
+        setFormError(
+          `Soal tersimpan di cache lokal, namun gagal menyimpan ke database Supabase: ${writeRes.error}`
+        );
+        return;
+      }
+
       setFeedback(
         qForm.id
-          ? `Soal Nomor ${payload.orderIndex} (${payload.subject}) berhasil diperbarui.`
-          : `Soal baru Nomor ${payload.orderIndex} (${payload.subject}) berhasil disimpan.`
+          ? `Soal Nomor ${payload.orderIndex} (${payload.subject}) berhasil diperbarui${writeRes?.synced ? ' & tersimpan ke database Supabase' : ''}.`
+          : `Soal baru Nomor ${payload.orderIndex} (${payload.subject}) berhasil disimpan${writeRes?.synced ? ' ke database Supabase' : ''}.`
       );
 
       if (goToNext && capturedNextQuestion) {
@@ -771,6 +1195,20 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       setIsSavingQuestion(false);
     }
   };
+
+  const modalSubjectOptions = useMemo(() => {
+    const base = [...availableSubjects];
+    const currentSubj = qForm.subject.trim();
+    if (
+      currentSubj &&
+      !isRestrictedBySubject &&
+      !base.some((s) => s.trim().toLowerCase() === currentSubj.toLowerCase())
+    ) {
+      base.push(currentSubj);
+      base.sort();
+    }
+    return base;
+  }, [availableSubjects, qForm.subject, isRestrictedBySubject]);
 
   const insertLatexSnippet = (snippet: string) => {
     setQForm((prev) => ({
@@ -898,7 +1336,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
           <button
             type="button"
-            onClick={() => setShowScheduleForm((v) => !v)}
+            onClick={() => {
+              setActiveSubView('manage');
+              setShowScheduleForm((v) => !v);
+            }}
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-sm font-semibold cursor-pointer whitespace-nowrap"
           >
             <Plus className="w-4 h-4" />
@@ -907,14 +1348,43 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
           <button
             type="button"
-            onClick={openCreateQuestionModal}
+            onClick={() => openCreateQuestionModal()}
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-sm font-semibold cursor-pointer whitespace-nowrap"
           >
             <Plus className="w-4 h-4" />
-            <span>Buat Soal (LaTeX / Gambar)</span>
+            <span>Buat Soal Baru</span>
           </button>
         </div>
       </div>
+
+      {canViewQuestionMatrix && (
+        <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-200/75 rounded-xl">
+          <button
+            type="button"
+            onClick={() => setActiveSubView('manage')}
+            className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+              activeSubView === 'manage'
+                ? 'bg-white text-slate-900 shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <BookOpenCheck className="w-4 h-4 text-emerald-700" />
+            <span>Kelola Soal &amp; Mapel</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveSubView('matrix')}
+            className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+              activeSubView === 'matrix'
+                ? 'bg-white text-slate-900 shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Grid3X3 className="w-4 h-4 text-emerald-700" />
+            <span>Pemetaan Soal Seluruh Kelas</span>
+          </button>
+        </div>
+      )}
 
       {activeInProgressSubjectSet.size > 0 && (
         <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-xs sm:text-sm flex items-start gap-2.5">
@@ -938,6 +1408,98 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
         </div>
       )}
 
+      {liveSupabase && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs sm:text-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+            cloudSyncStatus && !cloudSyncStatus.ok && cloudSyncStatus.error
+              ? 'bg-rose-50 border-rose-200 text-rose-900'
+              : serviceRoleActive
+                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                : 'bg-amber-50 border-amber-200 text-amber-950'
+          }`}
+        >
+          <div className="flex items-start gap-2.5 min-w-0">
+            <Cloud
+              className={`w-4 h-4 shrink-0 mt-0.5 ${
+                cloudSyncStatus && !cloudSyncStatus.ok && cloudSyncStatus.error
+                  ? 'text-rose-700'
+                  : serviceRoleActive
+                    ? 'text-emerald-700'
+                    : 'text-amber-700'
+              }`}
+            />
+            <div className="min-w-0">
+              {cloudSyncStatus && !cloudSyncStatus.ok && cloudSyncStatus.error ? (
+                <span>
+                  <strong>Gagal Sinkron Database:</strong> {cloudSyncStatus.error}
+                </span>
+              ) : serviceRoleActive ? (
+                <span>
+                  <strong>Database Terhubung (Service Role Aktif):</strong>{' '}
+                  {isSyncingCloud
+                    ? 'Sedang memuat seluruh soal & mata pelajaran dari database Supabase...'
+                    : `Menampilkan ${visibleQuestions.length} butir soal & ${visibleSchedules.length} mapel langsung dari database Supabase dan siap diedit langsung.`}
+                </span>
+              ) : (
+                <span>
+                  <strong>Mode Cache Lokal:</strong> Service Role Key belum diisi pada sesi browser ini sehingga pembacaan langsung tabel soal terproteksi RLS.{' '}
+                  {staffRoleType === 'admin'
+                    ? 'Masukkan Service Role Key di menu Database & SQL agar seluruh soal database termuat otomatis.'
+                    : 'Minta Administrator mengisi Service Role Key pada sesi ini untuk menarik seluruh soal langsung dari database.'}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            disabled={isSyncingCloud}
+            onClick={() => void handleSyncFromDatabase(false)}
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold cursor-pointer disabled:opacity-60 whitespace-nowrap shrink-0"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCloud ? 'animate-spin' : ''}`} />
+            <span>{isSyncingCloud ? 'Memuat...' : 'Muat Ulang dari Database'}</span>
+          </button>
+        </div>
+      )}
+
+      {canViewQuestionMatrix && activeSubView === 'matrix' ? (
+        <QuestionCoverageMatrix
+          schedules={schedules}
+          questions={questions}
+          participants={participants}
+          onSelectSubjectClass={(subject, className, hasQuestions) => {
+            if (hasQuestions) {
+              const normSubj = subject.trim().toLowerCase();
+              const hasLocal = visibleQuestions.some(
+                (q) =>
+                  q.subject.trim().toLowerCase() === normSubj &&
+                  q.targetClasses.some((c) => c.trim().toUpperCase() === className.toUpperCase())
+              );
+              setSubjectFilter(subject);
+              setClassFilter(className);
+              setSearchQuery('');
+              setActiveSubView('manage');
+              if (!hasLocal) {
+                if (serviceRoleActive) {
+                  void handleSyncFromDatabase(false);
+                } else {
+                  setFeedback(
+                    `Soal "${subject}" kelas ${className} sudah tersimpan di database Supabase, namun belum ada di cache lokal perangkat ini. Untuk melihat/mengedit butir soal & kunci jawaban dari cloud, masukkan Service Role Key di menu Database & SQL lalu klik Muat Ulang dari Database.`
+                  );
+                }
+              }
+            } else {
+              openCreateQuestionModal(subject, [className]);
+            }
+          }}
+          onOpenCreateSchedule={() => {
+            setActiveSubView('manage');
+            setShowScheduleForm(true);
+          }}
+        />
+      ) : (
+        <>
       {/* Create New Subject Schedule + Specific Class Targets */}
       {showScheduleForm && (
         <form
@@ -1176,7 +1738,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   <td className="py-2.5 px-4 text-right">
                     <button
                       type="button"
-                      onClick={() => void onDeleteSchedule(sched.id)}
+                      onClick={() => void handleDeleteSingleSchedule(sched)}
                       title="Hapus jadwal mata pelajaran"
                       className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer"
                     >
@@ -1361,6 +1923,17 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
               ))}
             </select>
 
+            <select
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value as 'ALL' | QuestionType)}
+              className="px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium text-slate-700"
+            >
+              <option value="ALL">Semua Jenis Soal</option>
+              <option value="multiple_choice">Pilihan Ganda</option>
+              <option value="true_false">Benar / Salah</option>
+              <option value="matching">Menjodohkan</option>
+            </select>
+
             <button
               type="button"
               disabled={isShuffling || filteredQuestions.length < 2}
@@ -1383,19 +1956,72 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
               </button>
             )}
 
+            {hasActiveQuestionFilter && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isRestrictedBySubject || availableSubjects.length > 1) {
+                    setSubjectFilter('ALL');
+                  }
+                  setClassFilter('ALL');
+                  setTypeFilter('ALL');
+                  setSearchQuery('');
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Tampilkan Semua</span>
+              </button>
+            )}
+
             <span className="text-xs font-mono text-slate-500 tabular-nums whitespace-nowrap">
-              {filteredQuestions.length} butir soal
+              {filteredQuestions.length === visibleQuestions.length
+                ? `${filteredQuestions.length} butir soal`
+                : `${filteredQuestions.length} / ${visibleQuestions.length} soal`}
             </span>
           </div>
         </div>
 
         <div className="divide-y divide-slate-100">
           {filteredQuestions.length === 0 ? (
-            <div className="py-10 px-4 text-center text-sm text-slate-500">
-              Tidak ada soal yang cocok dengan filter mata pelajaran atau kelas.
+            <div className="py-10 px-4 text-center text-sm text-slate-500 space-y-2">
+              <div>
+                {visibleQuestions.length === 0
+                  ? isSyncingCloud
+                    ? 'Sedang memuat bank soal dari database Supabase...'
+                    : 'Belum ada data soal tersimpan atau Service Role Key belum aktif.'
+                  : 'Tidak ada soal yang cocok dengan filter mata pelajaran, jenis soal, atau kelas.'}
+              </div>
+              {hasActiveQuestionFilter && visibleQuestions.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!isRestrictedBySubject || availableSubjects.length > 1) {
+                      setSubjectFilter('ALL');
+                    }
+                    setClassFilter('ALL');
+                    setTypeFilter('ALL');
+                    setSearchQuery('');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset Filter &amp; Tampilkan Semua ({visibleQuestions.length} soal)</span>
+                </button>
+              )}
             </div>
           ) : (
-            filteredQuestions.map((q) => (
+            displayedQuestions.map((q) => {
+              const qType = getEffectiveQuestionType(q);
+              const matchingPairs = qType === 'matching' ? reconstructMatchingPairs(q) : [];
+              const displayOptions =
+                qType === 'true_false'
+                  ? q.options.length >= 2
+                    ? q.options.slice(0, 2)
+                    : TRUE_FALSE_DEFAULT_OPTIONS
+                  : q.options;
+
+              return (
               <div
                 key={q.id}
                 className="p-4 sm:p-5 flex items-start justify-between gap-4 hover:bg-slate-50/60"
@@ -1404,6 +2030,20 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500 font-medium">
                     <span className="font-mono font-bold text-slate-800 bg-slate-100 px-2 py-0.5 rounded-md">
                       No. {q.orderIndex}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded-md font-semibold border ${
+                        qType === 'matching'
+                          ? 'bg-amber-50 border-amber-200 text-amber-800'
+                          : qType === 'true_false'
+                            ? 'bg-sky-50 border-sky-200 text-sky-800'
+                            : 'bg-slate-100 border-slate-200 text-slate-700'
+                      }`}
+                    >
+                      {QUESTION_TYPE_LABELS[qType]}
+                      {qType === 'matching' && matchingPairs.length > 0
+                        ? ` (${matchingPairs.length} Pasangan)`
+                        : ''}
                     </span>
                     <span className="text-emerald-800 font-semibold">{q.subject}</span>
                     <span aria-hidden="true">·</span>
@@ -1415,7 +2055,16 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     </span>
                     <span aria-hidden="true">·</span>
                     <span>
-                      Kunci: <strong className="font-mono text-slate-900">{q.correctAnswer}</strong>
+                      Kunci:{' '}
+                      <strong className="font-mono text-slate-900">
+                        {qType === 'matching'
+                          ? `${matchingPairs.length} Pasangan (Teracak di Siswa)`
+                          : qType === 'true_false'
+                            ? q.correctAnswer === 'B'
+                              ? 'Salah'
+                              : 'Benar'
+                            : q.correctAnswer}
+                      </strong>
                     </span>
                     <span aria-hidden="true">·</span>
                     <span className="font-mono">{q.points} poin</span>
@@ -1434,45 +2083,117 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     <MathText text={q.questionText} />
                   </div>
 
-                  {/* Option Previews including option images */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-                    {q.options.map((opt) => {
-                      const isCorrect = opt.key === q.correctAnswer;
-                      return (
+                  {/* Option / Pair Previews per Question Type */}
+                  {qType === 'matching' ? (
+                    <div className="space-y-1.5 pt-1">
+                      {matchingPairs.map((pair, idx) => (
                         <div
-                          key={opt.key}
-                          className={`rounded-xl border px-3 py-2 text-xs flex items-start gap-2 ${
-                            isCorrect
-                              ? 'bg-emerald-50/70 border-emerald-300 text-emerald-950'
-                              : 'bg-slate-50/70 border-slate-200 text-slate-700'
-                          }`}
+                          key={pair.id || idx}
+                          className="grid grid-cols-1 sm:grid-cols-11 gap-2 items-center rounded-xl border border-amber-200/80 bg-amber-50/40 px-3 py-2 text-xs"
                         >
-                          <span
-                            className={`font-mono font-bold px-1.5 py-0.5 rounded shrink-0 ${
-                              isCorrect ? 'bg-[#064e3b] text-white' : 'bg-white border border-slate-200 text-slate-700'
-                            }`}
-                          >
-                            {opt.key}
-                          </span>
-                          <div className="min-w-0 flex-1 space-y-1.5">
-                            {opt.text && (
-                              <div className="break-words">
-                                <MathText text={opt.text} />
-                              </div>
-                            )}
-                            {opt.imageUrl && (
-                              <img
-                                src={opt.imageUrl}
-                                alt={`Gambar Opsi ${opt.key}`}
-                                referrerPolicy="no-referrer"
-                                className="max-h-20 rounded border border-slate-200 bg-white object-contain p-0.5"
-                              />
-                            )}
+                          <div className="sm:col-span-5 flex items-start gap-2 min-w-0">
+                            <span className="font-mono font-bold px-1.5 py-0.5 rounded bg-white border border-amber-200 text-amber-900 shrink-0">
+                              {idx + 1}
+                            </span>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              {pair.leftText && (
+                                <div className="text-slate-800 break-words">
+                                  <MathText text={pair.leftText} />
+                                </div>
+                              )}
+                              {pair.leftImageUrl && (
+                                <img
+                                  src={pair.leftImageUrl}
+                                  alt={`Soal Pasangan ${idx + 1}`}
+                                  referrerPolicy="no-referrer"
+                                  className="max-h-16 rounded border border-slate-200 bg-white object-contain p-0.5"
+                                />
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="hidden sm:flex sm:col-span-1 justify-center text-amber-700">
+                            <ArrowLeftRight className="w-3.5 h-3.5" />
+                          </div>
+
+                          <div className="sm:col-span-5 flex items-start gap-2 min-w-0">
+                            <span className="font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-800 text-white shrink-0">
+                              Pasangan
+                            </span>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              {pair.rightText && (
+                                <div className="text-emerald-950 font-medium break-words">
+                                  <MathText text={pair.rightText} />
+                                </div>
+                              )}
+                              {pair.rightImageUrl && (
+                                <img
+                                  src={pair.rightImageUrl}
+                                  alt={`Jawaban Pasangan ${idx + 1}`}
+                                  referrerPolicy="no-referrer"
+                                  className="max-h-16 rounded border border-emerald-200 bg-white object-contain p-0.5"
+                                />
+                              )}
+                            </div>
                           </div>
                         </div>
-                      );
-                    })}
-                  </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                      {displayOptions.map((opt) => {
+                        const isCorrect = opt.key === q.correctAnswer;
+                        const labelBadge =
+                          qType === 'true_false'
+                            ? opt.key === 'A'
+                              ? 'Benar'
+                              : 'Salah'
+                            : opt.key;
+                        return (
+                          <div
+                            key={opt.key}
+                            className={`rounded-xl border px-3 py-2 text-xs flex items-start gap-2 ${
+                              isCorrect
+                                ? 'bg-emerald-50/70 border-emerald-300 text-emerald-950'
+                                : 'bg-slate-50/70 border-slate-200 text-slate-700'
+                            }`}
+                          >
+                            <span
+                              className={`font-mono font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                                isCorrect
+                                  ? 'bg-[#064e3b] text-white'
+                                  : 'bg-white border border-slate-200 text-slate-700'
+                              }`}
+                            >
+                              {labelBadge}
+                            </span>
+                            {qType !== 'true_false' && (
+                              <div className="min-w-0 flex-1 space-y-1.5">
+                                {opt.text && (
+                                  <div className="break-words">
+                                    <MathText text={opt.text} />
+                                  </div>
+                                )}
+                                {opt.imageUrl && (
+                                  <img
+                                    src={opt.imageUrl}
+                                    alt={`Gambar Opsi ${opt.key}`}
+                                    referrerPolicy="no-referrer"
+                                    className="max-h-20 rounded border border-slate-200 bg-white object-contain p-0.5"
+                                  />
+                                )}
+                              </div>
+                            )}
+                            {qType === 'true_false' && (
+                              <span className="pt-0.5 font-medium">
+                                {isCorrect ? 'Kunci Jawaban Benar' : 'Pernyataan Salah / Pengecoh'}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex flex-col sm:flex-row items-center gap-1.5 shrink-0">
@@ -1487,7 +2208,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => void onDeleteQuestion(q.id)}
+                    onClick={() => void handleDeleteSingleQuestion(q)}
                     title="Hapus soal"
                     className="p-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
                   >
@@ -1495,12 +2216,69 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   </button>
                 </div>
               </div>
-            ))
+              );
+            })
           )}
         </div>
-      </div>
 
-      {/* Modal: Create / Edit Question (supports Question & Option Image Uploads + Specific Class Targets) */}
+        {filteredQuestions.length > PAGE_SIZE && (
+          <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+            <div>
+              {showAllQuestions ? (
+                <span>
+                  Menampilkan {displayedQuestions.length} dari {filteredQuestions.length} soal (dibatasi maks.{' '}
+                  {MAX_SHOW_ALL} baris agar peramban tetap ringan).
+                </span>
+              ) : (
+                <span>
+                  Menampilkan soal {(safeListPage - 1) * PAGE_SIZE + 1}–
+                  {Math.min(safeListPage * PAGE_SIZE, filteredQuestions.length)} dari{' '}
+                  {filteredQuestions.length} soal (Halaman {safeListPage} dari {totalPages})
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!showAllQuestions && totalPages > 1 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={safeListPage <= 1}
+                    onClick={() => setListPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Sebelumnya</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeListPage >= totalPages}
+                    onClick={() => setListPage((p) => Math.min(totalPages, p + 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <span>Berikutnya</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAllQuestions((v) => !v)}
+                className="px-3 py-1.5 rounded-lg border border-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 font-semibold cursor-pointer"
+              >
+                {showAllQuestions
+                  ? `Bagi per ${PAGE_SIZE} Soal`
+                  : filteredQuestions.length > MAX_SHOW_ALL
+                    ? `Tampilkan ${MAX_SHOW_ALL} Teratas`
+                    : `Tampilkan Semua (${filteredQuestions.length})`}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+        </>
+      )}
+
+      {/* Modal: Create / Edit Question (Pilihan Ganda, Benar/Salah, Menjodohkan) */}
       {questionModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5">
           <div className="w-full max-w-3xl max-h-[92vh] bg-white rounded-2xl border border-slate-200 shadow-2xl flex flex-col overflow-hidden">
@@ -1508,11 +2286,11 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
               <div>
                 <h3 className="font-display font-bold text-base">
                   {qForm.id
-                    ? `Edit Soal Nomor ${qForm.orderIndex}`
-                    : 'Buat Soal Baru (LaTeX & Gambar Soal/Opsi)'}
+                    ? `Edit Soal Nomor ${qForm.orderIndex} (${QUESTION_TYPE_LABELS[activeQuestionType]})`
+                    : 'Buat Soal Baru'}
                 </h3>
                 <p className="text-xs text-emerald-100/85">
-                  Atur target kelas spesifik, rumus LaTeX, gambar soal, dan gambar untuk tiap opsi jawaban A–D.
+                  Pilih jenis soal (Pilihan Ganda, Benar/Salah, atau Menjodohkan), atur target kelas, rumus LaTeX, serta gambar.
                 </p>
               </div>
               <button
@@ -1531,7 +2309,73 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                 </div>
               )}
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {/* Selector Jenis Soal */}
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-slate-600">
+                  Jenis Soal
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {(
+                    [
+                      {
+                        type: 'multiple_choice' as QuestionType,
+                        title: 'Pilihan Ganda',
+                        desc: '4 opsi jawaban (A–D)',
+                        icon: ListChecks,
+                      },
+                      {
+                        type: 'true_false' as QuestionType,
+                        title: 'Benar / Salah',
+                        desc: 'Pernyataan Benar atau Salah',
+                        icon: CheckCircle2,
+                      },
+                      {
+                        type: 'matching' as QuestionType,
+                        title: 'Menjodohkan',
+                        desc: 'Beberapa soal & jawaban teracak',
+                        icon: ArrowLeftRight,
+                      },
+                    ] as const
+                  ).map((item) => {
+                    const Icon = item.icon;
+                    const isSelected = activeQuestionType === item.type;
+                    return (
+                      <button
+                        key={item.type}
+                        type="button"
+                        onClick={() => handleChangeQuestionType(item.type)}
+                        className={`p-3 rounded-xl border text-left transition-all flex items-start gap-2.5 cursor-pointer ${
+                          isSelected
+                            ? 'bg-emerald-50 border-[#064e3b] ring-1 ring-[#064e3b] text-emerald-950'
+                            : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700'
+                        }`}
+                      >
+                        <div
+                          className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                            isSelected
+                              ? 'bg-[#064e3b] text-white'
+                              : 'bg-slate-100 text-slate-600'
+                          }`}
+                        >
+                          <Icon className="w-4 h-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold leading-tight">{item.title}</div>
+                          <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                            {item.desc}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div
+                className={`grid grid-cols-2 gap-3 ${
+                  activeQuestionType === 'multiple_choice' ? 'sm:grid-cols-4' : 'sm:grid-cols-3'
+                }`}
+              >
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1">
                     Nomor Soal
@@ -1553,13 +2397,13 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   <label className="block text-xs font-semibold text-slate-600 mb-1">
                     Mata Pelajaran
                   </label>
-                  {availableSubjects.length > 0 ? (
+                  {modalSubjectOptions.length > 0 ? (
                     <select
-                      value={qForm.subject || availableSubjects[0]}
+                      value={qForm.subject || modalSubjectOptions[0]}
                       onChange={(e) => setQForm((prev) => ({ ...prev, subject: e.target.value }))}
                       className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm font-medium"
                     >
-                      {availableSubjects.map((s) => (
+                      {modalSubjectOptions.map((s) => (
                         <option key={s} value={s}>
                           {s}
                         </option>
@@ -1576,27 +2420,29 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     />
                   )}
                 </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">
-                    Kunci Jawaban
-                  </label>
-                  <select
-                    value={qForm.correctAnswer}
-                    onChange={(e) =>
-                      setQForm((prev) => ({
-                        ...prev,
-                        correctAnswer: e.target.value as OptionKey,
-                      }))
-                    }
-                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-mono text-sm font-bold"
-                  >
-                    {OPTION_KEYS.map((k) => (
-                      <option key={k} value={k}>
-                        Opsi {k}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                {activeQuestionType === 'multiple_choice' && (
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">
+                      Kunci Jawaban
+                    </label>
+                    <select
+                      value={['A', 'B', 'C', 'D'].includes(qForm.correctAnswer) ? qForm.correctAnswer : 'A'}
+                      onChange={(e) =>
+                        setQForm((prev) => ({
+                          ...prev,
+                          correctAnswer: e.target.value as OptionKey,
+                        }))
+                      }
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-mono text-sm font-bold"
+                    >
+                      {OPTION_KEYS.map((k) => (
+                        <option key={k} value={k}>
+                          Opsi {k}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1">
                     Bobot Poin
@@ -1621,12 +2467,18 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                 />
               </div>
 
-              {/* Teks Pertanyaan + LaTeX */}
+              {/* Teks Pertanyaan / Instruksi + LaTeX */}
               <div className="space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <label className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
                     <Sigma className="w-3.5 h-3.5 text-emerald-700" />
-                    <span>Teks Pertanyaan (Gunakan $...$ untuk rumus LaTeX)</span>
+                    <span>
+                      {activeQuestionType === 'matching'
+                        ? 'Instruksi / Pengantar Soal Menjodohkan (Opsional, mendukung $...$ LaTeX)'
+                        : activeQuestionType === 'true_false'
+                          ? 'Teks Pernyataan Benar/Salah (Gunakan $...$ untuk rumus LaTeX)'
+                          : 'Teks Pertanyaan (Gunakan $...$ untuk rumus LaTeX)'}
+                    </span>
                   </label>
                   <div className="flex flex-wrap gap-1.5">
                     {[
@@ -1648,12 +2500,18 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   </div>
                 </div>
                 <textarea
-                  rows={3}
+                  rows={activeQuestionType === 'matching' ? 2 : 3}
                   value={qForm.questionText}
                   onChange={(e) =>
                     setQForm((prev) => ({ ...prev, questionText: e.target.value }))
                   }
-                  placeholder="Contoh: Hitunglah nilai $x$ jika $\frac{2x+4}{3} = 6$..."
+                  placeholder={
+                    activeQuestionType === 'matching'
+                      ? 'Contoh: Jodohkan pernyataan/besaran di sebelah kiri dengan pasangan jawaban yang tepat...'
+                      : activeQuestionType === 'true_false'
+                        ? 'Contoh: Hasil dari $2^3 + 4$ adalah $12$. Tentukan apakah pernyataan tersebut Benar atau Salah!'
+                        : 'Contoh: Hitunglah nilai $x$ jika $\\frac{2x+4}{3} = 6$...'
+                  }
                   className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
                 />
                 {qForm.questionText.trim() && (
@@ -1716,106 +2574,349 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                 )}
               </div>
 
-              {/* Opsi Jawaban A–D dengan Upload Gambar */}
-              <div className="space-y-3">
-                <div className="text-xs font-semibold text-slate-700">
-                  Opsi Jawaban A–D (Mendukung Teks LaTeX &amp; Upload Gambar Per Opsi)
+              {/* Dynamic Answer Section by QuestionType */}
+              {activeQuestionType === 'multiple_choice' && (
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold text-slate-700">
+                    Opsi Jawaban A–D (Mendukung Teks LaTeX &amp; Upload Gambar Per Opsi)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {OPTION_KEYS.map((key) => {
+                      const optVal = qForm.options[key];
+                      const isKey = qForm.correctAnswer === key;
+                      return (
+                        <div
+                          key={key}
+                          className={`p-3 rounded-xl border space-y-2 ${
+                            isKey
+                              ? 'bg-emerald-50/50 border-emerald-400'
+                              : 'bg-slate-50/60 border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono font-bold text-xs text-slate-800">
+                              Opsi {key} {isKey ? '(Kunci)' : ''}
+                            </span>
+                            <div className="flex items-center gap-1.5">
+                              <label className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 text-slate-700 hover:text-emerald-900 text-[11px] font-semibold cursor-pointer">
+                                <ImagePlus className="w-3.5 h-3.5" />
+                                <span>{optVal.imageUrl ? 'Ganti Gambar' : 'Upload Gambar'}</span>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={(e) => void handleUploadOptionImage(key, e)}
+                                  className="sr-only"
+                                />
+                              </label>
+                              {optVal.imageUrl && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setQForm((prev) => ({
+                                      ...prev,
+                                      options: {
+                                        ...prev.options,
+                                        [key]: { ...prev.options[key], imageUrl: '' },
+                                      },
+                                    }))
+                                  }
+                                  className="px-2 py-1 rounded-lg border border-red-200 bg-white text-red-600 hover:bg-red-50 text-[11px] font-semibold cursor-pointer"
+                                >
+                                  Hapus
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          <input
+                            type="text"
+                            placeholder={`Teks Opsi ${key} (mendukung $LaTeX$)`}
+                            value={optVal.text}
+                            onChange={(e) =>
+                              setQForm((prev) => ({
+                                ...prev,
+                                options: {
+                                  ...prev.options,
+                                  [key]: { ...prev.options[key], text: e.target.value },
+                                },
+                              }))
+                            }
+                            className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm"
+                          />
+
+                          <input
+                            type="text"
+                            placeholder={`URL gambar opsi ${key} (opsional)`}
+                            value={optVal.imageUrl}
+                            onChange={(e) =>
+                              setQForm((prev) => ({
+                                ...prev,
+                                options: {
+                                  ...prev.options,
+                                  [key]: { ...prev.options[key], imageUrl: e.target.value },
+                                },
+                              }))
+                            }
+                            className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-600"
+                          />
+
+                          {optVal.imageUrl && (
+                            <div className="p-1.5 rounded-lg bg-white border border-slate-200 inline-block">
+                              <img
+                                src={optVal.imageUrl}
+                                alt={`Pratinjau Opsi ${key}`}
+                                referrerPolicy="no-referrer"
+                                className="max-h-24 object-contain rounded"
+                              />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {OPTION_KEYS.map((key) => {
-                    const optVal = qForm.options[key];
-                    const isKey = qForm.correctAnswer === key;
-                    return (
+              )}
+
+              {activeQuestionType === 'true_false' && (
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold text-slate-700">
+                    Pilih Kunci Jawaban (Benar atau Salah)
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    {TRUE_FALSE_DEFAULT_OPTIONS.map((tfOpt) => {
+                      const isKey = (qForm.correctAnswer === 'B' ? 'B' : 'A') === tfOpt.key;
+                      return (
+                        <button
+                          key={tfOpt.key}
+                          type="button"
+                          onClick={() =>
+                            setQForm((prev) => ({
+                              ...prev,
+                              correctAnswer: tfOpt.key,
+                            }))
+                          }
+                          className={`p-4 rounded-xl border text-left flex items-center justify-between gap-3 transition-all cursor-pointer ${
+                            isKey
+                              ? 'bg-emerald-50 border-[#064e3b] ring-1 ring-[#064e3b] text-emerald-950'
+                              : 'bg-slate-50/70 border-slate-200 hover:bg-slate-100 text-slate-700'
+                          }`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <span
+                              className={`w-8 h-8 rounded-lg font-mono font-bold text-sm flex items-center justify-center ${
+                                isKey ? 'bg-[#064e3b] text-white' : 'bg-white border border-slate-200 text-slate-600'
+                              }`}
+                            >
+                              {tfOpt.key === 'A' ? 'B' : 'S'}
+                            </span>
+                            <div>
+                              <div className="font-bold text-sm">{tfOpt.text}</div>
+                              <div className="text-[11px] text-slate-500">
+                                {isKey ? 'Kunci jawaban terpilih' : 'Klik untuk jadikan kunci'}
+                              </div>
+                            </div>
+                          </div>
+                          {isKey && (
+                            <CheckCircle2 className="w-5 h-5 text-[#064e3b] shrink-0" />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {activeQuestionType === 'matching' && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-800">
+                        Daftar Pasangan Soal &amp; Jawaban ({activeMatchingPairs.length} Pasangan)
+                      </div>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        Pasangan sisi kiri dan kanan diinput sejajar. Saat siswa mengerjakan ujian, posisi jawaban di sisi kanan akan otomatis diacak.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={activeMatchingPairs.length >= 12}
+                      onClick={() =>
+                        setQForm((prev) => {
+                          const current =
+                            Array.isArray(prev.matchingPairs) && prev.matchingPairs.length >= 2
+                              ? prev.matchingPairs
+                              : createDefaultMatchingPairs();
+                          if (current.length >= 12) return prev;
+                          const nextIndex = current.length + 1;
+                          return {
+                            ...prev,
+                            matchingPairs: [
+                              ...current,
+                              {
+                                id: `L${Date.now().toString(36).slice(-4)}_${nextIndex}`,
+                                leftText: '',
+                                rightText: '',
+                              },
+                            ],
+                          };
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-900 text-xs font-semibold cursor-pointer disabled:opacity-40"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Tambah Pasangan</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    {activeMatchingPairs.map((pair, idx) => (
                       <div
-                        key={key}
-                        className={`p-3 rounded-xl border space-y-2 ${
-                          isKey
-                            ? 'bg-emerald-50/50 border-emerald-400'
-                            : 'bg-slate-50/60 border-slate-200'
-                        }`}
+                        key={pair.id || idx}
+                        className="p-3 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2.5"
                       >
                         <div className="flex items-center justify-between gap-2">
-                          <span className="font-mono font-bold text-xs text-slate-800">
-                            Opsi {key} {isKey ? '(Kunci)' : ''}
+                          <span className="font-mono font-bold text-xs text-slate-700 bg-white px-2 py-0.5 rounded border border-slate-200">
+                            Pasangan #{idx + 1}
                           </span>
-                          <div className="flex items-center gap-1.5">
-                            <label className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 text-slate-700 hover:text-emerald-900 text-[11px] font-semibold cursor-pointer">
-                              <ImagePlus className="w-3.5 h-3.5" />
-                              <span>{optVal.imageUrl ? 'Ganti Gambar' : 'Upload Gambar'}</span>
-                              <input
-                                type="file"
-                                accept="image/*"
-                                onChange={(e) => void handleUploadOptionImage(key, e)}
-                                className="sr-only"
-                              />
-                            </label>
-                            {optVal.imageUrl && (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setQForm((prev) => ({
-                                    ...prev,
-                                    options: {
-                                      ...prev.options,
-                                      [key]: { ...prev.options[key], imageUrl: '' },
-                                    },
-                                  }))
-                                }
-                                className="px-2 py-1 rounded-lg border border-red-200 bg-white text-red-600 hover:bg-red-50 text-[11px] font-semibold cursor-pointer"
-                              >
-                                Hapus
-                              </button>
+                          {activeMatchingPairs.length > 2 && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setQForm((prev) => ({
+                                  ...prev,
+                                  matchingPairs: activeMatchingPairs.filter((_, i) => i !== idx),
+                                }))
+                              }
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-rose-200 bg-white hover:bg-rose-50 text-rose-700 text-[11px] font-semibold cursor-pointer"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                              <span>Hapus Baris</span>
+                            </button>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-11 gap-2.5 items-start">
+                          {/* Left Side (Prompt) */}
+                          <div className="sm:col-span-5 space-y-1.5 bg-white p-2.5 rounded-lg border border-slate-200">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-[11px] font-bold text-slate-600">
+                                Sisi Kiri — Soal / Pernyataan {idx + 1}
+                              </span>
+                              <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-50 hover:bg-emerald-50 border border-slate-200 text-slate-600 hover:text-emerald-800 text-[10px] font-semibold cursor-pointer">
+                                <ImagePlus className="w-3 h-3" />
+                                <span>{pair.leftImageUrl ? 'Ganti' : 'Gambar'}</span>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={(e) => void handleUploadMatchingImage(idx, 'left', e)}
+                                  className="sr-only"
+                                />
+                              </label>
+                            </div>
+                            <input
+                              type="text"
+                              value={pair.leftText}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setQForm((prev) => {
+                                  const nextPairs = [...activeMatchingPairs];
+                                  nextPairs[idx] = { ...nextPairs[idx], leftText: val };
+                                  return { ...prev, matchingPairs: nextPairs };
+                                });
+                              }}
+                              placeholder={`Soal / pernyataan ${idx + 1} (mendukung $LaTeX$)`}
+                              className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs sm:text-sm"
+                            />
+                            {pair.leftImageUrl && (
+                              <div className="flex items-center gap-2 pt-1">
+                                <img
+                                  src={pair.leftImageUrl}
+                                  alt={`Gambar Kiri ${idx + 1}`}
+                                  referrerPolicy="no-referrer"
+                                  className="max-h-16 rounded border border-slate-200 object-contain"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQForm((prev) => {
+                                      const nextPairs = [...activeMatchingPairs];
+                                      nextPairs[idx] = { ...nextPairs[idx], leftImageUrl: '' };
+                                      return { ...prev, matchingPairs: nextPairs };
+                                    });
+                                  }}
+                                  className="text-[11px] text-rose-600 hover:underline cursor-pointer"
+                                >
+                                  Hapus gambar
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="hidden sm:flex sm:col-span-1 items-center justify-center pt-6 text-emerald-700">
+                            <ArrowLeftRight className="w-4 h-4" />
+                          </div>
+
+                          {/* Right Side (Matching Answer) */}
+                          <div className="sm:col-span-5 space-y-1.5 bg-emerald-50/40 p-2.5 rounded-lg border border-emerald-200">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-[11px] font-bold text-emerald-900">
+                                Sisi Kanan — Pasangan Jawaban {idx + 1}
+                              </span>
+                              <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-white hover:bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-semibold cursor-pointer">
+                                <ImagePlus className="w-3 h-3" />
+                                <span>{pair.rightImageUrl ? 'Ganti' : 'Gambar'}</span>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={(e) => void handleUploadMatchingImage(idx, 'right', e)}
+                                  className="sr-only"
+                                />
+                              </label>
+                            </div>
+                            <input
+                              type="text"
+                              value={pair.rightText}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setQForm((prev) => {
+                                  const nextPairs = [...activeMatchingPairs];
+                                  nextPairs[idx] = { ...nextPairs[idx], rightText: val };
+                                  return { ...prev, matchingPairs: nextPairs };
+                                });
+                              }}
+                              placeholder={`Jawaban pasangan ${idx + 1} (akan diacak ke siswa)`}
+                              className="w-full px-2.5 py-1.5 rounded-lg border border-emerald-300 bg-white text-xs sm:text-sm"
+                            />
+                            {pair.rightImageUrl && (
+                              <div className="flex items-center gap-2 pt-1">
+                                <img
+                                  src={pair.rightImageUrl}
+                                  alt={`Gambar Kanan ${idx + 1}`}
+                                  referrerPolicy="no-referrer"
+                                  className="max-h-16 rounded border border-emerald-200 bg-white object-contain"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQForm((prev) => {
+                                      const nextPairs = [...activeMatchingPairs];
+                                      nextPairs[idx] = { ...nextPairs[idx], rightImageUrl: '' };
+                                      return { ...prev, matchingPairs: nextPairs };
+                                    });
+                                  }}
+                                  className="text-[11px] text-rose-600 hover:underline cursor-pointer"
+                                >
+                                  Hapus gambar
+                                </button>
+                              </div>
                             )}
                           </div>
                         </div>
-
-                        <input
-                          type="text"
-                          placeholder={`Teks Opsi ${key} (mendukung $LaTeX$)`}
-                          value={optVal.text}
-                          onChange={(e) =>
-                            setQForm((prev) => ({
-                              ...prev,
-                              options: {
-                                ...prev.options,
-                                [key]: { ...prev.options[key], text: e.target.value },
-                              },
-                            }))
-                          }
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm"
-                        />
-
-                        <input
-                          type="text"
-                          placeholder={`URL gambar opsi ${key} (opsional)`}
-                          value={optVal.imageUrl}
-                          onChange={(e) =>
-                            setQForm((prev) => ({
-                              ...prev,
-                              options: {
-                                ...prev.options,
-                                [key]: { ...prev.options[key], imageUrl: e.target.value },
-                              },
-                            }))
-                          }
-                          className="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-600"
-                        />
-
-                        {optVal.imageUrl && (
-                          <div className="p-1.5 rounded-lg bg-white border border-slate-200 inline-block">
-                            <img
-                              src={optVal.imageUrl}
-                              alt={`Pratinjau Opsi ${key}`}
-                              referrerPolicy="no-referrer"
-                              className="max-h-24 object-contain rounded"
-                            />
-                          </div>
-                        )}
                       </div>
-                    );
-                  })}
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
             <div className="px-5 py-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-end gap-2.5 shrink-0">

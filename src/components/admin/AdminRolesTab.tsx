@@ -159,6 +159,9 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
     return Array.from(set).sort();
   }, [schedules, questions, staffAccounts, form.assignedSubjects]);
 
+  const allowedTabSet = useMemo(() => new Set(form.allowedTabs), [form.allowedTabs]);
+  const assignedSubjectSet = useMemo(() => new Set(form.assignedSubjects), [form.assignedSubjects]);
+
   const openCreateModal = (presetRole: StaffRoleType = 'proktor') => {
     const template =
       ROLE_TYPE_OPTIONS.find((r) => r.value === presetRole) || ROLE_TYPE_OPTIONS[1];
@@ -821,7 +824,7 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {MENU_OPTIONS.map((item) => {
-                    const checked = form.allowedTabs.includes(item.key);
+                    const checked = allowedTabSet.has(item.key);
                     const locked = form.userId.toLowerCase() === 'admin' && item.key === 'roles';
                     return (
                       <label
@@ -873,7 +876,7 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
                     <div className="space-y-2.5 pt-1">
                       <div className="flex flex-wrap gap-2">
                         {allSubjects.map((subj) => {
-                          const selected = form.assignedSubjects.includes(subj);
+                          const selected = assignedSubjectSet.has(subj);
                           return (
                             <button
                               key={subj}

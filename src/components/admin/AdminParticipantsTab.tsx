@@ -1,7 +1,9 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Dices,
   FileSpreadsheet,
   Pencil,
@@ -64,6 +66,8 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
   const [importError, setImportError] = useState('');
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [isDeletingAll, setIsDeletingAll] = useState(false);
+  const [listPage, setListPage] = useState(1);
+  const [showAllRows, setShowAllRows] = useState(false);
 
   const filtered = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -80,6 +84,27 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
       return true;
     });
   }, [participants, classFilter, searchQuery]);
+
+  useEffect(() => {
+    setListPage(1);
+  }, [classFilter, searchQuery]);
+
+  const PAGE_SIZE = 50;
+  const MAX_SHOW_ALL = 300;
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safeListPage = Math.min(listPage, totalPages);
+  const displayedParticipants = useMemo(() => {
+    if (showAllRows) {
+      return filtered.length <= MAX_SHOW_ALL
+        ? filtered
+        : filtered.slice(0, MAX_SHOW_ALL);
+    }
+    if (filtered.length <= PAGE_SIZE) {
+      return filtered;
+    }
+    const start = (safeListPage - 1) * PAGE_SIZE;
+    return filtered.slice(start, start + PAGE_SIZE);
+  }, [filtered, showAllRows, safeListPage]);
 
   const handleAddSingle = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -521,7 +546,7 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
                   </td>
                 </tr>
               ) : (
-                filtered.map((p) => {
+                displayedParticipants.map((p) => {
                   const isEditing = editingId === p.id;
                   return (
                     <tr key={p.id} className="hover:bg-slate-50/70">
@@ -622,6 +647,59 @@ export const AdminParticipantsTab: React.FC<AdminParticipantsTabProps> = ({
             </tbody>
           </table>
         </div>
+
+        {filtered.length > PAGE_SIZE && (
+          <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+            <div>
+              {showAllRows ? (
+                <span>
+                  {filtered.length > MAX_SHOW_ALL
+                    ? `Menampilkan ${MAX_SHOW_ALL} dari ${filtered.length} peserta (gunakan filter/pencarian untuk sisa data).`
+                    : `Menampilkan seluruh ${filtered.length} peserta sekaligus.`}
+                </span>
+              ) : (
+                <span>
+                  Menampilkan peserta {(safeListPage - 1) * PAGE_SIZE + 1}–
+                  {Math.min(safeListPage * PAGE_SIZE, filtered.length)} dari {filtered.length}{' '}
+                  peserta (Halaman {safeListPage} dari {totalPages})
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!showAllRows && totalPages > 1 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={safeListPage <= 1}
+                    onClick={() => setListPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Sebelumnya</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeListPage >= totalPages}
+                    onClick={() => setListPage((p) => Math.min(totalPages, p + 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <span>Berikutnya</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAllRows((v) => !v)}
+                className="px-3 py-1.5 rounded-lg border border-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 font-semibold cursor-pointer"
+              >
+                {showAllRows
+                  ? `Bagi per ${PAGE_SIZE} Peserta`
+                  : `Tampilkan Maks ${Math.min(filtered.length, MAX_SHOW_ALL)} (${filtered.length})`}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Confirmation Modal for Delete All Participants */}

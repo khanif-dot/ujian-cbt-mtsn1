@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Lock,
   RefreshCw,
@@ -85,28 +87,55 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
 
   const [feedback, setFeedback] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [listPage, setListPage] = useState(1);
+  const [showAllRows, setShowAllRows] = useState(false);
 
   useEffect(() => {
     void autoFinalizeExpiredExams({ isAdmin: true });
     const timer = window.setInterval(() => {
       setNowMs(Date.now());
-    }, 15000);
+    }, 25_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  const normalizedAllowedSet = useMemo(
+    () => new Set(normalizedAllowed),
+    [normalizedAllowed]
+  );
+
+  const scheduleLookup = useMemo(() => {
+    const byId = new Map<string, ExamSchedule>();
+    const bySubject = new Map<string, ExamSchedule>();
+    for (const s of schedules) {
+      byId.set(s.id, s);
+      const key = (s.subject || '').trim().toLowerCase();
+      if (key && !bySubject.has(key)) {
+        bySubject.set(key, s);
+      }
+    }
+    return { byId, bySubject };
+  }, [schedules]);
 
   const scopedSchedules = useMemo(() => {
     if (!isRestrictedBySubject) return schedules;
     return schedules.filter((s) =>
-      normalizedAllowed.includes(s.subject.trim().toLowerCase())
+      normalizedAllowedSet.has(s.subject.trim().toLowerCase())
     );
-  }, [schedules, isRestrictedBySubject, normalizedAllowed]);
+  }, [schedules, isRestrictedBySubject, normalizedAllowedSet]);
 
   const scopedResults = useMemo(() => {
     if (!isRestrictedBySubject) return results;
-    return results.filter((r) =>
-      normalizedAllowed.includes((r.subject || '').trim().toLowerCase())
-    );
-  }, [results, isRestrictedBySubject, normalizedAllowed]);
+    return results.filter((r) => {
+      const resolvedSubject = (
+        scheduleLookup.byId.get(r.examId)?.subject ||
+        r.subject ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+      return normalizedAllowedSet.has(resolvedSubject);
+    });
+  }, [results, isRestrictedBySubject, normalizedAllowedSet, scheduleLookup]);
 
   const dashboardResults = useMemo(
     () => scopedResults.filter((r) => hiddenDashboardLogs[r.id] !== r.startedAt),
@@ -119,10 +148,11 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
     }
     const set = new Set<string>(scopedSchedules.map((s) => s.subject));
     dashboardResults.forEach((r) => {
-      if (r.subject) set.add(r.subject);
+      const subj = scheduleLookup.byId.get(r.examId)?.subject || r.subject;
+      if (subj) set.add(subj);
     });
     return Array.from(set).sort();
-  }, [scopedSchedules, dashboardResults, isRestrictedBySubject, allowedSubjects]);
+  }, [scopedSchedules, dashboardResults, isRestrictedBySubject, allowedSubjects, scheduleLookup]);
 
   const stats = useMemo(() => {
     const inProgress = dashboardResults.filter((r) => r.status === 'in_progress');
@@ -167,11 +197,17 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
       }
 
       if (classFilter !== 'ALL' && r.className !== classFilter) return false;
-      if (
-        subjectFilter !== 'ALL' &&
-        (r.subject || '').trim().toLowerCase() !== normSubjFilter
-      ) {
-        return false;
+      if (subjectFilter !== 'ALL') {
+        const resolvedSubj = (
+          scheduleLookup.byId.get(r.examId)?.subject ||
+          r.subject ||
+          ''
+        )
+          .trim()
+          .toLowerCase();
+        if (resolvedSubj !== normSubjFilter) {
+          return false;
+        }
       }
       if (
         q &&
@@ -182,17 +218,22 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
       }
       return true;
     });
-  }, [dashboardResults, statusFilter, classFilter, subjectFilter, searchQuery]);
+  }, [dashboardResults, statusFilter, classFilter, subjectFilter, searchQuery, scheduleLookup]);
 
   const activeSelectedIds = useMemo(() => {
     const existingIds = new Set(dashboardResults.map((r) => r.id));
     return selectedIds.filter((id) => existingIds.has(id));
   }, [dashboardResults, selectedIds]);
 
-  const selectedRecords = useMemo(() => {
-    const selectedSet = new Set(activeSelectedIds);
-    return dashboardResults.filter((r) => selectedSet.has(r.id));
-  }, [dashboardResults, activeSelectedIds]);
+  const activeSelectedSet = useMemo(
+    () => new Set(activeSelectedIds),
+    [activeSelectedIds]
+  );
+
+  const selectedRecords = useMemo(
+    () => dashboardResults.filter((r) => activeSelectedSet.has(r.id)),
+    [dashboardResults, activeSelectedSet]
+  );
 
   const allInProgressRecords = useMemo(
     () => dashboardResults.filter((r) => r.status === 'in_progress'),
@@ -211,7 +252,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
 
   const allVisibleSelected =
     filteredResults.length > 0 &&
-    filteredResults.every((r) => activeSelectedIds.includes(r.id));
+    filteredResults.every((r) => activeSelectedSet.has(r.id));
 
   const toggleSelectAllVisible = () => {
     if (allVisibleSelected) {
@@ -229,13 +270,32 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
     );
   };
 
+  useEffect(() => {
+    setListPage(1);
+  }, [statusFilter, classFilter, subjectFilter, searchQuery]);
+
+  const PAGE_SIZE = 50;
+  const MAX_SHOW_ALL = 300;
+  const totalPages = Math.max(1, Math.ceil(filteredResults.length / PAGE_SIZE));
+  const safeListPage = Math.min(listPage, totalPages);
+  const displayedResults = useMemo(() => {
+    if (showAllRows) {
+      return filteredResults.slice(0, MAX_SHOW_ALL);
+    }
+    if (filteredResults.length <= PAGE_SIZE) {
+      return filteredResults;
+    }
+    const start = (safeListPage - 1) * PAGE_SIZE;
+    return filteredResults.slice(start, start + PAGE_SIZE);
+  }, [filteredResults, showAllRows, safeListPage]);
+
   const getRemainingMinutesForResult = (res: ExamResult): number | null => {
     if (res.status !== 'in_progress') return null;
-    const sched = schedules.find(
-      (s) =>
-        s.id === res.examId ||
-        (res.subject && s.subject.trim().toLowerCase() === res.subject.trim().toLowerCase())
-    );
+    const sched =
+      scheduleLookup.byId.get(res.examId) ||
+      (res.subject
+        ? scheduleLookup.bySubject.get(res.subject.trim().toLowerCase())
+        : undefined);
     if (!sched) return null;
     const startedMs = new Date(res.startedAt).getTime();
     if (!Number.isFinite(startedMs)) return null;
@@ -679,7 +739,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
                   </td>
                 </tr>
               ) : (
-                filteredResults.map((res) => {
+                displayedResults.map((res) => {
                   const answeredCount = Object.keys(res.answers || {}).length;
                   const pct =
                     res.totalQuestions > 0
@@ -688,7 +748,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
                   const isCompleted = res.status === 'submitted';
                   const isFlagged = res.status === 'flagged';
                   const isInProgress = res.status === 'in_progress';
-                  const isChecked = activeSelectedIds.includes(res.id);
+                  const isChecked = activeSelectedSet.has(res.id);
                   const remainingMin = getRemainingMinutesForResult(res);
 
                   return (
@@ -803,6 +863,60 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
             </tbody>
           </table>
         </div>
+
+        {filteredResults.length > PAGE_SIZE && (
+          <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+            <div>
+              {showAllRows ? (
+                <span>
+                  Menampilkan {displayedResults.length} dari {filteredResults.length} baris log (dibatasi maks.{' '}
+                  {MAX_SHOW_ALL} baris agar halaman tetap responsif).
+                </span>
+              ) : (
+                <span>
+                  Menampilkan baris {(safeListPage - 1) * PAGE_SIZE + 1}–
+                  {Math.min(safeListPage * PAGE_SIZE, filteredResults.length)} dari{' '}
+                  {filteredResults.length} data (Halaman {safeListPage} dari {totalPages})
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!showAllRows && totalPages > 1 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={safeListPage <= 1}
+                    onClick={() => setListPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Sebelumnya</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeListPage >= totalPages}
+                    onClick={() => setListPage((p) => Math.min(totalPages, p + 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <span>Berikutnya</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAllRows((v) => !v)}
+                className="px-3 py-1.5 rounded-lg border border-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 font-semibold cursor-pointer"
+              >
+                {showAllRows
+                  ? `Bagi per ${PAGE_SIZE} Baris`
+                  : filteredResults.length > MAX_SHOW_ALL
+                    ? `Tampilkan ${MAX_SHOW_ALL} Teratas`
+                    : `Tampilkan Semua (${filteredResults.length})`}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Confirmation Modal for Force-Finishing In-Progress Exams */}

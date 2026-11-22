@@ -5,6 +5,8 @@ export const ALL_CLASSES: string[] = GRADE_LEVELS.flatMap((grade) =>
   CLASS_SECTIONS.map((section) => `${grade}${section}`)
 );
 
+export type QuestionType = 'multiple_choice' | 'true_false' | 'matching';
+
 export type OptionKey = 'A' | 'B' | 'C' | 'D';
 
 export interface QuestionOption {
@@ -13,29 +15,53 @@ export interface QuestionOption {
   imageUrl?: string;
 }
 
+export interface MatchingPair {
+  id: string;
+  leftText: string;
+  leftImageUrl?: string;
+  rightText: string;
+  rightImageUrl?: string;
+}
+
+export interface MatchingItem {
+  id: string;
+  text: string;
+  imageUrl?: string;
+}
+
+export interface MatchingPayload {
+  leftItems: MatchingItem[];
+  rightItems: MatchingItem[];
+}
+
 export interface Question {
   id: string;
   subject: string;
   targetClasses: string[];
+  questionType?: QuestionType;
   questionText: string;
   questionImageUrl?: string;
   options: QuestionOption[];
-  correctAnswer: OptionKey;
+  matchingPairs?: MatchingPair[];
+  matchingData?: MatchingPayload;
+  correctAnswer: string;
   points: number;
   orderIndex: number;
 }
 
 /**
- * Sanitized student question payload — strictly omits `correctAnswer`
+ * Sanitized student question payload — strictly omits `correctAnswer` & `matchingPairs`
  * so answer keys cannot be inspected via DevTools / Inspect Element.
  */
 export interface StudentQuestion {
   id: string;
   subject: string;
   targetClasses: string[];
+  questionType?: QuestionType;
   questionText: string;
   questionImageUrl?: string;
   options: QuestionOption[];
+  matchingData?: MatchingPayload;
   points: number;
   orderIndex: number;
 }
@@ -115,7 +141,7 @@ export interface ExamResult {
   examId: string;
   examTitle: string;
   subject: string;
-  answers: Record<string, OptionKey>;
+  answers: Record<string, string>;
   flaggedQuestions: string[];
   questionIds?: string[];
   correctCount: number;
@@ -126,6 +152,7 @@ export interface ExamResult {
   startedAt: string;
   submittedAt: string | null;
   syncStatus: SyncStatus;
+  needsServerScoring?: boolean;
 }
 
 export interface ActiveExamSession {
@@ -133,7 +160,7 @@ export interface ActiveExamSession {
   participant: Participant;
   schedule: ExamSchedule;
   questions: StudentQuestion[];
-  answers: Record<string, OptionKey>;
+  answers: Record<string, string>;
   flaggedQuestions: string[];
   currentIndex: number;
   tabSwitchCount: number;

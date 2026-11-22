@@ -39,6 +39,7 @@ import {
   isLiveSupabaseConfigured,
   resetSupabaseConfig,
   saveSupabaseConfig,
+  validateServiceRoleKey,
 } from '@/src/lib/supabase';
 import {
   type SyncOperationReport,
@@ -198,7 +199,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
   );
   const [autoSyncIntervalSec, setAutoSyncIntervalSec] = usePersistedState<number>(
     'cbt_draft_db_interval_v1',
-    () => initialConfig.autoSyncIntervalSec || 8
+    () => initialConfig.autoSyncIntervalSec || 25
   );
   const [enableRealtime, setEnableRealtime] = usePersistedState<boolean>(
     'cbt_draft_db_realtime_v1',
@@ -240,9 +241,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
 
   const projectRef = useMemo(() => extractProjectRef(url), [url]);
   const anonJwtInfo = useMemo(() => decodeJwtPayload(anonKey), [anonKey]);
-  const serviceJwtInfo = useMemo(
-    () => (serviceRoleKey.trim() ? decodeJwtPayload(serviceRoleKey) : null),
-    [serviceRoleKey]
+  const serviceValidation = useMemo(
+    () => validateServiceRoleKey(serviceRoleKey, url),
+    [serviceRoleKey, url]
   );
 
   const derivedEndpoints = useMemo(() => {
@@ -332,7 +333,7 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
     setAnonKey(DEFAULT_SUPABASE_ANON_KEY);
     setServiceRoleKey('');
     setSchema('public');
-    setAutoSyncIntervalSec(8);
+    setAutoSyncIntervalSec(25);
     setEnableRealtime(true);
     setStatusMsg('Kredensial dikembalikan ke konfigurasi default tertanam dalam kode.');
     setStatusOk(null);
@@ -354,8 +355,12 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
     const res = await testSupabaseConnection();
     setStatusMsg(res.message);
     setStatusOk(res.ok);
+    if (res.ok && serviceRoleKey.trim()) {
+      await pullAllFromSupabaseDetailed();
+    }
     setIsTesting(false);
     await refreshDiagnostics();
+    await onDatabaseChanged();
   };
 
   const appendSyncLog = (report: SyncOperationReport) => {
@@ -760,18 +765,30 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
                     Disimpan <strong>hanya di memori sesi browser Admin (tidak ditulis ke localStorage)</strong> untuk mengecek jumlah baris &amp; menarik ulang Bank Soal (tabel{' '}
                     <code className="font-mono">questions</code>) yang diblokir dari role <code className="font-mono">anon</code>. Jangan masukkan key ini ke file <code className="font-mono">.env</code> client siswa.
                   </span>
-                  {serviceJwtInfo && (
+                  {serviceValidation.hasKey && (
                     <span
                       className={`font-mono font-semibold ${
-                        serviceJwtInfo.valid ? 'text-emerald-800' : 'text-rose-700'
+                        serviceValidation.valid ? 'text-emerald-800' : 'text-rose-700'
                       }`}
                     >
-                      {serviceJwtInfo.valid
-                        ? `Terdeteksi role: ${serviceJwtInfo.role || 'JWT valid'}`
+                      {serviceValidation.valid
+                        ? `Valid (${serviceValidation.role || 'service_role'})`
+                        : serviceValidation.role
+                        ? `Salah role: ${serviceValidation.role}`
                         : 'Format Service Key tidak valid'}
                     </span>
                   )}
                 </div>
+                {serviceValidation.hasKey && !serviceValidation.valid && serviceValidation.reason && (
+                  <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-900 font-medium">
+                    {serviceValidation.reason}
+                  </div>
+                )}
+                {serviceValidation.valid && serviceValidation.isSecretFormat && (
+                  <div className="p-2.5 rounded-lg bg-amber-100/80 border border-amber-300 text-[11px] text-amber-950">
+                    Catatan: Supabase Cloud sering memblokir key format <code className="font-mono">sb_secret_...</code> jika dipanggil langsung dari browser. Jika muncul error izin, gunakan Legacy <code className="font-mono">service_role</code> JWT (diawali <code className="font-mono">eyJ...</code>) dari tab <strong>Legacy anon, service_role API keys</strong> di Supabase.
+                  </div>
+                )}
               </div>
 
               {/* Technical API & Sync Parameters */}
@@ -795,10 +812,10 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
                   </label>
                   <input
                     type="number"
-                    min={3}
+                    min={5}
                     max={120}
                     value={autoSyncIntervalSec}
-                    onChange={(e) => setAutoSyncIntervalSec(Math.max(3, Number(e.target.value) || 8))}
+                    onChange={(e) => setAutoSyncIntervalSec(Math.max(5, Number(e.target.value) || 25))}
                     className="w-full px-3.5 py-2 rounded-xl border border-slate-300 font-mono text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
                   />
                 </div>
@@ -1102,9 +1119,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
                   Error: permission denied for table ...
                 </div>
                 <p className="text-slate-600 leading-relaxed">
-                  Pastikan bagian perintah <code className="font-mono">GRANT USAGE</code>,{' '}
-                  <code className="font-mono">GRANT SELECT, INSERT, UPDATE, DELETE</code>, dan{' '}
-                  <code className="font-mono">CREATE POLICY</code> pada Skrip SQL sudah ikut dieksekusi seluruhnya di SQL Editor.
+                  Pastikan perintah <code className="font-mono">GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role</code>, hak akses per tabel sesuai role (<code className="font-mono">REVOKE/GRANT</code>),{' '}
+                  <code className="font-mono">GRANT EXECUTE</code> fungsi RPC aman, dan{' '}
+                  <code className="font-mono">CREATE POLICY</code> pada Skrip SQL terbaru sudah dieksekusi seluruhnya di Supabase SQL Editor. Pastikan juga Service Role Key berisi token <code className="font-mono">service_role</code> (bukan <code className="font-mono">anon</code>).
                 </p>
               </div>
               <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
@@ -1455,13 +1472,43 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
                       </div>
                     )}
                     {log.errors.length > 0 && (
-                      <ul className="pl-10 list-disc text-rose-700 space-y-0.5">
-                        {log.errors.map((err, eIdx) => (
-                          <li key={eIdx} className="font-mono text-[11px]">
-                            {err}
-                          </li>
-                        ))}
-                      </ul>
+                      <div className="pl-6 space-y-2">
+                        <ul className="pl-4 list-disc text-rose-700 space-y-0.5">
+                          {log.errors.map((err, eIdx) => (
+                            <li key={eIdx} className="font-mono text-[11px]">
+                              {err}
+                            </li>
+                          ))}
+                        </ul>
+                        {log.errors.some((e) => e.toLowerCase().includes('permission denied')) && (
+                          <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-xs text-amber-950 font-medium">
+                              Terdeteksi error izin PostgreSQL (<code className="font-mono">permission denied</code>). Jalankan Skrip SQL terbaru (termasuk <code className="font-mono">GRANT</code>) di Supabase SQL Editor:
+                            </span>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => void copyText('log_sql', SUPABASE_SCHEMA_SQL)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold cursor-pointer"
+                              >
+                                {copiedField === 'log_sql' ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>{copiedField === 'log_sql' ? 'SQL Tersalin' : 'Salin Skrip SQL'}</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setSubTab('sql')}
+                                className="px-2.5 py-1.5 rounded-lg border border-amber-300 bg-white hover:bg-amber-100 text-amber-950 text-[11px] font-semibold cursor-pointer"
+                              >
+                                Buka Tab Skema SQL &amp; RLS
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     )}
                   </div>
                 ))}
@@ -1491,9 +1538,9 @@ export const AdminDatabaseTab: React.FC<AdminDatabaseTabProps> = ({
               </p>
             </div>
             <div className="bg-white rounded-xl border border-slate-200 p-4">
-              <div className="text-xs font-bold text-slate-900">6 Fungsi RPC SECURITY DEFINER</div>
+              <div className="text-xs font-bold text-slate-900">18 Fungsi RPC SECURITY DEFINER</div>
               <p className="text-[11px] text-slate-600 mt-1 font-mono leading-relaxed">
-                get_server_time, get_student_questions, upsert_exam_progress, submit_exam_and_score, upsert_questions_batch, delete_question_by_id
+                get_server_time, get_student_questions, get_questions_sync_meta, get_question_coverage_summary, upsert_exam_progress, submit_exam_and_score, force_finish_exam_results, auto_finalize_expired_results, verify_participant_login, verify_staff_login, staff_list_accounts, staff_upsert_account, staff_delete_account, staff_upsert_school_profile, staff_delete_exam_results, staff_upsert_exam_results_batch, upsert_questions_batch, delete_question_by_id
               </p>
             </div>
           </div>

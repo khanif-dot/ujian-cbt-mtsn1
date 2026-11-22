@@ -1,11 +1,16 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ClipboardCheck,
   Clock,
   FileDown,
   FileSpreadsheet,
+  FileText,
+  RefreshCw,
   Search,
   ShieldAlert,
   Trash2,
@@ -20,8 +25,17 @@ import {
   type Question,
   type RecapEntry,
   type SchoolProfile,
+  type StaffRoleType,
 } from '@/src/types/cbt';
-import { exportExamResultsExcel, exportExamResultsPdf } from '@/src/lib/importers';
+import {
+  PDF_RECAP_MAX_ROWS,
+  exportAttendancePdf,
+  exportAttendanceWord,
+  exportBeritaAcaraPdf,
+  exportBeritaAcaraWord,
+  exportExamResultsExcel,
+  exportExamResultsPdf,
+} from '@/src/lib/importers';
 
 interface AdminRecapTabProps {
   profile: SchoolProfile;
@@ -29,7 +43,11 @@ interface AdminRecapTabProps {
   schedules: ExamSchedule[];
   questions: Question[];
   results: ExamResult[];
+  staffRoleType?: StaffRoleType;
+  staffName?: string;
   allowedSubjects?: string[];
+  onForceSync?: () => Promise<void>;
+  isSyncing?: boolean;
   onDeleteResults: (resultIds: string[]) => Promise<void>;
 }
 
@@ -48,20 +66,75 @@ const STATUS_FILTER_LABELS: Record<RecapStatusFilter, string> = {
   in_progress: 'Sedang Ujian',
 };
 
+const RECAP_RECALC_INTERVAL_MS = 25_000;
+
 export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
   profile,
   participants,
   schedules,
   questions,
   results,
+  staffRoleType,
+  staffName,
   allowedSubjects,
+  onForceSync,
+  isSyncing = false,
   onDeleteResults,
 }) => {
+  const canManageExamDocuments = staffRoleType === 'admin' || staffRoleType === 'proktor';
   const isRestrictedBySubject = Boolean(allowedSubjects && allowedSubjects.length > 0);
   const normalizedAllowed = useMemo(
     () => (allowedSubjects || []).map((s) => s.trim().toLowerCase()),
     [allowedSubjects]
   );
+  const normalizedAllowedSet = useMemo(
+    () => new Set(normalizedAllowed),
+    [normalizedAllowed]
+  );
+
+  // Throttle recalculation of the heavy participant x schedule recap matrix to at most once every 25s
+  // during live background syncs, while allowing immediate recalculation on manual refresh or delete.
+  const [recapSnapshot, setRecapSnapshot] = useState({
+    participants,
+    schedules,
+    questions,
+    results,
+  });
+  const latestDataRef = useRef({ participants, schedules, questions, results });
+  latestDataRef.current = { participants, schedules, questions, results };
+  const lastRecapCalcMsRef = useRef<number>(Date.now());
+  const recapTimerRef = useRef<number | null>(null);
+
+  const flushRecapNow = useCallback(() => {
+    if (recapTimerRef.current) {
+      window.clearTimeout(recapTimerRef.current);
+      recapTimerRef.current = null;
+    }
+    lastRecapCalcMsRef.current = Date.now();
+    setRecapSnapshot(latestDataRef.current);
+  }, []);
+
+  useEffect(() => {
+    const elapsed = Date.now() - lastRecapCalcMsRef.current;
+    if (elapsed >= RECAP_RECALC_INTERVAL_MS) {
+      flushRecapNow();
+      return;
+    }
+    if (!recapTimerRef.current) {
+      const waitMs = Math.max(250, RECAP_RECALC_INTERVAL_MS - elapsed);
+      recapTimerRef.current = window.setTimeout(() => {
+        flushRecapNow();
+      }, waitMs);
+    }
+  }, [participants, schedules, questions, results, flushRecapNow]);
+
+  useEffect(() => {
+    return () => {
+      if (recapTimerRef.current) {
+        window.clearTimeout(recapTimerRef.current);
+      }
+    };
+  }, []);
 
   const [subjectFilter, setSubjectFilter] = useState<string>('ALL');
   const [classFilter, setClassFilter] = useState<string>('ALL');
@@ -73,20 +146,50 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
   const [deleteScope, setDeleteScope] = useState<RecapDeleteScope | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const [pdfWarning, setPdfWarning] = useState('');
+  const [listPage, setListPage] = useState(1);
+  const [showAllRows, setShowAllRows] = useState(false);
+
+  const [docModalTab, setDocModalTab] = useState<'attendance' | 'minutes' | null>(null);
+  const [docSubject, setDocSubject] = useState<string>('ALL');
+  const [docClass, setDocClass] = useState<string>('ALL');
+  const [docRoom, setDocRoom] = useState('');
+  const [docSession, setDocSession] = useState('');
+  const [docDate, setDocDate] = useState('');
+  const [docTimeRange, setDocTimeRange] = useState('');
+  const [docSupervisor1, setDocSupervisor1] = useState('');
+  const [docSupervisor2, setDocSupervisor2] = useState('');
+  const [docNotes, setDocNotes] = useState('');
+  const [docSplitByClass, setDocSplitByClass] = useState(true);
+  const [docSignatureStyle, setDocSignatureStyle] = useState<'zigzag' | 'single'>('zigzag');
+  const [isExportingDoc, setIsExportingDoc] = useState(false);
+  const [docModalError, setDocModalError] = useState('');
+
+  const scheduleById = useMemo(
+    () => new Map(recapSnapshot.schedules.map((s) => [s.id, s])),
+    [recapSnapshot.schedules]
+  );
 
   const scopedSchedules = useMemo(() => {
-    if (!isRestrictedBySubject) return schedules;
-    return schedules.filter((s) =>
-      normalizedAllowed.includes(s.subject.trim().toLowerCase())
+    if (!isRestrictedBySubject) return recapSnapshot.schedules;
+    return recapSnapshot.schedules.filter((s) =>
+      normalizedAllowedSet.has(s.subject.trim().toLowerCase())
     );
-  }, [schedules, isRestrictedBySubject, normalizedAllowed]);
+  }, [recapSnapshot.schedules, isRestrictedBySubject, normalizedAllowedSet]);
 
   const scopedResults = useMemo(() => {
-    if (!isRestrictedBySubject) return results;
-    return results.filter((r) =>
-      normalizedAllowed.includes((r.subject || '').trim().toLowerCase())
-    );
-  }, [results, isRestrictedBySubject, normalizedAllowed]);
+    if (!isRestrictedBySubject) return recapSnapshot.results;
+    return recapSnapshot.results.filter((r) => {
+      const resolvedSubj = (
+        scheduleById.get(r.examId)?.subject ||
+        r.subject ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+      return normalizedAllowedSet.has(resolvedSubj);
+    });
+  }, [recapSnapshot.results, isRestrictedBySubject, normalizedAllowedSet, scheduleById]);
 
   const subjects = useMemo(() => {
     if (isRestrictedBySubject && allowedSubjects) {
@@ -94,10 +197,11 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
     }
     const set = new Set<string>(scopedSchedules.map((s) => s.subject));
     scopedResults.forEach((r) => {
-      if (r.subject) set.add(r.subject);
+      const subj = scheduleById.get(r.examId)?.subject || r.subject;
+      if (subj) set.add(subj);
     });
     return Array.from(set).sort();
-  }, [scopedSchedules, scopedResults, isRestrictedBySubject, allowedSubjects]);
+  }, [scopedSchedules, scopedResults, isRestrictedBySubject, allowedSubjects, scheduleById]);
 
   const effectiveSubjectFilter = useMemo(() => {
     if (isRestrictedBySubject && subjects.length === 1) {
@@ -113,7 +217,7 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
 
   const questionCountMap = useMemo(() => {
     const map = new Map<string, number>();
-    questions.forEach((q) => {
+    recapSnapshot.questions.forEach((q) => {
       const subjKey = q.subject.trim().toLowerCase();
       (q.targetClasses || []).forEach((cls) => {
         const key = `${subjKey}::${cls}`;
@@ -121,14 +225,38 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       });
     });
     return map;
-  }, [questions]);
+  }, [recapSnapshot.questions]);
 
   // Build complete participant-based recap entries:
   // Every scheduled exam x target participants is paired with existing ExamResult,
   // or marked as `not_attended` (score 0) if the student never logged in / started.
   // Orphaned results (from deleted schedules/participants) are also preserved.
+  const sortedScopedSchedules = useMemo(
+    () =>
+      [...scopedSchedules].sort((a, b) =>
+        a.subject < b.subject ? -1 : a.subject > b.subject ? 1 : 0
+      ),
+    [scopedSchedules]
+  );
+
+  const sortedParticipants = useMemo(
+    () =>
+      [...recapSnapshot.participants].sort((a, b) =>
+        a.className !== b.className
+          ? a.className < b.className
+            ? -1
+            : 1
+          : a.participantNumber < b.participantNumber
+            ? -1
+            : a.participantNumber > b.participantNumber
+              ? 1
+              : 0
+      ),
+    [recapSnapshot.participants]
+  );
+
   const allRecapEntries = useMemo<RecapEntry[]>(() => {
-    const scheduleIdSet = new Set(scopedSchedules.map((s) => s.id));
+    const scheduleIdSet = new Set(sortedScopedSchedules.map((s) => s.id));
     const exactResultMap = new Map<string, ExamResult>();
     const fallbackResultMap = new Map<string, ExamResult>();
 
@@ -146,11 +274,11 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
     const consumedResultIds = new Set<string>();
     const entries: RecapEntry[] = [];
 
-    for (const sched of scopedSchedules) {
+    for (const sched of sortedScopedSchedules) {
       const targetClassSet = new Set(sched.targetClasses || []);
       const normSubj = sched.subject.trim().toLowerCase();
 
-      for (const p of participants) {
+      for (const p of sortedParticipants) {
         if (!targetClassSet.has(p.className)) continue;
 
         const normNum = p.participantNumber.trim().toUpperCase();
@@ -214,8 +342,10 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
     }
 
     // Preserve any existing results whose schedule or participant was later removed
+    let hasOrphaned = false;
     for (const r of scopedResults) {
       if (consumedResultIds.has(r.id)) continue;
+      hasOrphaned = true;
       const attendanceStatus: RecapEntry['attendanceStatus'] =
         r.status === 'in_progress'
           ? 'in_progress'
@@ -244,25 +374,42 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       });
     }
 
-    entries.sort(
-      (a, b) =>
-        a.subject.localeCompare(b.subject) ||
-        a.className.localeCompare(b.className) ||
-        a.participantNumber.localeCompare(b.participantNumber)
-    );
+    if (hasOrphaned) {
+      entries.sort((a, b) =>
+        a.subject !== b.subject
+          ? a.subject < b.subject
+            ? -1
+            : 1
+          : a.className !== b.className
+            ? a.className < b.className
+              ? -1
+              : 1
+            : a.participantNumber < b.participantNumber
+              ? -1
+              : a.participantNumber > b.participantNumber
+                ? 1
+                : 0
+      );
+    }
 
     return entries;
-  }, [scopedSchedules, scopedResults, participants, questionCountMap]);
+  }, [sortedScopedSchedules, scopedResults, sortedParticipants, questionCountMap]);
 
   const filteredEntries = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const normFilter = effectiveSubjectFilter.trim().toLowerCase();
     return allRecapEntries.filter((entry) => {
-      if (
-        effectiveSubjectFilter !== 'ALL' &&
-        (entry.subject || '').trim().toLowerCase() !== normFilter
-      ) {
-        return false;
+      if (effectiveSubjectFilter !== 'ALL') {
+        const resolvedSubj = (
+          scheduleById.get(entry.examId)?.subject ||
+          entry.subject ||
+          ''
+        )
+          .trim()
+          .toLowerCase();
+        if (resolvedSubj !== normFilter) {
+          return false;
+        }
       }
       if (classFilter !== 'ALL' && entry.className !== classFilter) return false;
 
@@ -289,15 +436,53 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       }
       return true;
     });
-  }, [allRecapEntries, effectiveSubjectFilter, classFilter, statusFilter, searchQuery]);
+  }, [allRecapEntries, effectiveSubjectFilter, classFilter, statusFilter, searchQuery, scheduleById]);
 
-  const getKkm = (subject: string): number => {
-    const target = (subject || '').trim().toLowerCase();
-    const match = schedules.find(
-      (s) => s.subject.trim().toLowerCase() === target
-    );
-    return match ? match.kkm : 75;
-  };
+  const kkmLookup = useMemo(() => {
+    const byExamId = new Map<string, number>();
+    const bySubject = new Map<string, number>();
+    for (const s of recapSnapshot.schedules) {
+      byExamId.set(s.id, s.kkm);
+      const key = (s.subject || '').trim().toLowerCase();
+      if (key && !bySubject.has(key)) {
+        bySubject.set(key, s.kkm);
+      }
+    }
+    return { byExamId, bySubject };
+  }, [recapSnapshot.schedules]);
+
+  const getKkm = useCallback(
+    (examId: string, subject: string): number => {
+      if (examId) {
+        const byId = kkmLookup.byExamId.get(examId);
+        if (typeof byId === 'number') return byId;
+      }
+      return kkmLookup.bySubject.get((subject || '').trim().toLowerCase()) ?? 75;
+    },
+    [kkmLookup]
+  );
+
+  useEffect(() => {
+    setListPage(1);
+    setPdfWarning('');
+  }, [effectiveSubjectFilter, classFilter, statusFilter, searchQuery]);
+
+  const PAGE_SIZE = 50;
+  const MAX_SHOW_ALL = 300;
+  const totalPages = Math.max(1, Math.ceil(filteredEntries.length / PAGE_SIZE));
+  const safeListPage = Math.min(listPage, totalPages);
+  const displayedEntries = useMemo(() => {
+    if (showAllRows) {
+      return filteredEntries.length <= MAX_SHOW_ALL
+        ? filteredEntries
+        : filteredEntries.slice(0, MAX_SHOW_ALL);
+    }
+    if (filteredEntries.length <= PAGE_SIZE) {
+      return filteredEntries;
+    }
+    const start = (safeListPage - 1) * PAGE_SIZE;
+    return filteredEntries.slice(start, start + PAGE_SIZE);
+  }, [filteredEntries, showAllRows, safeListPage]);
 
   const summary = useMemo(() => {
     const total = filteredEntries.length;
@@ -311,7 +496,7 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       (e) => e.attendanceStatus === 'in_progress'
     ).length;
 
-    const passed = completedEntries.filter((e) => e.score >= getKkm(e.subject)).length;
+    const passed = completedEntries.filter((e) => e.score >= getKkm(e.examId, e.subject)).length;
 
     // Scored pool includes completed/flagged + absent (score 0), excludes active in_progress
     const scoredEntries = filteredEntries.filter(
@@ -340,7 +525,7 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       attendedAvg,
       highest,
     };
-  }, [filteredEntries, schedules]);
+  }, [filteredEntries, getKkm]);
 
   const deletableAllResults = useMemo(
     () =>
@@ -363,14 +548,19 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
     return selectedIds.filter((id) => allowedSet.has(id));
   }, [deletableAllResults, selectedIds]);
 
-  const selectedRecords = useMemo(() => {
-    const selectedSet = new Set(activeSelectedIds);
-    return deletableAllResults.filter((r) => selectedSet.has(r.id));
-  }, [deletableAllResults, activeSelectedIds]);
+  const activeSelectedSet = useMemo(
+    () => new Set(activeSelectedIds),
+    [activeSelectedIds]
+  );
+
+  const selectedRecords = useMemo(
+    () => deletableAllResults.filter((r) => activeSelectedSet.has(r.id)),
+    [deletableAllResults, activeSelectedSet]
+  );
 
   const allVisibleSelected =
     deletableFilteredResults.length > 0 &&
-    deletableFilteredResults.every((r) => activeSelectedIds.includes(r.id));
+    deletableFilteredResults.every((r) => activeSelectedSet.has(r.id));
 
   const toggleSelectAllVisible = () => {
     if (allVisibleSelected) {
@@ -402,6 +592,7 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       await onDeleteResults(ids);
       const removedSet = new Set(ids);
       setSelectedIds((prev) => prev.filter((id) => !removedSet.has(id)));
+      flushRecapNow();
 
       if (deleteScope.kind === 'single') {
         const t = deleteScope.target;
@@ -420,6 +611,135 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
       setDeleteScope(null);
     } finally {
       setIsDeleting(false);
+    }
+  };
+
+  const handleManualRefresh = async () => {
+    if (onForceSync) {
+      await onForceSync();
+    }
+    flushRecapNow();
+  };
+
+  const handleExportPdf = async () => {
+    setPdfWarning('');
+    const pdfRes = await exportExamResultsPdf(
+      filteredEntries,
+      recapSnapshot.schedules,
+      profile,
+      {
+        subject: effectiveSubjectFilter,
+        className: classFilter,
+        statusLabel: STATUS_FILTER_LABELS[statusFilter],
+      }
+    );
+    if (!pdfRes.ok) {
+      setPdfWarning(
+        `Ekspor PDF dibatasi maksimal ${PDF_RECAP_MAX_ROWS.toLocaleString('id-ID')} baris agar browser tidak hang (saat ini ${pdfRes.rowCount.toLocaleString('id-ID')} baris). Gunakan tombol "Unduh Excel (.xlsx)" atau saring data per Mata Pelajaran / per Kelas terlebih dahulu.`
+      );
+    }
+  };
+
+  const docTargetParticipants = useMemo(() => {
+    const activeParticipants = participants.filter((p) => p.isActive !== false);
+    let subjectTargetClassSet: Set<string> | null = null;
+    if (docSubject && docSubject !== 'ALL') {
+      const normSubj = docSubject.trim().toLowerCase();
+      const matchingSchedules = schedules.filter(
+        (s) => s.subject.trim().toLowerCase() === normSubj
+      );
+      if (matchingSchedules.length > 0) {
+        subjectTargetClassSet = new Set<string>();
+        matchingSchedules.forEach((s) =>
+          (s.targetClasses || []).forEach((cls) => subjectTargetClassSet!.add(cls))
+        );
+      }
+    }
+
+    return activeParticipants.filter((p) => {
+      if (docClass !== 'ALL' && p.className !== docClass) return false;
+      if (subjectTargetClassSet && !subjectTargetClassSet.has(p.className)) return false;
+      return true;
+    });
+  }, [participants, schedules, docSubject, docClass]);
+
+  const docClassCount = useMemo(() => {
+    const set = new Set<string>();
+    docTargetParticipants.forEach((p) => p.className && set.add(p.className));
+    return set.size;
+  }, [docTargetParticipants]);
+
+  const openDocumentModal = (initialTab: 'attendance' | 'minutes') => {
+    setDocModalError('');
+    setDocSubject(effectiveSubjectFilter !== 'ALL' ? effectiveSubjectFilter : subjects[0] || 'ALL');
+    setDocClass(classFilter);
+    if (!docSupervisor2 && staffRoleType === 'proktor' && staffName) {
+      setDocSupervisor2(staffName);
+    }
+    setDocModalTab(initialTab);
+  };
+
+  const buildCurrentDocMeta = () => ({
+    subject: docSubject,
+    className: docClass,
+    roomName: docRoom,
+    sessionLabel: docSession,
+    examDate: docDate,
+    timeRange: docTimeRange,
+    supervisor1: docSupervisor1,
+    supervisor2: docSupervisor2,
+    notes: docNotes,
+    splitByClass: docSplitByClass,
+    signatureStyle: docSignatureStyle,
+  });
+
+  const handleDownloadAttendance = async (format: 'pdf' | 'word') => {
+    setDocModalError('');
+    if (docTargetParticipants.length === 0) {
+      setDocModalError(
+        'Tidak ada peserta aktif yang sesuai dengan pilihan mata pelajaran & kelas saat ini.'
+      );
+      return;
+    }
+    setIsExportingDoc(true);
+    try {
+      const meta = buildCurrentDocMeta();
+      if (format === 'pdf') {
+        await exportAttendancePdf(docTargetParticipants, profile, meta);
+      } else {
+        await exportAttendanceWord(docTargetParticipants, profile, meta);
+      }
+      setFeedback(
+        `Daftar Hadir (${format === 'pdf' ? 'PDF' : 'Word .docx'}) untuk ${docTargetParticipants.length} peserta berhasil diunduh.`
+      );
+    } catch (err) {
+      setDocModalError(
+        err instanceof Error ? err.message : 'Gagal membuat dokumen Daftar Hadir.'
+      );
+    } finally {
+      setIsExportingDoc(false);
+    }
+  };
+
+  const handleDownloadBeritaAcara = async (format: 'pdf' | 'word') => {
+    setDocModalError('');
+    setIsExportingDoc(true);
+    try {
+      const meta = buildCurrentDocMeta();
+      if (format === 'pdf') {
+        await exportBeritaAcaraPdf(docTargetParticipants.length, profile, meta);
+      } else {
+        await exportBeritaAcaraWord(docTargetParticipants.length, profile, meta);
+      }
+      setFeedback(
+        `Berita Acara Pelaksanaan Ujian (${format === 'pdf' ? 'PDF' : 'Word .docx'}) berhasil diunduh.`
+      );
+    } catch (err) {
+      setDocModalError(
+        err instanceof Error ? err.message : 'Gagal membuat dokumen Berita Acara.'
+      );
+    } finally {
+      setIsExportingDoc(false);
     }
   };
 
@@ -511,9 +831,23 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
 
           <button
             type="button"
+            disabled={isSyncing}
+            onClick={() => void handleManualRefresh()}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-sm font-semibold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
+          >
+            <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+            <span>Segarkan Rekap</span>
+          </button>
+
+          <button
+            type="button"
             disabled={filteredEntries.length === 0}
             onClick={() =>
-              exportExamResultsExcel(filteredEntries, schedules, profile.schoolName)
+              exportExamResultsExcel(
+                filteredEntries,
+                recapSnapshot.schedules,
+                profile.schoolName
+              )
             }
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-sm font-semibold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
           >
@@ -524,20 +858,66 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
           <button
             type="button"
             disabled={filteredEntries.length === 0}
-            onClick={() =>
-              exportExamResultsPdf(filteredEntries, schedules, profile, {
-                subject: effectiveSubjectFilter,
-                className: classFilter,
-                statusLabel: STATUS_FILTER_LABELS[statusFilter],
-              })
-            }
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-sm font-semibold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
+            onClick={() => void handleExportPdf()}
+            className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-white text-sm font-semibold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap ${
+              filteredEntries.length > PDF_RECAP_MAX_ROWS
+                ? 'bg-amber-600 hover:bg-amber-700'
+                : 'bg-[#064e3b] hover:bg-[#043927]'
+            }`}
           >
             <FileDown className="w-4 h-4" />
             <span>Unduh PDF</span>
           </button>
+
+          {canManageExamDocuments && (
+            <>
+              <button
+                type="button"
+                onClick={() => openDocumentModal('attendance')}
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-emerald-700/30 bg-emerald-50 hover:bg-emerald-100 text-emerald-950 text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <ClipboardCheck className="w-4 h-4 text-emerald-800" />
+                <span>Daftar Hadir</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => openDocumentModal('minutes')}
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-sky-700/30 bg-sky-50 hover:bg-sky-100 text-sky-950 text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <FileText className="w-4 h-4 text-sky-800" />
+                <span>Berita Acara</span>
+              </button>
+            </>
+          )}
         </div>
       </div>
+
+      {(filteredEntries.length > PDF_RECAP_MAX_ROWS || pdfWarning) && (
+        <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-sm flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <div className="font-semibold">
+                Data rekap melebihi batas aman PDF ({filteredEntries.length.toLocaleString('id-ID')} dari maks. {PDF_RECAP_MAX_ROWS.toLocaleString('id-ID')} baris)
+              </div>
+              <div className="text-xs text-amber-900">
+                {pdfWarning ||
+                  'Untuk jumlah baris besar agar ekspor cepat dan dokumen rapi, silakan gunakan tombol Unduh Excel (.xlsx) atau filter per Mata Pelajaran / Kelas sebelum mengunduh PDF.'}
+              </div>
+            </div>
+          </div>
+          {pdfWarning && (
+            <button
+              type="button"
+              onClick={() => setPdfWarning('')}
+              className="p-1 rounded-lg hover:bg-amber-100 text-amber-800 cursor-pointer shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      )}
 
       {feedback && (
         <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center justify-between gap-3">
@@ -693,12 +1073,12 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
                   </td>
                 </tr>
               ) : (
-                filteredEntries.map((entry) => {
-                  const kkm = getKkm(entry.subject);
+                displayedEntries.map((entry) => {
+                  const kkm = getKkm(entry.examId, entry.subject);
                   const isAbsent = entry.attendanceStatus === 'not_attended';
                   const isInProgress = entry.attendanceStatus === 'in_progress';
                   const passed = !isAbsent && !isInProgress && entry.score >= kkm;
-                  const isChecked = entry.hasResult && activeSelectedIds.includes(entry.id);
+                  const isChecked = entry.hasResult && activeSelectedSet.has(entry.id);
 
                   return (
                     <tr
@@ -805,6 +1185,59 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
             </tbody>
           </table>
         </div>
+
+        {filteredEntries.length > PAGE_SIZE && (
+          <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+            <div>
+              {showAllRows ? (
+                <span>
+                  {filteredEntries.length > MAX_SHOW_ALL
+                    ? `Menampilkan ${MAX_SHOW_ALL} dari ${filteredEntries.length} baris (gunakan filter/Excel untuk ekspor penuh).`
+                    : `Menampilkan seluruh ${filteredEntries.length} baris rekap sekaligus.`}
+                </span>
+              ) : (
+                <span>
+                  Menampilkan baris {(safeListPage - 1) * PAGE_SIZE + 1}–
+                  {Math.min(safeListPage * PAGE_SIZE, filteredEntries.length)} dari{' '}
+                  {filteredEntries.length} data (Halaman {safeListPage} dari {totalPages})
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!showAllRows && totalPages > 1 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={safeListPage <= 1}
+                    onClick={() => setListPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Sebelumnya</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeListPage >= totalPages}
+                    onClick={() => setListPage((p) => Math.min(totalPages, p + 1))}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    <span>Berikutnya</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAllRows((v) => !v)}
+                className="px-3 py-1.5 rounded-lg border border-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 font-semibold cursor-pointer"
+              >
+                {showAllRows
+                  ? `Bagi per ${PAGE_SIZE} Baris`
+                  : `Tampilkan Maks ${Math.min(filteredEntries.length, MAX_SHOW_ALL)} (${filteredEntries.length})`}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Confirmation Modal for Deleting Recap Results */}
@@ -896,6 +1329,313 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
                 >
                   {isDeleting ? 'Menghapus...' : 'Ya, Hapus Permanen'}
                 </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pre-Exam Documents Modal: Daftar Hadir / Presensi & Berita Acara (Admin & Proktor only) */}
+      {canManageExamDocuments && docModalTab && (
+        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="w-full max-w-2xl bg-white rounded-2xl border border-slate-200 shadow-2xl overflow-hidden my-auto">
+            <div className="bg-[#064e3b] px-5 py-4 text-white flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="font-display font-bold text-base truncate">
+                  Cetak / Unduh Dokumen Pelaksanaan Ujian
+                </h2>
+                <p className="text-xs text-emerald-100/85 mt-0.5">
+                  Disiapkan dan dicetak sebelum ujian dilaksanakan agar ditandatangani selama ujian berlangsung.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={isExportingDoc}
+                onClick={() => setDocModalTab(null)}
+                className="p-1.5 rounded-lg hover:bg-white/10 text-emerald-100 cursor-pointer shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Sub-Tab Switcher */}
+            <div className="px-5 pt-4 border-b border-slate-200 flex items-center gap-2 bg-slate-50">
+              <button
+                type="button"
+                onClick={() => {
+                  setDocModalError('');
+                  setDocModalTab('attendance');
+                }}
+                className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-semibold border border-b-0 transition-colors cursor-pointer ${
+                  docModalTab === 'attendance'
+                    ? 'bg-white text-emerald-950 border-slate-200 -mb-px'
+                    : 'bg-transparent text-slate-600 border-transparent hover:text-slate-900'
+                }`}
+              >
+                <ClipboardCheck className="w-4 h-4 text-emerald-700" />
+                <span>Daftar Hadir / Presensi</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDocModalError('');
+                  setDocModalTab('minutes');
+                }}
+                className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-semibold border border-b-0 transition-colors cursor-pointer ${
+                  docModalTab === 'minutes'
+                    ? 'bg-white text-sky-950 border-slate-200 -mb-px'
+                    : 'bg-transparent text-slate-600 border-transparent hover:text-slate-900'
+                }`}
+              >
+                <FileText className="w-4 h-4 text-sky-700" />
+                <span>Berita Acara Ujian</span>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto">
+              {/* Shared Exam Metadata Form */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Mata Pelajaran
+                  </label>
+                  <select
+                    value={docSubject}
+                    onChange={(e) => setDocSubject(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  >
+                    <option value="ALL">Kosongkan / Semua Mata Pelajaran</option>
+                    {subjects.map((subj) => (
+                      <option key={subj} value={subj}>
+                        {subj}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Kelas / Tingkat Peserta
+                  </label>
+                  <select
+                    value={docClass}
+                    onChange={(e) => setDocClass(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  >
+                    <option value="ALL">Semua Kelas (7A–9I)</option>
+                    {ALL_CLASSES.map((cls) => (
+                      <option key={cls} value={cls}>
+                        Kelas {cls}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Hari &amp; Tanggal Ujian <span className="font-normal text-slate-400">(opsional)</span>
+                  </label>
+                  <input
+                    type="date"
+                    value={docDate}
+                    onChange={(e) => setDocDate(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Waktu / Pukul <span className="font-normal text-slate-400">(opsional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={docTimeRange}
+                    onChange={(e) => setDocTimeRange(e.target.value)}
+                    placeholder="Contoh: 07.30 – 09.00 WIB"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Ruang Ujian <span className="font-normal text-slate-400">(opsional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={docRoom}
+                    onChange={(e) => setDocRoom(e.target.value)}
+                    placeholder="Contoh: Ruang 01 / Lab Komputer 1"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Sesi Ujian <span className="font-normal text-slate-400">(opsional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={docSession}
+                    onChange={(e) => setDocSession(e.target.value)}
+                    placeholder="Contoh: Sesi 1"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Pengawas Ruang 1 <span className="font-normal text-slate-400">(kosong = garis TTD)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={docSupervisor1}
+                    onChange={(e) => setDocSupervisor1(e.target.value)}
+                    placeholder="Nama Pengawas 1 (opsional)"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Pengawas Ruang 2 / Proktor <span className="font-normal text-slate-400">(opsional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={docSupervisor2}
+                    onChange={(e) => setDocSupervisor2(e.target.value)}
+                    placeholder="Nama Pengawas 2 / Proktor"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  />
+                </div>
+              </div>
+
+              {docModalTab === 'attendance' ? (
+                <div className="p-3.5 rounded-xl bg-emerald-50/70 border border-emerald-200 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-emerald-950">
+                      Peserta Aktif Tercakup:{' '}
+                      <strong className="font-mono text-emerald-800">
+                        {docTargetParticipants.length} siswa
+                      </strong>
+                      {docClass === 'ALL' && docClassCount > 1
+                        ? ` (${docClassCount} kelas)`
+                        : ''}
+                    </span>
+                    <span className="text-emerald-900/80">
+                      Kolom tanda tangan dikosongkan untuk diisi siswa saat ujian.
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Format Kolom Tanda Tangan
+                      </label>
+                      <select
+                        value={docSignatureStyle}
+                        onChange={(e) =>
+                          setDocSignatureStyle(e.target.value as 'zigzag' | 'single')
+                        }
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-xs sm:text-sm text-slate-800"
+                      >
+                        <option value="zigzag">Zigzag Kiri–Kanan (1. ... / 2. ...)</option>
+                        <option value="single">Rata Kiri Berurutan</option>
+                      </select>
+                    </div>
+
+                    {docClass === 'ALL' && docClassCount > 1 && (
+                      <label className="flex items-center gap-2.5 px-3 py-2 rounded-xl border border-emerald-200 bg-white text-xs font-medium text-slate-800 cursor-pointer self-end">
+                        <input
+                          type="checkbox"
+                          checked={docSplitByClass}
+                          onChange={(e) => setDocSplitByClass(e.target.checked)}
+                          className="w-4 h-4 accent-[#064e3b]"
+                        />
+                        <span>Pisahkan halaman baru per Kelas</span>
+                      </label>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="p-3 rounded-xl bg-sky-50 border border-sky-200 text-xs text-sky-950 leading-relaxed">
+                    <strong>Format Pra-Pelaksanaan Ujian:</strong> Berita Acara otomatis memuat identitas lembaga, jumlah peserta terdaftar (
+                    <strong className="font-mono">{docTargetParticipants.length} orang</strong>), kolom isian kosong untuk jumlah hadir/tidak hadir &amp; nomor peserta yang tidak hadir, kotak catatan pengawas, serta kolom tanda tangan Pengawas, Proktor, Ketua Panitia, dan Kepala Sekolah.
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Catatan Tambahan Pra-Cetak <span className="font-normal text-slate-400">(opsional — kosongkan untuk baris tulis tangan)</span>
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={docNotes}
+                      onChange={(e) => setDocNotes(e.target.value)}
+                      placeholder="Kosongkan agar tercetak kotak garis tulis tangan untuk pengawas saat ujian berlangsung..."
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {docModalError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 text-xs font-medium">
+                  {docModalError}
+                </div>
+              )}
+
+              <div className="pt-2 border-t border-slate-200 flex flex-col sm:flex-row items-stretch sm:items-center justify-end gap-2.5">
+                <button
+                  type="button"
+                  disabled={isExportingDoc}
+                  onClick={() => setDocModalTab(null)}
+                  className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs sm:text-sm font-semibold cursor-pointer"
+                >
+                  Tutup
+                </button>
+
+                {docModalTab === 'attendance' ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={isExportingDoc || docTargetParticipants.length === 0}
+                      onClick={() => void handleDownloadAttendance('word')}
+                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-sky-700 bg-sky-50 hover:bg-sky-100 text-sky-950 text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50"
+                    >
+                      <FileText className="w-4 h-4 text-sky-700" />
+                      <span>{isExportingDoc ? 'Menyiapkan...' : 'Unduh Word (.docx)'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isExportingDoc || docTargetParticipants.length === 0}
+                      onClick={() => void handleDownloadAttendance('pdf')}
+                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50"
+                    >
+                      <FileDown className="w-4 h-4" />
+                      <span>{isExportingDoc ? 'Menyiapkan...' : 'Unduh PDF'}</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      disabled={isExportingDoc}
+                      onClick={() => void handleDownloadBeritaAcara('word')}
+                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-sky-700 bg-sky-50 hover:bg-sky-100 text-sky-950 text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50"
+                    >
+                      <FileText className="w-4 h-4 text-sky-700" />
+                      <span>{isExportingDoc ? 'Menyiapkan...' : 'Unduh Word (.docx)'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isExportingDoc}
+                      onClick={() => void handleDownloadBeritaAcara('pdf')}
+                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50"
+                    >
+                      <FileDown className="w-4 h-4" />
+                      <span>{isExportingDoc ? 'Menyiapkan...' : 'Unduh PDF'}</span>
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           </div>

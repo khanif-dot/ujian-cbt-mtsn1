@@ -47,11 +47,11 @@ interface AdminConsoleProps {
   onUpsertParticipants: (items: Participant[]) => Promise<void>;
   onDeleteParticipant: (id: string) => Promise<void>;
   onDeleteAllParticipants: () => Promise<void>;
-  onSaveSchedule: (schedule: ExamSchedule) => Promise<void>;
-  onDeleteSchedule: (id: string) => Promise<void>;
+  onSaveSchedule: (schedule: ExamSchedule) => Promise<{ synced: boolean; error?: string } | void>;
+  onDeleteSchedule: (id: string) => Promise<{ synced: boolean; error?: string } | void>;
   onDeleteAllSchedules: (allowedSubjects?: string[]) => Promise<void>;
-  onUpsertQuestions: (items: Question[]) => Promise<void>;
-  onDeleteQuestion: (id: string) => Promise<void>;
+  onUpsertQuestions: (items: Question[]) => Promise<{ synced: boolean; error?: string } | void>;
+  onDeleteQuestion: (id: string) => Promise<{ synced: boolean; error?: string } | void>;
   onDeleteQuestionsBatch: (ids: string[]) => Promise<void>;
   onDeleteAllQuestions: (allowedSubjects?: string[]) => Promise<void>;
   onForceFinishExamResults: (resultIds: string[]) => Promise<number>;
@@ -299,7 +299,11 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
               schedules={schedules}
               questions={questions}
               results={results}
+              staffRoleType={currentStaff.roleType}
+              staffName={currentStaff.name}
               allowedSubjects={restrictedSubjects}
+              onForceSync={onForceSync}
+              isSyncing={isSyncing}
               onDeleteResults={onResetExamResults}
             />
           )}
@@ -321,7 +325,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
             <AdminQuestionsTab
               schedules={schedules}
               questions={questions}
+              participants={participants}
               results={results}
+              staffRoleType={currentStaff.roleType}
               allowedSubjects={restrictedSubjects}
               onSaveSchedule={onSaveSchedule}
               onDeleteSchedule={onDeleteSchedule}

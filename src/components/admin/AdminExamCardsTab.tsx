@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { FileDown, Printer, Search } from 'lucide-react';
 import { exportExamCardsPdf } from '@/src/lib/importers';
+import { KEMENAG_HEADER_TITLE, KEMENAG_LOGO_DATA_URL } from '@/src/lib/seedData';
 import { ALL_CLASSES, type Participant, type SchoolProfile } from '@/src/types/cbt';
 
 interface AdminExamCardsTabProps {
@@ -148,36 +149,51 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
               {pageCards.map((student) => (
                 <article
                   key={student.id}
-                  className="exam-card-cell border border-dashed border-slate-500 p-3 flex flex-col justify-between bg-white h-[212px]"
+                  className="exam-card-cell border border-dashed border-slate-500 px-3 py-2.5 flex flex-col justify-between bg-white h-[212px]"
                 >
                   {/* Kop Instansi */}
-                  <div className="flex items-center gap-2.5 pb-1.5 border-b border-slate-800">
-                    {profile.logoDataUrl && (
+                  <div>
+                    <div className="flex items-center justify-between gap-2 pb-1 border-b border-slate-800">
                       <img
-                        src={profile.logoDataUrl}
-                        alt={`Logo ${profile.schoolName}`}
-                        referrerPolicy="no-referrer"
-                        className="w-11 h-11 object-contain shrink-0"
+                        src={KEMENAG_LOGO_DATA_URL}
+                        alt="Logo Kementerian Agama"
+                        className="w-9 h-9 object-contain shrink-0"
                       />
-                    )}
-                    <div className="min-w-0 flex-1 text-center">
-                      <div className="font-display font-extrabold text-[11px] uppercase tracking-tight text-slate-950 truncate leading-tight">
-                        {profile.schoolName}
+                      <div className="min-w-0 flex-1 text-center">
+                        <div className="font-display font-extrabold text-[8px] uppercase tracking-tight text-slate-950 truncate leading-tight">
+                          {KEMENAG_HEADER_TITLE}
+                        </div>
+                        <div className="font-display font-extrabold text-[10px] uppercase tracking-tight text-slate-950 truncate leading-tight">
+                          {profile.schoolName}
+                        </div>
+                        <div className="italic text-[7.5px] text-slate-600 truncate leading-tight">
+                          {profile.address}
+                        </div>
                       </div>
-                      <div className="text-[8.5px] text-slate-600 truncate leading-tight">
-                        {profile.address}
-                      </div>
-                      <div className="text-[10px] font-extrabold tracking-wider text-slate-950 uppercase leading-tight mt-0.5">
+                      {profile.logoDataUrl ? (
+                        <img
+                          src={profile.logoDataUrl}
+                          alt={`Logo ${profile.schoolName}`}
+                          referrerPolicy="no-referrer"
+                          className="w-9 h-9 object-contain shrink-0"
+                        />
+                      ) : (
+                        <div className="w-9 h-9 shrink-0" />
+                      )}
+                    </div>
+
+                    <div className="text-center pt-1">
+                      <div className="text-[9.5px] font-extrabold tracking-wider text-slate-950 uppercase leading-tight">
                         KARTU PESERTA
                       </div>
-                      <div className="text-[9.5px] font-bold text-[#064e3b] truncate leading-tight">
+                      <div className="text-[8.5px] font-bold text-[#064e3b] truncate leading-tight">
                         {profile.examTitle} ({profile.academicYear})
                       </div>
                     </div>
                   </div>
 
                   {/* Data Peserta */}
-                  <div className="py-0.5 space-y-0.5 text-[11px]">
+                  <div className="py-0.5 space-y-0.5 text-[10.5px]">
                     <div className="grid grid-cols-12 items-baseline">
                       <span className="col-span-4 text-slate-600">Nama Peserta</span>
                       <span className="col-span-8 font-bold text-slate-950 truncate">
@@ -194,7 +210,7 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
                       <span className="col-span-4 text-slate-700 font-semibold">
                         No. Peserta
                       </span>
-                      <span className="col-span-8 font-mono text-[12px] font-extrabold tracking-wider text-slate-950 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded inline-block">
+                      <span className="col-span-8 font-mono text-[11.5px] font-extrabold tracking-wider text-slate-950 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded text-center block">
                         {student.participantNumber}
                       </span>
                     </div>
@@ -202,20 +218,20 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
                       <span className="col-span-4 text-slate-700 font-semibold">
                         Token Ujian
                       </span>
-                      <span className="col-span-8 font-mono text-[12px] font-extrabold tracking-widest text-[#064e3b]">
+                      <span className="col-span-8 font-mono text-[11.5px] font-extrabold tracking-widest text-[#064e3b]">
                         : {student.token || '-'}
                       </span>
                     </div>
                   </div>
 
                   {/* Tanda Tangan Panitia */}
-                  <div className="flex items-end justify-between pt-0.5 text-[10px] text-slate-700">
-                    <div className="text-[9px] text-slate-500">
+                  <div className="flex items-end justify-between pt-0.5 text-[9.5px] text-slate-700">
+                    <div className="text-[8.5px] text-slate-500">
                       Login dengan No. Peserta &amp; Token.
                     </div>
                     <div className="text-right leading-tight shrink-0 pl-2">
                       <div>Ketua Panitia,</div>
-                      <div className="h-3" />
+                      <div className="h-2.5" />
                       <div className="font-bold text-slate-950 underline decoration-slate-400">
                         {profile.committeeChairName}
                       </div>

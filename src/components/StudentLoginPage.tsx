@@ -4,6 +4,7 @@ import {
   ArrowRight,
   BookOpen,
   CheckCircle2,
+  Clock,
   GraduationCap,
   KeyRound,
   Lock,
@@ -13,7 +14,10 @@ import {
   UserCheck,
 } from 'lucide-react';
 import type { ExamResult, ExamSchedule, Participant, SchoolProfile } from '@/src/types/cbt';
-import { checkStudentExamLock, validateParticipantAndToken } from '@/src/lib/dataStore';
+import {
+  syncStudentResultsFromCloud,
+  validateParticipantAndToken,
+} from '@/src/lib/dataStore';
 import { clearPersistedValue, usePersistedState } from '@/src/lib/usePersistedState';
 
 interface StudentLoginPageProps {
@@ -46,6 +50,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   );
 
   const [verifiedParticipant, setVerifiedParticipant] = useState<Participant | null>(null);
+  const [cloudSyncedResults, setCloudSyncedResults] = useState<ExamResult[] | null>(null);
   const [validationSource, setValidationSource] = useState<'supabase' | 'local-cache' | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [isChecking, setIsChecking] = useState(false);
@@ -95,6 +100,18 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
     return availableSubjects[0] || null;
   }, [availableSubjects, selectedScheduleId]);
 
+  const effectiveResults = useMemo(() => {
+    if (!cloudSyncedResults || cloudSyncedResults.length === 0) return results;
+    const merged = new Map<string, ExamResult>();
+    for (const r of results) {
+      merged.set(`${r.participantNumber.trim().toUpperCase()}::${r.examId}`, r);
+    }
+    for (const cr of cloudSyncedResults) {
+      merged.set(`${cr.participantNumber.trim().toUpperCase()}::${cr.examId}`, cr);
+    }
+    return Array.from(merged.values());
+  }, [results, cloudSyncedResults]);
+
   const getExistingResultForSchedule = (
     participant: Participant | null,
     schedule: ExamSchedule | null
@@ -102,7 +119,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
     if (!participant || !schedule) return null;
     const normNum = participant.participantNumber.trim().toUpperCase();
     return (
-      results.find(
+      effectiveResults.find(
         (r) =>
           r.participantNumber.trim().toUpperCase() === normNum && r.examId === schedule.id
       ) || null
@@ -111,8 +128,14 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
 
   const selectedSubjectExistingResult = useMemo(
     () => getExistingResultForSchedule(verifiedParticipant, activeSelectedSchedule),
-    [verifiedParticipant, activeSelectedSchedule, results]
+    [verifiedParticipant, activeSelectedSchedule, effectiveResults]
   );
+
+  const isSelectedSubjectLocked = Boolean(
+    selectedSubjectExistingResult && selectedSubjectExistingResult.status !== 'in_progress'
+  );
+  const isSelectedSubjectInProgress =
+    selectedSubjectExistingResult?.status === 'in_progress';
 
   const handleVerifyCredentials = async (rawNum?: string, rawToken?: string) => {
     const code = (rawNum ?? participantNumber).trim().toUpperCase();
@@ -133,6 +156,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
       const res = await validateParticipantAndToken(code, tkn);
       if (res.status === 'not_found' || !res.participant) {
         setVerifiedParticipant(null);
+        setCloudSyncedResults(null);
         setErrorMsg(
           `Nomor Peserta "${code}" tidak ditemukan atau tidak aktif. Periksa kembali kartu ujian Anda.`
         );
@@ -141,26 +165,29 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
 
       if (res.status === 'wrong_token') {
         setVerifiedParticipant(null);
+        setCloudSyncedResults(null);
         setErrorMsg(
           `Token tidak sesuai untuk Nomor Peserta "${code}". Periksa kembali token Anda.`
         );
         return;
       }
 
+      const freshResults = await syncStudentResultsFromCloud(res.participant.participantNumber);
+      setCloudSyncedResults(freshResults);
+      setVerifiedParticipant(res.participant);
+      setValidationSource(res.source);
+
       const eligible = schedules.filter(
         (s) => s.isActive && s.targetClasses.includes(res.participant!.className)
       );
 
       if (eligible.length === 0) {
-        setVerifiedParticipant(res.participant);
         setErrorMsg(
           `Tidak ada jadwal mata pelajaran aktif untuk kelas ${res.participant.className} saat ini.`
         );
         return;
       }
 
-      setVerifiedParticipant(res.participant);
-      setValidationSource(res.source);
       if (!selectedScheduleId || !eligible.some((s) => s.id === selectedScheduleId)) {
         setSelectedScheduleId(eligible[0].id);
       }
@@ -172,35 +199,31 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (verifiedParticipant && activeSelectedSchedule) {
-      if (selectedSubjectExistingResult) {
+      if (isSelectedSubjectLocked) {
         return;
       }
       setIsStarting(true);
       setErrorMsg('');
       try {
-        const lockCheck = await checkStudentExamLock(
-          verifiedParticipant.participantNumber,
-          activeSelectedSchedule
+        const freshResults = await syncStudentResultsFromCloud(
+          verifiedParticipant.participantNumber
         );
-        if (lockCheck.locked) {
-          if (lockCheck.reason === 'network_error') {
-            setErrorMsg(
-              lockCheck.errorMessage ||
-                'Gagal memeriksa status ujian ke server. Periksa koneksi internet lalu coba lagi.'
-            );
-          } else if (lockCheck.reason === 'submitted') {
-            setErrorMsg(
-              `Anda sudah menyelesaikan ujian mata pelajaran ${activeSelectedSchedule.subject}. Peserta tidak dapat mengulang ujian yang sudah selesai.`
-            );
-          } else if (lockCheck.reason === 'flagged') {
-            setErrorMsg(
-              `Akses ujian ${activeSelectedSchedule.subject} terkunci karena pelanggaran perpindahan tab. Hubungi panitia/admin untuk Reset Ujian.`
-            );
-          } else {
-            setErrorMsg(
-              `Peserta terdeteksi sudah masuk / memulai ujian pada mata pelajaran ${activeSelectedSchedule.subject}. Hubungi panitia/admin untuk Reset Ujian.`
-            );
-          }
+        setCloudSyncedResults(freshResults);
+
+        const normNum = verifiedParticipant.participantNumber.trim().toUpperCase();
+        const freshResult =
+          freshResults.find(
+            (r) =>
+              r.participantNumber.trim().toUpperCase() === normNum &&
+              r.examId === activeSelectedSchedule.id
+          ) || null;
+
+        if (freshResult && freshResult.status !== 'in_progress') {
+          setErrorMsg(
+            freshResult.status === 'submitted'
+              ? `Anda telah menyelesaikan ujian mata pelajaran ${activeSelectedSchedule.subject} dan tidak dapat mengulanginya.`
+              : `Akses ujian ${activeSelectedSchedule.subject} terkunci karena pelanggaran. Hubungi admin untuk Reset Ujian.`
+          );
           return;
         }
 
@@ -216,6 +239,9 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
         clearPersistedValue('cbt_draft_student_token_v1');
         clearPersistedValue('cbt_draft_student_sched_v1');
       } catch (err) {
+        if (document.fullscreenElement && document.exitFullscreen) {
+          void document.exitFullscreen().catch(() => {});
+        }
         setErrorMsg(
           err instanceof Error ? err.message : 'Gagal memulai sesi ujian. Silakan coba lagi.'
         );
@@ -370,37 +396,39 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                   autoComplete="off"
                   autoFocus
                   value={participantNumber}
-                  onChange={(e) => {
-                    setParticipantNumber(e.target.value.toUpperCase());
-                    if (verifiedParticipant) setVerifiedParticipant(null);
-                    if (errorMsg) setErrorMsg('');
-                  }}
-                  placeholder="Contoh: 2026-7A-001"
-                  className="w-full px-4 py-2.5 rounded-xl border border-slate-300 bg-slate-50/60 text-slate-900 font-mono text-sm sm:text-base font-semibold tracking-wider text-center placeholder:font-sans placeholder:font-normal placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600 focus:border-sky-600 focus:bg-white transition-all"
-                />
-              </div>
+                    onChange={(e) => {
+                      setParticipantNumber(e.target.value.toUpperCase());
+                      if (verifiedParticipant) setVerifiedParticipant(null);
+                      if (cloudSyncedResults) setCloudSyncedResults(null);
+                      if (errorMsg) setErrorMsg('');
+                    }}
+                    placeholder="Contoh: 2026-7A-001"
+                    className="w-full px-4 py-2.5 rounded-xl border border-slate-300 bg-slate-50/60 text-slate-900 font-mono text-sm sm:text-base font-semibold tracking-wider text-center placeholder:font-sans placeholder:font-normal placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600 focus:border-sky-600 focus:bg-white transition-all"
+                  />
+                </div>
 
-              {/* Token Input */}
-              <div>
-                <label
-                  htmlFor="participant-token"
-                  className="block text-sm font-semibold text-slate-800 mb-1.5 text-center"
-                >
-                  Token Ujian
-                </label>
-                <div className="flex gap-2">
-                  <div className="relative flex-1">
-                    <Ticket className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      id="participant-token"
-                      type="text"
-                      autoComplete="off"
-                      value={tokenInput}
-                      onChange={(e) => {
-                        setTokenInput(e.target.value.toUpperCase());
-                        if (verifiedParticipant) setVerifiedParticipant(null);
-                        if (errorMsg) setErrorMsg('');
-                      }}
+                {/* Token Input */}
+                <div>
+                  <label
+                    htmlFor="participant-token"
+                    className="block text-sm font-semibold text-slate-800 mb-1.5 text-center"
+                  >
+                    Token Ujian
+                  </label>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <Ticket className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        id="participant-token"
+                        type="text"
+                        autoComplete="off"
+                        value={tokenInput}
+                        onChange={(e) => {
+                          setTokenInput(e.target.value.toUpperCase());
+                          if (verifiedParticipant) setVerifiedParticipant(null);
+                          if (cloudSyncedResults) setCloudSyncedResults(null);
+                          if (errorMsg) setErrorMsg('');
+                        }}
                       placeholder="Masukkan Token (mis. TKN7A1)"
                       className="w-full pl-10 pr-10 py-2.5 rounded-xl border border-slate-300 bg-slate-50/60 text-slate-900 font-mono text-sm sm:text-base font-bold tracking-widest text-center placeholder:font-sans placeholder:font-normal placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600 focus:border-sky-600 focus:bg-white transition-all"
                     />
@@ -441,14 +469,14 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                     ) : (
                       availableSubjects.map((sched) => {
                         const existing = getExistingResultForSchedule(verifiedParticipant, sched);
-                        const suffix =
-                          existing?.status === 'submitted'
-                            ? ' — Sudah Selesai'
-                            : existing?.status === 'flagged'
-                              ? ' — Terkunci Pelanggaran'
-                              : existing?.status === 'in_progress'
-                                ? ' — Sudah Masuk Ujian'
-                                : '';
+                          const suffix =
+                            existing?.status === 'submitted'
+                              ? ' — Sudah Selesai'
+                              : existing?.status === 'flagged'
+                                ? ' — Terkunci Pelanggaran'
+                                : existing?.status === 'in_progress'
+                                  ? ' — Sedang Berlangsung (Lanjutkan)'
+                                  : '';
                         return (
                           <option key={sched.id} value={sched.id}>
                             {sched.subject} ({sched.durationMinutes} Menit){suffix}
@@ -526,28 +554,41 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
               )}
 
               {verifiedParticipant && activeSelectedSchedule && selectedSubjectExistingResult && (
-                <div
-                  role="alert"
-                  className="rounded-xl bg-amber-50 border border-amber-300 p-4 flex items-start gap-3 text-amber-950"
-                >
-                  <AlertOctagon className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
-                  <div className="text-xs sm:text-sm space-y-1 leading-relaxed">
-                    <div className="font-bold">
-                      {selectedSubjectExistingResult.status === 'submitted'
-                        ? 'Ujian Mata Pelajaran Ini Sudah Diselesaikan'
-                        : selectedSubjectExistingResult.status === 'flagged'
-                          ? 'Akses Ujian Terkunci (Pelanggaran Terdeteksi)'
-                          : 'Peserta Sudah Masuk / Memulai Ujian Ini'}
+                isSelectedSubjectInProgress ? (
+                  <div
+                    role="status"
+                    className="rounded-xl bg-sky-50 border border-sky-300 p-4 flex items-start gap-3 text-sky-950"
+                  >
+                    <Clock className="w-5 h-5 text-sky-700 shrink-0 mt-0.5" />
+                    <div className="text-xs sm:text-sm space-y-1 leading-relaxed">
+                      <div className="font-bold">
+                        Sesi Ujian Masih Berlangsung (Dapat Dilanjutkan)
+                      </div>
+                      <p className="text-sky-900">
+                        Nomor peserta {verifiedParticipant.participantNumber} memiliki sesi aktif untuk mata pelajaran {activeSelectedSchedule.subject}. Tekan tombol <strong>Lanjutkan Ujian</strong> di bawah untuk melanjutkan mengerjakan dengan jawaban dan sisa waktu tersimpan.
+                      </p>
                     </div>
-                    <p className="text-amber-900">
-                      {selectedSubjectExistingResult.status === 'submitted'
-                        ? `Anda telah mengumpulkan ujian mata pelajaran ${activeSelectedSchedule.subject}. Setiap peserta hanya dapat mengikuti ujian satu kali pada mata pelajaran yang sama.`
-                        : selectedSubjectExistingResult.status === 'flagged'
-                          ? `Sesi ujian ${activeSelectedSchedule.subject} terkunci karena melewati batas perpindahan tab. Hubungi panitia/admin untuk membuka kunci melalui menu Reset Ujian.`
-                          : `Nomor peserta ${verifiedParticipant.participantNumber} terdeteksi sudah masuk ujian pada mata pelajaran ${activeSelectedSchedule.subject}. Anda tidak dapat memulai ujian lagi kecuali dibuka kunci oleh panitia/admin di menu Reset Ujian.`}
-                    </p>
                   </div>
-                </div>
+                ) : (
+                  <div
+                    role="alert"
+                    className="rounded-xl bg-amber-50 border border-amber-300 p-4 flex items-start gap-3 text-amber-950"
+                  >
+                    <AlertOctagon className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="text-xs sm:text-sm space-y-1 leading-relaxed">
+                      <div className="font-bold">
+                        {selectedSubjectExistingResult.status === 'submitted'
+                          ? 'Ujian Mata Pelajaran Ini Sudah Diselesaikan'
+                          : 'Akses Ujian Terkunci (Pelanggaran Terdeteksi)'}
+                      </div>
+                      <p className="text-amber-900">
+                        {selectedSubjectExistingResult.status === 'submitted'
+                          ? `Anda telah mengumpulkan ujian mata pelajaran ${activeSelectedSchedule.subject}. Setiap peserta hanya dapat mengikuti ujian satu kali pada mata pelajaran yang sama.`
+                          : `Sesi ujian ${activeSelectedSchedule.subject} terkunci karena melewati batas perpindahan tab. Hubungi panitia/admin untuk membuka kunci melalui menu Reset Ujian.`}
+                      </p>
+                    </div>
+                  </div>
+                )
               )}
 
               <button
@@ -555,16 +596,16 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                 disabled={
                   isChecking ||
                   isStarting ||
-                  Boolean(verifiedParticipant && activeSelectedSchedule && selectedSubjectExistingResult)
+                  Boolean(verifiedParticipant && activeSelectedSchedule && isSelectedSubjectLocked)
                 }
                 className="w-full py-3.5 px-5 rounded-xl bg-[#0369a1] hover:bg-[#075985] text-white font-semibold text-sm sm:text-base flex items-center justify-center gap-2.5 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed transition-all cursor-pointer"
               >
                 {verifiedParticipant && activeSelectedSchedule ? (
-                  selectedSubjectExistingResult ? (
+                  isSelectedSubjectLocked ? (
                     <>
                       <Lock className="w-4 h-4" />
                       <span>
-                        {selectedSubjectExistingResult.status === 'submitted'
+                        {selectedSubjectExistingResult?.status === 'submitted'
                           ? 'Ujian Sudah Selesai'
                           : 'Ujian Terkunci — Hubungi Admin'}
                       </span>
@@ -572,7 +613,15 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                   ) : (
                     <>
                       <Maximize2 className="w-4 h-4" />
-                      <span>{isStarting ? 'Menyiapkan Ruang Ujian...' : 'Mulai Ujian Sekarang'}</span>
+                      <span>
+                        {isStarting
+                          ? isSelectedSubjectInProgress
+                            ? 'Melanjutkan Ruang Ujian...'
+                            : 'Menyiapkan Ruang Ujian...'
+                          : isSelectedSubjectInProgress
+                            ? 'Lanjutkan Ujian'
+                            : 'Mulai Ujian Sekarang'}
+                      </span>
                       <ArrowRight className="w-4 h-4" />
                     </>
                   )
