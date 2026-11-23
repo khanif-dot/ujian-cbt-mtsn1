@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Lock, User, X } from 'lucide-react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import { Check, Copy, Database, Download, Lock, User, X } from 'lucide-react';
 import {
   authenticateStaff,
   autoFinalizeExpiredExams,
@@ -10,7 +10,6 @@ import {
   clearAllParticipants,
   clearAllQuestions,
   clearAllSchedules,
-  deleteExamResultLocalById,
   deleteExamSchedule,
   deleteParticipant,
   deleteQuestion,
@@ -31,6 +30,7 @@ import {
   getStaffAccounts,
   getStudentQuestionsForClass,
   hideDashboardExamLogs,
+  normalizeParticipantNumber,
   resetBulkExamResults,
   saveActiveSessionLocal,
   saveSchoolProfile,
@@ -39,7 +39,7 @@ import {
   submitFinalExam,
   syncFromSupabase,
   syncServerClock,
-  syncStudentResultsFromCloud,
+  type SyncTableScope,
   upsertExamProgress,
   upsertExamSchedule,
   upsertParticipants,
@@ -49,7 +49,11 @@ import {
 } from '@/src/lib/dataStore';
 import { prepareMatchingForStudentSession } from '@/src/lib/questionUtils';
 import { SEED_SCHOOL_PROFILE } from '@/src/lib/seedData';
-import { getSupabaseClient, getSupabaseConfig, isLiveSupabaseConfigured } from '@/src/lib/supabase';
+import {
+  getSupabaseClient,
+  getSupabaseConfig,
+  isLiveSupabaseConfigured,
+} from '@/src/lib/supabase';
 import type {
   ActiveExamSession,
   ExamResult,
@@ -59,10 +63,22 @@ import type {
   SchoolProfile,
   StaffAccount,
 } from '@/src/types/cbt';
-import { ExamCompletedView } from '@/src/components/ExamCompletedView';
-import { ExamRoom } from '@/src/components/ExamRoom';
 import { StudentLoginPage } from '@/src/components/StudentLoginPage';
-import { AdminConsole } from '@/src/components/admin/AdminConsole';
+
+const loadExamRoomModule = () => import('@/src/components/ExamRoom');
+const ExamRoom = lazy(() =>
+  loadExamRoomModule().then((m) => ({ default: m.ExamRoom }))
+);
+const ExamCompletedView = lazy(() =>
+  import('@/src/components/ExamCompletedView').then((m) => ({
+    default: m.ExamCompletedView,
+  }))
+);
+const AdminConsole = lazy(() =>
+  import('@/src/components/admin/AdminConsole').then((m) => ({
+    default: m.AdminConsole,
+  }))
+);
 
 type AppRoute = 'student-login' | 'exam-room' | 'exam-completed' | 'admin';
 
@@ -160,12 +176,16 @@ export default function App() {
   const [adminIdInput, setAdminIdInput] = useState('');
   const [adminPinInput, setAdminPinInput] = useState('');
   const [adminPinError, setAdminPinError] = useState('');
+  const [adminSqlUpdateRequired, setAdminSqlUpdateRequired] = useState(false);
+  const [copiedRecoveryField, setCopiedRecoveryField] = useState<'schema' | 'reset' | null>(null);
   const [isAuthenticatingAdmin, setIsAuthenticatingAdmin] = useState(false);
 
   const routeRef = useRef(route);
   routeRef.current = route;
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
+  const completedResultRef = useRef(completedResult);
+  completedResultRef.current = completedResult;
   const staffRevokedRef = useRef(false);
 
   const loadAllData = useCallback(async (topic?: string) => {
@@ -200,6 +220,24 @@ export default function App() {
     const fetchTopic = async (t: string): Promise<void> => {
       if (t === 'results' || t === 'sync_flushed') {
         const res = await getExamResults();
+        // Selama di ruang ujian, hindari re-render App setiap 3.5 detik untuk progres in_progress rutin
+        // kecuali status ujian aktif berubah menjadi submitted/flagged.
+        if (routeRef.current === 'exam-room' && activeSessionRef.current && t === 'results') {
+          const curSess = activeSessionRef.current;
+          const matching = res.find(
+            (r) =>
+              r.id === curSess.resultId ||
+              (r.participantNumber.trim().toUpperCase() ===
+                curSess.participant.participantNumber.trim().toUpperCase() &&
+                r.examId === curSess.schedule.id)
+          );
+          if (
+            !matching ||
+            (matching.status === 'in_progress' && matching.submittedAt === null)
+          ) {
+            return;
+          }
+        }
         setResults((prev) => (prev === res ? prev : res));
       } else if (t === 'schedules' || t === 'schedules_admin_sync') {
         const scheds = await getExamSchedules();
@@ -303,15 +341,19 @@ export default function App() {
       await ensureInitialized();
       const savedInitial = getSavedActiveSession();
       if (isLiveSupabaseConfigured()) {
+        // syncFromSupabase sudah menarik hasil milik savedInitial.participant.participantNumber secara otomatis
         await syncFromSupabase({
           force: false,
           currentParticipantNumber: savedInitial?.participant.participantNumber,
         });
-        if (savedInitial?.participant.participantNumber) {
-          await syncStudentResultsFromCloud(savedInitial.participant.participantNumber);
-        }
       }
       await loadAllData();
+      if (isLiveSupabaseConfigured()) {
+        // Segera kirim ulang antrean hasil ujian lokal yang mungkin tertunda saat submit sebelumnya
+        window.setTimeout(() => {
+          void flushPendingSyncQueue();
+        }, 600 + Math.floor(Math.random() * 2200));
+      }
       const autoFinalizedCount = await autoFinalizeExpiredExams({
         currentParticipantNumber: savedInitial?.participant.participantNumber,
         isAdmin: false,
@@ -357,69 +399,62 @@ export default function App() {
       void loadAllData(topic);
     });
 
-    const cfgSync = getSupabaseConfig();
-    const intervalMs = Math.max(5, cfgSync.autoSyncIntervalSec || 25) * 1000;
-    const adminEffectiveIntervalMs = Math.max(25_000, intervalMs);
-    let lastStudentSyncAt = Date.now();
-    let lastAdminSyncAt = Date.now();
-    const syncInterval = window.setInterval(() => {
-      if (document.hidden) return;
-      const currentRoute = routeRef.current;
-      const isAdminRoute = currentRoute === 'admin';
-      const now = Date.now();
-      if (isAdminRoute) {
-        if (now - lastAdminSyncAt < adminEffectiveIntervalMs) return;
-        lastAdminSyncAt = now;
-      } else {
-        if (now - lastStudentSyncAt < Math.max(45_000, intervalMs)) return;
-        lastStudentSyncAt = now;
-      }
-      void (async () => {
-        await flushPendingSyncQueue();
-        // Selama berada di ExamRoom, status cloud (Reset/Paksa Selesai) sudah dipantau oleh checkLiveSessionStatusFromCloud
-        // sehingga tidak perlu mengunduh ulang jadwal/profil setiap siklus.
-        if (currentRoute === 'exam-room') {
-          return;
-        }
-        await syncFromSupabase({
-          currentParticipantNumber: activeSessionRef.current?.participant.participantNumber,
-          isAdmin: isAdminRoute,
-          resultsOnly: isAdminRoute,
-        });
-      })();
-    }, intervalMs);
-
-    const expiryInterval = window.setInterval(() => {
-      const isAdminRoute = routeRef.current === 'admin';
-      if (!isAdminRoute && !activeSessionRef.current) return;
-      void autoFinalizeExpiredExams({
-        currentParticipantNumber: activeSessionRef.current?.participant.participantNumber,
-        isAdmin: isAdminRoute,
-      });
-    }, 25_000);
-
+    // Tanpa polling berkala saat dashboard admin/proktor atau halaman login terbuka
+    // agar 804 siswa + 1 proktor tidak membebani database dengan kueri berulang.
+    // Pembaruan data dilakukan via event Realtime tertarget per tabel, tombol Sinkronisasi manual,
+    // atau pengiriman antrean lokal saat koneksi pulih.
+    let onlineJitterTimer: number | null = null;
     const onOnline = () => {
-      void (async () => {
-        await flushPendingSyncQueue();
-        await syncFromSupabase({
-          force: true,
-          currentParticipantNumber: activeSessionRef.current?.participant.participantNumber,
-          isAdmin: routeRef.current === 'admin',
-        });
-        await autoFinalizeExpiredExams({
-          currentParticipantNumber: activeSessionRef.current?.participant.participantNumber,
-          isAdmin: routeRef.current === 'admin',
-        });
-      })();
+      if (onlineJitterTimer !== null) {
+        window.clearTimeout(onlineJitterTimer);
+      }
+      // Sebarkan koneksi ulang 3 - 45 detik agar ratusan perangkat setelah gangguan Wi-Fi tidak membanjiri server serentak
+      const reconnectJitterMs =
+        routeRef.current === 'admin'
+          ? 800 + Math.floor(Math.random() * 1500)
+          : 3_000 + Math.floor(Math.random() * 42_000);
+      onlineJitterTimer = window.setTimeout(() => {
+        onlineJitterTimer = null;
+        void (async () => {
+          const isAdminRoute = routeRef.current === 'admin';
+          await syncServerClock(true);
+          await flushPendingSyncQueue();
+          // Jangan memicu full-table reload atau force sync saat koneksi pulih (online).
+          // Khusus portal Admin/Proktor, tarik delta exam_results saja (menghormati throttle cooldown).
+          if (isAdminRoute) {
+            await syncFromSupabase({
+              force: false,
+              isAdmin: true,
+              resultsOnly: true,
+            });
+          }
+        })();
+      }, reconnectJitterMs);
     };
     window.addEventListener('online', onOnline);
+
+    let hiddenSinceMs: number | null = null;
+    const onVisibilitySyncClock = () => {
+      if (document.hidden) {
+        hiddenSinceMs = Date.now();
+      } else {
+        const wasHiddenLong = hiddenSinceMs !== null && Date.now() - hiddenSinceMs > 15_000;
+        hiddenSinceMs = null;
+        if (wasHiddenLong && isLiveSupabaseConfigured()) {
+          void syncServerClock(true);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilitySyncClock);
 
     return () => {
       mounted = false;
       unsubscribe();
-      window.clearInterval(syncInterval);
-      window.clearInterval(expiryInterval);
+      if (onlineJitterTimer !== null) {
+        window.clearTimeout(onlineJitterTimer);
+      }
       window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisibilitySyncClock);
     };
   }, [loadAllData]);
 
@@ -448,17 +483,57 @@ export default function App() {
     }
   }, [route, activeSession, results]);
 
-  // Polling cloud status selama berada di ExamRoom untuk mendeteksi Reset Ujian / Paksa Selesai seketika
+  // Perbarui completedResult secara real-time saat antrean sync berhasil masuk ke cloud
   useEffect(() => {
-    if (route !== 'exam-room' || !activeSession || !isLiveSupabaseConfigured()) return;
+    if (route !== 'exam-completed' || !completedResult) return;
+    const updated = results.find(
+      (r) =>
+        r.id === completedResult.id ||
+        (r.participantNumber.trim().toUpperCase() ===
+          completedResult.participantNumber.trim().toUpperCase() &&
+          r.examId === completedResult.examId)
+    );
+    if (
+      updated &&
+      (updated.syncStatus !== completedResult.syncStatus ||
+        updated.score !== completedResult.score ||
+        updated.status !== completedResult.status)
+    ) {
+      setCompletedResult(updated);
+    }
+  }, [route, completedResult, results]);
+
+  // Polling cloud status selama berada di ExamRoom untuk mendeteksi Reset Ujian / Paksa Selesai seketika
+  const activeSessionId = activeSession?.resultId ?? null;
+  useEffect(() => {
+    if (route !== 'exam-room' || !activeSessionId || !isLiveSupabaseConfigured()) return;
     let active = true;
     const checkCloud = async () => {
-      if (document.hidden) return;
+      const currentSess = activeSessionRef.current;
+      if (
+        document.hidden ||
+        !currentSess ||
+        (typeof navigator !== 'undefined' && navigator.onLine === false)
+      ) {
+        return;
+      }
+      const checkedResultId = currentSess.resultId;
       const res = await checkLiveSessionStatusFromCloud(
-        activeSession.participant.participantNumber,
-        activeSession.schedule.id
+        currentSess.participant.participantNumber,
+        currentSess.schedule.id,
+        {
+          activeAnswers: currentSess.answers,
+          activeTabSwitchCount: currentSess.tabSwitchCount,
+          maxTabSwitches: currentSess.schedule.maxTabSwitches,
+        }
       );
-      if (!active) return;
+      if (!active || activeSessionRef.current?.resultId !== checkedResultId) return;
+      if (res.status === 'unsynced_local') {
+        // Baris awal belum terkonfirmasi masuk ke server (misal gagal saat puncak mulai ujian).
+        // Jangan hapus jawaban lokal — langsung coba kirim ulang ke server!
+        void upsertExamProgress(currentSess, { includeQuestionIds: true });
+        return;
+      }
       if (res.status === 'finalized' && res.result) {
         clearActiveSessionLocal();
         if (document.fullscreenElement && document.exitFullscreen) {
@@ -469,8 +544,8 @@ export default function App() {
         setRoute('exam-completed');
       } else if (res.status === 'reset_deleted') {
         await forceDeleteExamResultForReset(
-          activeSession.participant.participantNumber,
-          activeSession.schedule.id
+          currentSess.participant.participantNumber,
+          currentSess.schedule.id
         );
         clearActiveSessionLocal();
         if (document.fullscreenElement && document.exitFullscreen) {
@@ -478,14 +553,14 @@ export default function App() {
         }
         setActiveSession(null);
         setSessionNotice(
-          `Sesi ujian ${activeSession.schedule.subject} untuk peserta ${activeSession.participant.participantNumber} telah di-reset oleh Panitia / Proktor.`
+          `Sesi ujian ${currentSess.schedule.subject} untuk peserta ${currentSess.participant.participantNumber} telah di-reset oleh Panitia / Proktor.`
         );
         setRoute('student-login');
         void loadAllData('results');
       }
     };
 
-    const pollMs = 45_000 + Math.floor(Math.random() * 15_000);
+    const pollMs = 60_000 + Math.floor(Math.random() * 30_000);
     const timer = window.setInterval(() => {
       void checkCloud();
     }, pollMs);
@@ -494,7 +569,7 @@ export default function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [route, activeSession, loadAllData]);
+  }, [route, activeSessionId, loadAllData]);
 
   // Multi-table Supabase Realtime sync (diaktifkan khusus pada Portal Admin/Proktor agar 800+ siswa tidak terkena badai broadcast N^2)
   const isAdminRoute = route === 'admin';
@@ -505,28 +580,27 @@ export default function App() {
     const ADMIN_REALTIME_THROTTLE_MS = 25_000;
     let throttleTimer: number | null = null;
     let lastPullAt = 0;
-    let needsFullStaticPull = false;
+    const pendingTables = new Set<SyncTableScope>();
 
     const flushPull = () => {
       if (throttleTimer) {
         window.clearTimeout(throttleTimer);
         throttleTimer = null;
       }
+      if (pendingTables.size === 0) return;
       lastPullAt = Date.now();
-      const pullFull = needsFullStaticPull;
-      needsFullStaticPull = false;
+      const tablesToSync = Array.from(pendingTables);
+      pendingTables.clear();
+      // Tarik HANYA tabel konfigurasi yang benar-benar berubah (tanpa full-table reload atau menarik ulang exam_results).
       void syncFromSupabase({
-        force: pullFull,
-        currentParticipantNumber: activeSessionRef.current?.participant.participantNumber,
+        force: false,
         isAdmin: true,
-        resultsOnly: !pullFull,
+        tables: tablesToSync,
       });
     };
 
-    const triggerPull = (resultsOnly: boolean) => {
-      if (!resultsOnly) {
-        needsFullStaticPull = true;
-      }
+    const triggerPull = (tableScope: SyncTableScope) => {
+      pendingTables.add(tableScope);
       if (throttleTimer) return;
       const elapsed = Date.now() - lastPullAt;
       const delayMs =
@@ -537,37 +611,35 @@ export default function App() {
     };
 
     const schema = cfg.schema || 'public';
+    // exam_results sengaja tidak disubscribe lewat Realtime untuk mencegah badai WAL/broadcast
+    // saat 800+ siswa serentak; Dashboard Admin menerima pembaruan hasil via tombol Sinkronisasi manual / delta-sync.
     const channel = supabase
       .channel('cbt_admin_realtime')
-      .on('postgres_changes', { event: '*', schema, table: 'exam_results' }, (payload) => {
-        if (payload.eventType === 'DELETE' && payload.old && 'id' in payload.old) {
-          void deleteExamResultLocalById(String((payload.old as { id?: unknown }).id || ''));
-          return;
-        }
-        triggerPull(true);
-      })
       .on('postgres_changes', { event: '*', schema, table: 'exam_schedules' }, () =>
-        triggerPull(false)
+        triggerPull('schedules')
       )
       .on('postgres_changes', { event: '*', schema, table: 'participants' }, () =>
-        triggerPull(false)
+        triggerPull('participants')
       )
       .on('postgres_changes', { event: '*', schema, table: 'school_profile' }, () =>
-        triggerPull(false)
+        triggerPull('profile')
       )
       .on('postgres_changes', { event: '*', schema, table: 'staff_accounts' }, () =>
-        triggerPull(false)
+        triggerPull('staff_accounts')
       )
       .subscribe();
 
     return () => {
       if (throttleTimer) window.clearTimeout(throttleTimer);
+      pendingTables.clear();
       void supabase.removeChannel(channel);
     };
   }, [isAdminRoute]);
 
   const handleStartExam = async (participant: Participant, schedule: ExamSchedule) => {
     setSessionNotice('');
+    // Unduh chunk ruang ujian (ExamRoom + KaTeX) secara paralel selagi preflight server berjalan
+    void loadExamRoomModule();
     const preflight = await verifyStudentCanStartExam(
       participant.participantNumber,
       schedule.id
@@ -617,6 +689,11 @@ export default function App() {
         const rawStartedMs = new Date(lockCheck.result.startedAt).getTime();
         const startedMs = Number.isFinite(rawStartedMs) ? rawStartedMs : getServerNowMs();
 
+        const normalizedPNumber = normalizeParticipantNumber(freshParticipant.participantNumber);
+        const normalizedParticipant: Participant = {
+          ...freshParticipant,
+          participantNumber: normalizedPNumber,
+        };
         let orderedQuestions = safeQuestions;
         if (lockCheck.result.questionIds && lockCheck.result.questionIds.length > 0) {
           const byId = new Map(safeQuestions.map((q) => [q.id, q]));
@@ -640,21 +717,21 @@ export default function App() {
         } else if (freshSchedule.randomizeQuestions) {
           orderedQuestions = shuffleQuestionsForParticipant(
             safeQuestions,
-            `${freshParticipant.participantNumber.trim().toUpperCase()}::${freshSchedule.id}::${startedMs}`
+            `${normalizedPNumber}::${freshSchedule.id}::${startedMs}`
           );
         }
 
         const sessionQuestions = prepareMatchingForStudentSession(
           orderedQuestions,
-          `${freshParticipant.participantNumber.trim().toUpperCase()}::${freshSchedule.id}::${startedMs}`
+          `${normalizedPNumber}::${freshSchedule.id}::${startedMs}`
         );
         const endsAt = new Date(startedMs + freshSchedule.durationMinutes * 60 * 1000);
 
         const resumedSession: ActiveExamSession = {
           resultId:
             lockCheck.result.id ||
-            `res-${freshParticipant.participantNumber}-${freshSchedule.id}`,
-          participant: freshParticipant,
+            `res-${normalizedPNumber}-${freshSchedule.id}`,
+          participant: normalizedParticipant,
           schedule: freshSchedule,
           questions: sessionQuestions,
           answers: { ...(lockCheck.result.answers || {}) },
@@ -689,23 +766,28 @@ export default function App() {
 
     await syncServerClock(false);
     const serverNowMs = getServerNowMs();
+    const normalizedPNumber = normalizeParticipantNumber(freshParticipant.participantNumber);
+    const normalizedParticipant: Participant = {
+      ...freshParticipant,
+      participantNumber: normalizedPNumber,
+    };
 
     const orderedQuestions = freshSchedule.randomizeQuestions
       ? shuffleQuestionsForParticipant(
           safeQuestions,
-          `${freshParticipant.participantNumber.trim().toUpperCase()}::${freshSchedule.id}::${serverNowMs}`
+          `${normalizedPNumber}::${freshSchedule.id}::${serverNowMs}`
         )
       : safeQuestions;
 
     const sessionQuestions = prepareMatchingForStudentSession(
       orderedQuestions,
-      `${freshParticipant.participantNumber.trim().toUpperCase()}::${freshSchedule.id}::${serverNowMs}`
+      `${normalizedPNumber}::${freshSchedule.id}::${serverNowMs}`
     );
 
     const endsAt = new Date(serverNowMs + freshSchedule.durationMinutes * 60 * 1000);
     const session: ActiveExamSession = {
-      resultId: `res-${freshParticipant.participantNumber}-${freshSchedule.id}`,
-      participant: freshParticipant,
+      resultId: `res-${normalizedPNumber}-${freshSchedule.id}`,
+      participant: normalizedParticipant,
       schedule: freshSchedule,
       questions: sessionQuestions,
       answers: {},
@@ -723,27 +805,107 @@ export default function App() {
     setRoute('exam-room');
   };
 
-  const handleExamCompleted = (result: ExamResult) => {
-    setActiveSession(null);
-    setCompletedResult(result);
-    setRoute('exam-completed');
-    void loadAllData('results');
-  };
+  const handleExamCompleted = useCallback(
+    (result: ExamResult) => {
+      setActiveSession(null);
+      setCompletedResult(result);
+      setRoute('exam-completed');
+      void loadAllData('results');
+    },
+    [loadAllData]
+  );
+
+  const handleExamLocked = useCallback(
+    (lockedResult?: ExamResult) => {
+      clearActiveSessionLocal();
+      setActiveSession(null);
+      if (lockedResult) {
+        setSessionNotice(
+          `Ujian ${lockedResult.subject} terkunci otomatis karena melewati batas pelanggaran tab. Jawaban terakhir Anda telah disimpan & dinilai.`
+        );
+      }
+      setRoute('student-login');
+      void loadAllData('results');
+    },
+    [loadAllData]
+  );
 
   const handleForceSync = async () => {
     setIsSyncing(true);
     try {
+      const isAdmin = routeRef.current === 'admin';
       await flushPendingSyncQueue();
-      await syncFromSupabase({ force: true, isAdmin: routeRef.current === 'admin' });
+      await syncFromSupabase({ force: true, isAdmin, deltaPreferred: isAdmin });
+      if (isAdmin) {
+        await autoFinalizeExpiredExams({ isAdmin: true });
+      }
       await loadAllData();
     } finally {
       setIsSyncing(false);
     }
   };
 
+  const ADMIN_RESET_PASSWORD_SQL = `-- Ganti SANDI_BARU_ANDA dengan sandi admin yang diinginkan, lalu klik Run:
+UPDATE public.staff_accounts
+SET password_hash = 'sha256$' || encode(pg_catalog.sha256(convert_to('SANDI_BARU_ANDA', 'UTF8')), 'hex'),
+    is_active = TRUE
+WHERE LOWER(TRIM(user_id)) = 'admin';
+
+UPDATE public.school_profile
+SET admin_password = 'sha256$' || encode(pg_catalog.sha256(convert_to('SANDI_BARU_ANDA', 'UTF8')), 'hex'),
+    updated_at = NOW()
+WHERE id = 'default';`;
+
+  const copyRecoverySqlText = async (field: 'schema' | 'reset', text: string) => {
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+    if (!copied) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand('copy');
+        ta.remove();
+      } catch {
+        copied = false;
+      }
+    }
+    if (copied) {
+      setCopiedRecoveryField(field);
+      window.setTimeout(() => {
+        setCopiedRecoveryField((prev) => (prev === field ? null : prev));
+      }, 2500);
+    }
+  };
+
+  const handleDownloadRecoverySql = async () => {
+    const { SUPABASE_SCHEMA_SQL } = await import('@/src/lib/supabaseSchemaSql');
+    const blob = new Blob([SUPABASE_SCHEMA_SQL], { type: 'text/sql;charset=utf-8' });
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = 'nusantara-cbt-supabase-schema-rls.sql';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(downloadUrl);
+  };
+
   const handleAdminSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAdminPinError('');
+    setAdminSqlUpdateRequired(false);
     setIsAuthenticatingAdmin(true);
     try {
       const auth = await authenticateStaff(adminIdInput, adminPinInput);
@@ -754,6 +916,7 @@ export default function App() {
         setAdminIdInput('');
         setAdminPinInput('');
         setAdminPinError('');
+        setAdminSqlUpdateRequired(false);
         setSessionNotice('');
         setRoute('admin');
         if (isLiveSupabaseConfigured()) {
@@ -761,6 +924,7 @@ export default function App() {
         }
       } else {
         setAdminPinError(auth.message || 'ID atau Sandi Panitia tidak sesuai.');
+        setAdminSqlUpdateRequired(Boolean(auth.sqlUpdateRequired));
       }
     } finally {
       setIsAuthenticatingAdmin(false);
@@ -787,43 +951,57 @@ export default function App() {
           onStartExam={handleStartExam}
           onOpenAdmin={() => {
             setAdminPinError('');
+            setAdminSqlUpdateRequired(false);
             setShowAdminModal(true);
           }}
         />
       )}
 
       {route === 'exam-room' && activeSession && (
-        <ExamRoom
-          profile={profile}
-          initialSession={activeSession}
-          onExamCompleted={handleExamCompleted}
-          onExamLocked={(lockedResult) => {
-            clearActiveSessionLocal();
-            setActiveSession(null);
-            if (lockedResult) {
-              setSessionNotice(
-                `Ujian ${lockedResult.subject} terkunci otomatis karena melewati batas pelanggaran tab. Jawaban terakhir Anda telah disimpan & dinilai.`
-              );
-            }
-            setRoute('student-login');
-            void loadAllData('results');
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-700 text-sm font-medium">
+              Memuat ruang ujian...
+            </div>
+          }
+        >
+          <ExamRoom
+            profile={profile}
+            initialSession={activeSession}
+            onExamCompleted={handleExamCompleted}
+            onExamLocked={handleExamLocked}
+          />
+        </Suspense>
       )}
 
       {route === 'exam-completed' && completedResult && (
-        <ExamCompletedView
-          profile={profile}
-          result={completedResult}
-          onReturnLogin={() => {
-            setCompletedResult(null);
-            setRoute('student-login');
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-700 text-sm font-medium">
+              Memuat ringkasan hasil ujian...
+            </div>
+          }
+        >
+          <ExamCompletedView
+            profile={profile}
+            result={completedResult}
+            onReturnLogin={() => {
+              setCompletedResult(null);
+              setRoute('student-login');
+            }}
+          />
+        </Suspense>
       )}
 
       {route === 'admin' && currentStaff && (
-        <AdminConsole
+        <Suspense
+          fallback={
+            <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-700 text-sm font-medium">
+              Memuat Portal Admin &amp; Panitia...
+            </div>
+          }
+        >
+          <AdminConsole
           profile={profile}
           currentStaff={currentStaff}
           staffAccounts={staffAccounts}
@@ -834,9 +1012,10 @@ export default function App() {
           hiddenDashboardLogs={hiddenDashboardLogs}
           isSyncing={isSyncing}
           onForceSync={handleForceSync}
-          onSaveProfile={async (updated) => {
-            await saveSchoolProfile(updated);
+          onSaveProfile={async (updated, options) => {
+            const syncRes = await saveSchoolProfile(updated, options);
             await Promise.all([loadAllData('profile'), loadAllData('staff_accounts')]);
+            return syncRes;
           }}
           onUpsertParticipants={async (items) => {
             await upsertParticipants(items);
@@ -899,9 +1078,13 @@ export default function App() {
             await resetBulkExamResults(resultIds);
             await loadAllData('results');
           }}
-          onUpsertStaff={async (account) => {
-            const syncRes = await upsertStaffAccount(account);
-            await loadAllData('staff_accounts');
+          onUpsertStaff={async (account, options) => {
+            const syncRes = await upsertStaffAccount(account, options);
+            if (account.userId.trim().toLowerCase() === 'admin' && options?.updatePassword) {
+              await Promise.all([loadAllData('staff_accounts'), loadAllData('profile')]);
+            } else {
+              await loadAllData('staff_accounts');
+            }
             return syncRes;
           }}
           onDeleteStaff={async (id) => {
@@ -917,27 +1100,34 @@ export default function App() {
             setRoute('student-login');
           }}
         />
+        </Suspense>
       )}
 
       {/* Admin & Committee Role Login Modal */}
       {showAdminModal && (
         <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-white rounded-2xl border border-slate-200 shadow-2xl overflow-hidden">
-            <div className="bg-[#064e3b] px-5 py-4 text-white flex items-center justify-between">
+          <div className="w-full max-w-md max-h-[90vh] bg-white rounded-2xl border border-slate-200 shadow-2xl overflow-hidden flex flex-col">
+            <div className="bg-[#064e3b] px-5 py-4 text-white flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2 font-display font-bold text-base">
                 <Lock className="w-4 h-4 text-emerald-200" />
                 <span>Masuk Portal Admin &amp; Panitia</span>
               </div>
               <button
                 type="button"
-                onClick={() => setShowAdminModal(false)}
+                onClick={() => {
+                  setShowAdminModal(false);
+                  setAdminSqlUpdateRequired(false);
+                }}
                 className="p-1 rounded-lg hover:bg-white/10 text-emerald-100 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <form onSubmit={(e) => void handleAdminSubmit(e)} className="p-5 space-y-4">
+            <form
+              onSubmit={(e) => void handleAdminSubmit(e)}
+              className="p-5 space-y-4 overflow-y-auto"
+            >
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                   ID Role / Pengguna (Admin, Proktor, Guru Mapel)
@@ -952,6 +1142,7 @@ export default function App() {
                     onChange={(e) => {
                       setAdminIdInput(e.target.value);
                       setAdminPinError('');
+                      setAdminSqlUpdateRequired(false);
                     }}
                     placeholder="Masukkan ID Anda"
                     className="w-full pl-10 pr-3.5 py-2.5 rounded-xl border border-slate-300 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
@@ -977,8 +1168,75 @@ export default function App() {
               </div>
 
               {adminPinError && (
-                <div className="text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg p-2.5">
+                <div className="text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg p-2.5 leading-relaxed">
                   {adminPinError}
+                </div>
+              )}
+
+              {adminSqlUpdateRequired && (
+                <div className="rounded-xl bg-amber-50 border border-amber-300 p-3.5 space-y-2.5 text-amber-950">
+                  <div className="flex items-center gap-2 text-xs font-bold">
+                    <Database className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>Perbarui Skrip SQL Supabase Terlebih Dahulu</span>
+                  </div>
+                  <ol className="list-decimal pl-4 text-[11px] leading-relaxed space-y-1 text-amber-900">
+                    <li>Klik <strong>Salin Skrip SQL Terbaru</strong> atau <strong>Unduh .sql</strong> di bawah ini.</li>
+                    <li>Buka <strong>Supabase Dashboard → SQL Editor → + New query</strong>.</li>
+                    <li>Tempel seluruh skrip SQL lalu klik <strong>Run</strong>, kemudian coba login kembali.</li>
+                  </ol>
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void import('@/src/lib/supabaseSchemaSql').then(({ SUPABASE_SCHEMA_SQL }) =>
+                          copyRecoverySqlText('schema', SUPABASE_SCHEMA_SQL)
+                        )
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
+                    >
+                      {copiedRecoveryField === 'schema' ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {copiedRecoveryField === 'schema' ? 'Skrip SQL Tersalin' : 'Salin Skrip SQL Terbaru'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleDownloadRecoverySql()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-400 bg-white hover:bg-amber-100 text-amber-950 text-xs font-semibold cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Unduh .sql</span>
+                    </button>
+                  </div>
+
+                  <details className="pt-1 border-t border-amber-200/80 text-[11px]">
+                    <summary className="cursor-pointer font-semibold text-amber-900 hover:text-amber-950">
+                      Lupa sandi asli di balik hash database? (Reset via SQL Editor)
+                    </summary>
+                    <div className="mt-2 space-y-1.5">
+                      <pre className="p-2.5 rounded-lg bg-slate-950 text-emerald-100 font-mono text-[10px] overflow-x-auto leading-relaxed">
+                        {ADMIN_RESET_PASSWORD_SQL}
+                      </pre>
+                      <button
+                        type="button"
+                        onClick={() => void copyRecoverySqlText('reset', ADMIN_RESET_PASSWORD_SQL)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-[11px] font-semibold cursor-pointer"
+                      >
+                        {copiedRecoveryField === 'reset' ? (
+                          <Check className="w-3 h-3 text-emerald-700" />
+                        ) : (
+                          <Copy className="w-3 h-3" />
+                        )}
+                        <span>
+                          {copiedRecoveryField === 'reset' ? 'SQL Reset Tersalin' : 'Salin SQL Reset Sandi'}
+                        </span>
+                      </button>
+                    </div>
+                  </details>
                 </div>
               )}
 

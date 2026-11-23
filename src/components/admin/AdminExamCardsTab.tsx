@@ -155,8 +155,9 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
                   <div>
                     <div className="flex items-center justify-between gap-2 pb-1 border-b border-slate-800">
                       <img
-                        src={KEMENAG_LOGO_DATA_URL}
+                        src={profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL}
                         alt="Logo Kementerian Agama"
+                        referrerPolicy="no-referrer"
                         className="w-9 h-9 object-contain shrink-0"
                       />
                       <div className="min-w-0 flex-1 text-center">

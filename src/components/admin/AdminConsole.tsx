@@ -43,7 +43,10 @@ interface AdminConsoleProps {
   hiddenDashboardLogs: Record<string, string>;
   isSyncing: boolean;
   onForceSync: () => Promise<void>;
-  onSaveProfile: (updated: SchoolProfile) => Promise<void>;
+  onSaveProfile: (
+    updated: SchoolProfile,
+    options?: { updateAdminPassword?: boolean }
+  ) => Promise<{ synced: boolean; error?: string } | void>;
   onUpsertParticipants: (items: Participant[]) => Promise<void>;
   onDeleteParticipant: (id: string) => Promise<void>;
   onDeleteAllParticipants: () => Promise<void>;
@@ -58,7 +61,10 @@ interface AdminConsoleProps {
   onHideDashboardLogs: (items: Array<{ id: string; startedAt: string }>) => Promise<void>;
   onClearDashboardLogs: () => Promise<void>;
   onResetExamResults: (resultIds: string[]) => Promise<void>;
-  onUpsertStaff: (account: StaffAccount) => Promise<{ synced: boolean; error?: string } | void>;
+  onUpsertStaff: (
+    account: StaffAccount,
+    options?: { updatePassword?: boolean }
+  ) => Promise<{ synced: boolean; error?: string } | void>;
   onDeleteStaff: (id: string) => Promise<{ synced: boolean; error?: string } | void>;
   onRefreshAll: () => Promise<void>;
   onExitAdmin: () => void;

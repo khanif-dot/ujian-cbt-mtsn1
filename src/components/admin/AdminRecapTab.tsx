@@ -1560,7 +1560,7 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
                 <div className="space-y-3">
                   <div className="p-3 rounded-xl bg-sky-50 border border-sky-200 text-xs text-sky-950 leading-relaxed">
                     <strong>Format Pra-Pelaksanaan Ujian:</strong> Berita Acara otomatis memuat identitas lembaga, jumlah peserta terdaftar (
-                    <strong className="font-mono">{docTargetParticipants.length} orang</strong>), kolom isian kosong untuk jumlah hadir/tidak hadir &amp; nomor peserta yang tidak hadir, kotak catatan pengawas, serta kolom tanda tangan Pengawas, Proktor, Ketua Panitia, dan Kepala Sekolah.
+                    <strong className="font-mono">{docTargetParticipants.length} orang</strong>), kolom isian kosong untuk jumlah hadir/tidak hadir &amp; nomor peserta yang tidak hadir, kotak catatan pengawas, serta kolom tanda tangan Pengawas, Proktor, dan Mengetahui Ketua Panitia Ujian.
                   </div>
                   <div>
                     <label className="block text-xs font-semibold text-slate-700 mb-1">

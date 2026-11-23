@@ -78,6 +78,7 @@ export const SEED_SCHOOL_PROFILE: SchoolProfile = {
   committeeChairName: 'Siti Rahmawati, S.Pd., M.Si.',
   examTitle: 'Penilaian Akhir Semester (PAS) Ganjil',
   logoDataUrl: DEFAULT_LOGO_DATA_URL,
+  kemenagLogoDataUrl: KEMENAG_LOGO_DATA_URL,
   adminPassword: 'admin123',
   updatedAt: '2026-11-15T07:00:00.000Z',
 };

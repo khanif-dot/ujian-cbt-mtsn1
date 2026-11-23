@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { Check, ImagePlus, KeyRound, RotateCcw, Save } from 'lucide-react';
+import { AlertTriangle, Check, ImagePlus, KeyRound, RotateCcw, Save } from 'lucide-react';
 import { compressLogoImage } from '@/src/lib/importers';
-import { DEFAULT_LOGO_DATA_URL } from '@/src/lib/seedData';
+import { DEFAULT_LOGO_DATA_URL, KEMENAG_LOGO_DATA_URL } from '@/src/lib/seedData';
 import type { SchoolProfile } from '@/src/types/cbt';
-import { verifyPassword } from '@/src/lib/dataStore';
+import { verifyStaffPassword } from '@/src/lib/dataStore';
 import {
   clearPersistedValue,
   readPersistedValue,
@@ -12,38 +12,89 @@ import {
 
 interface AdminBrandingTabProps {
   profile: SchoolProfile;
-  onSaveProfile: (updated: SchoolProfile) => Promise<void>;
+  onSaveProfile: (
+    updated: SchoolProfile,
+    options?: { updateAdminPassword?: boolean }
+  ) => Promise<{ synced: boolean; error?: string } | void>;
 }
 
 export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
   profile,
   onSaveProfile,
 }) => {
+  const hasDraftForCurrentProfile = React.useMemo(() => {
+    const draft = readPersistedValue<{ baseUpdatedAt: string; data: SchoolProfile } | null>(
+      'cbt_draft_branding_v1',
+      null
+    );
+    return Boolean(draft && draft.baseUpdatedAt === profile.updatedAt);
+  }, [profile.updatedAt]);
+
   const [form, setForm] = useState<SchoolProfile>(() => {
     const draft = readPersistedValue<{ baseUpdatedAt: string; data: SchoolProfile } | null>(
       'cbt_draft_branding_v1',
       null
     );
     if (draft && draft.baseUpdatedAt === profile.updatedAt) {
-      return draft.data;
+      return {
+        ...draft.data,
+        kemenagLogoDataUrl: draft.data.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL,
+      };
     }
-    return profile;
+    return {
+      ...profile,
+      kemenagLogoDataUrl: profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL,
+    };
   });
+  const lastSyncedProfileSigRef = React.useRef(
+    `${profile.updatedAt}|${profile.logoDataUrl}|${profile.kemenagLogoDataUrl || ''}`
+  );
+  const isDirtyRef = React.useRef(hasDraftForCurrentProfile);
   const [isSaving, setIsSaving] = useState(false);
-  const [savedNotice, setSavedNotice] = useState('');
+  const [savedNotice, setSavedNotice] = useState<{ ok: boolean; msg: string } | null>(null);
   const [uploadError, setUploadError] = useState('');
+  const [kemenagUploadError, setKemenagUploadError] = useState('');
 
   React.useEffect(() => {
+    const nextSig = `${profile.updatedAt}|${profile.logoDataUrl}|${profile.kemenagLogoDataUrl || ''}`;
+    if (nextSig !== lastSyncedProfileSigRef.current) {
+      lastSyncedProfileSigRef.current = nextSig;
+      if (!isDirtyRef.current) {
+        setForm({
+          ...profile,
+          kemenagLogoDataUrl: profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL,
+        });
+      }
+    }
+  }, [profile]);
+
+  React.useEffect(() => {
+    const isSameAsProp =
+      form.schoolName === profile.schoolName &&
+      form.address === profile.address &&
+      form.academicYear === profile.academicYear &&
+      form.principalName === profile.principalName &&
+      form.committeeChairName === profile.committeeChairName &&
+      form.examTitle === profile.examTitle &&
+      form.logoDataUrl === profile.logoDataUrl &&
+      (form.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL) ===
+        (profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL);
+    isDirtyRef.current = !isSameAsProp;
+    if (isSameAsProp) {
+      clearPersistedValue('cbt_draft_branding_v1');
+      return;
+    }
     writePersistedValue('cbt_draft_branding_v1', {
       baseUpdatedAt: profile.updatedAt,
       data: form,
     });
-  }, [form, profile.updatedAt]);
+  }, [form, profile]);
 
   // Admin Password Change State
   const [currentPwd, setCurrentPwd] = useState('');
   const [newPwd, setNewPwd] = useState('');
   const [confirmPwd, setConfirmPwd] = useState('');
+  const [isSavingPwd, setIsSavingPwd] = useState(false);
   const [pwdFeedback, setPwdFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
 
   const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -57,17 +108,51 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
       setUploadError(
         err instanceof Error ? err.message : 'Gagal memproses gambar logo.'
       );
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleKemenagLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setKemenagUploadError('');
+    try {
+      const compressed = await compressLogoImage(file, 240);
+      setForm((prev) => ({ ...prev, kemenagLogoDataUrl: compressed }));
+    } catch (err) {
+      setKemenagUploadError(
+        err instanceof Error ? err.message : 'Gagal memproses gambar logo Kementerian Agama.'
+      );
+    } finally {
+      e.target.value = '';
     }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
-    setSavedNotice('');
+    setSavedNotice(null);
     try {
-      await onSaveProfile({ ...form, adminPassword: profile.adminPassword || 'admin123' });
+      const syncRes = await onSaveProfile(form, { updateAdminPassword: false });
+      isDirtyRef.current = false;
       clearPersistedValue('cbt_draft_branding_v1');
-      setSavedNotice('Profil sekolah & logo berhasil disimpan dan langsung diperbarui ke seluruh tampilan.');
+      if (syncRes?.error) {
+        setSavedNotice({
+          ok: false,
+          msg: `Profil sekolah disimpan lokal, namun gagal sinkron ke Cloud (${syncRes.error}).`,
+        });
+      } else if (syncRes?.synced) {
+        setSavedNotice({
+          ok: true,
+          msg: 'Profil sekolah & logo berhasil disimpan dan tersinkron ke semua perangkat.',
+        });
+      } else {
+        setSavedNotice({
+          ok: true,
+          msg: 'Profil sekolah & logo berhasil disimpan dan langsung diperbarui ke seluruh tampilan.',
+        });
+      }
     } finally {
       setIsSaving(false);
     }
@@ -76,29 +161,45 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
   const handlePasswordChange = async (e: React.FormEvent) => {
     e.preventDefault();
     setPwdFeedback(null);
-    const activePwd = profile.adminPassword || 'admin123';
+    setIsSavingPwd(true);
+    try {
+      const validCurrent = await verifyStaffPassword('admin', currentPwd);
+      if (!validCurrent) {
+        setPwdFeedback({ type: 'err', msg: 'Sandi admin saat ini tidak sesuai.' });
+        return;
+      }
+      if (newPwd.trim().length < 4) {
+        setPwdFeedback({ type: 'err', msg: 'Sandi baru minimal terdiri dari 4 karakter.' });
+        return;
+      }
+      if (newPwd !== confirmPwd) {
+        setPwdFeedback({ type: 'err', msg: 'Konfirmasi sandi baru tidak cocok.' });
+        return;
+      }
 
-    if (!(await verifyPassword(currentPwd, activePwd))) {
-      setPwdFeedback({ type: 'err', msg: 'Sandi admin saat ini tidak sesuai.' });
-      return;
+      const syncRes = await onSaveProfile(
+        { ...profile, adminPassword: newPwd.trim() },
+        { updateAdminPassword: true }
+      );
+      if (syncRes?.error) {
+        setPwdFeedback({
+          type: 'err',
+          msg: `Sandi tersimpan di perangkat ini, namun GAGAL sinkron ke Supabase Cloud (${syncRes.error}). Pastikan koneksi aktif dan skema SQL terbaru telah dijalankan.`,
+        });
+        return;
+      }
+      setCurrentPwd('');
+      setNewPwd('');
+      setConfirmPwd('');
+      setPwdFeedback({
+        type: 'ok',
+        msg: syncRes?.synced
+          ? 'Sandi admin berhasil diperbarui dan tersinkron ke Database Cloud (aktif di semua perangkat).'
+          : 'Sandi admin berhasil diperbarui di perangkat ini.',
+      });
+    } finally {
+      setIsSavingPwd(false);
     }
-    if (newPwd.trim().length < 4) {
-      setPwdFeedback({ type: 'err', msg: 'Sandi baru minimal terdiri dari 4 karakter.' });
-      return;
-    }
-    if (newPwd !== confirmPwd) {
-      setPwdFeedback({ type: 'err', msg: 'Konfirmasi sandi baru tidak cocok.' });
-      return;
-    }
-
-    await onSaveProfile({ ...profile, adminPassword: newPwd.trim() });
-    setCurrentPwd('');
-    setNewPwd('');
-    setConfirmPwd('');
-    setPwdFeedback({
-      type: 'ok',
-      msg: 'Sandi admin berhasil diperbarui dan langsung aktif untuk login berikutnya.',
-    });
   };
 
   return (
@@ -108,49 +209,101 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
           Profil Lembaga &amp; Pengaturan Sandi
         </h1>
         <p className="text-sm text-slate-600 mt-0.5">
-          Identitas sekolah, logo terkompresi untuk header &amp; halaman login, serta pengaturan ubah sandi administrator.
+          Identitas lembaga, logo Kementerian Agama (Kop Kiri) &amp; logo sekolah/madrasah (Kop Kanan &amp; Header), serta pengaturan ubah sandi administrator.
         </p>
       </div>
 
       {/* School Profile Form */}
       <form onSubmit={handleSubmit} className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-center gap-5 pb-6 border-b border-slate-100">
-          <div className="w-28 h-28 flex items-center justify-center shrink-0">
-            <img
-              src={form.logoDataUrl || DEFAULT_LOGO_DATA_URL}
-              alt="Pratinjau Logo Sekolah"
-              referrerPolicy="no-referrer"
-              className="w-full h-full object-contain"
-            />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 pb-6 border-b border-slate-100">
+          {/* Logo Kementerian Agama (Kop Kiri) */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 flex flex-col sm:flex-row sm:items-center gap-4">
+            <div className="w-24 h-24 rounded-xl bg-white border border-slate-200 p-2 flex items-center justify-center shrink-0">
+              <img
+                src={form.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL}
+                alt="Pratinjau Logo Kementerian Agama"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-contain"
+              />
+            </div>
+
+            <div className="space-y-2 flex-1 min-w-0">
+              <div className="font-semibold text-slate-900 text-sm">
+                Logo Kementerian Agama <span className="text-emerald-800 font-medium">(Kop Kiri)</span>
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Digunakan sebagai sumber logo KOP bagian kiri pada seluruh administrasi (Kartu Peserta, Rekap Nilai, Daftar Hadir, dan Berita Acara). Kompresi otomatis maks. 240×240 px.
+              </p>
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-semibold cursor-pointer transition-colors">
+                  <ImagePlus className="w-3.5 h-3.5" />
+                  <span>Unggah Logo Kemenag</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleKemenagLogoUpload}
+                    className="sr-only"
+                  />
+                </label>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setForm((prev) => ({ ...prev, kemenagLogoDataUrl: KEMENAG_LOGO_DATA_URL }))
+                  }
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold cursor-pointer transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Default</span>
+                </button>
+              </div>
+              {kemenagUploadError && (
+                <p className="text-xs text-red-700 font-medium">{kemenagUploadError}</p>
+              )}
+            </div>
           </div>
 
-          <div className="space-y-2 flex-1">
-            <div className="font-semibold text-slate-900 text-sm">Logo Sekolah / Madrasah</div>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              Mendukung PNG, JPG, atau WebP. Sistem mengompresi gambar otomatis hingga 240×240 px agar ringan diakses serentak oleh ribuan peserta.
-            </p>
-            <div className="flex flex-wrap items-center gap-2.5 pt-1">
-              <label className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-semibold cursor-pointer transition-colors">
-                <ImagePlus className="w-4 h-4" />
-                <span>Unggah Logo Baru</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleLogoUpload}
-                  className="sr-only"
-                />
-              </label>
-
-              <button
-                type="button"
-                onClick={() => setForm((prev) => ({ ...prev, logoDataUrl: DEFAULT_LOGO_DATA_URL }))}
-                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 text-xs font-semibold cursor-pointer transition-colors"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Gunakan Logo Default</span>
-              </button>
+          {/* Logo Sekolah / Madrasah (Kop Kanan & Header) */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 flex flex-col sm:flex-row sm:items-center gap-4">
+            <div className="w-24 h-24 rounded-xl bg-white border border-slate-200 p-2 flex items-center justify-center shrink-0">
+              <img
+                src={form.logoDataUrl || DEFAULT_LOGO_DATA_URL}
+                alt="Pratinjau Logo Sekolah"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-contain"
+              />
             </div>
-            {uploadError && <p className="text-xs text-red-700 font-medium">{uploadError}</p>}
+
+            <div className="space-y-2 flex-1 min-w-0">
+              <div className="font-semibold text-slate-900 text-sm">
+                Logo Sekolah / Madrasah <span className="text-emerald-800 font-medium">(Kop Kanan &amp; Header)</span>
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Digunakan untuk logo KOP bagian kanan administrasi, header aplikasi, dan halaman login. Mendukung PNG, JPG, atau WebP (kompresi otomatis maks. 240×240 px).
+              </p>
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-semibold cursor-pointer transition-colors">
+                  <ImagePlus className="w-3.5 h-3.5" />
+                  <span>Unggah Logo Sekolah</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleLogoUpload}
+                    className="sr-only"
+                  />
+                </label>
+
+                <button
+                  type="button"
+                  onClick={() => setForm((prev) => ({ ...prev, logoDataUrl: DEFAULT_LOGO_DATA_URL }))}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold cursor-pointer transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Default</span>
+                </button>
+              </div>
+              {uploadError && <p className="text-xs text-red-700 font-medium">{uploadError}</p>}
+            </div>
           </div>
         </div>
 
@@ -222,7 +375,7 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
 
           <div>
             <label className="block text-sm font-semibold text-slate-800 mb-1.5">
-              Nama Ketua Panitia Ujian (Tanda Tangan Kartu)
+              Nama Ketua Panitia Ujian (Tanda Tangan Administrasi &amp; Kartu)
             </label>
             <input
               type="text"
@@ -235,9 +388,19 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
         </div>
 
         {savedNotice && (
-          <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center gap-2">
-            <Check className="w-4 h-4 text-emerald-700 shrink-0" />
-            <span>{savedNotice}</span>
+          <div
+            className={`p-3.5 rounded-xl border text-sm flex items-center gap-2 ${
+              savedNotice.ok
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                : 'bg-amber-50 border-amber-300 text-amber-950'
+            }`}
+          >
+            {savedNotice.ok ? (
+              <Check className="w-4 h-4 text-emerald-700 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+            )}
+            <span>{savedNotice.msg}</span>
           </div>
         )}
 
@@ -329,10 +492,11 @@ export const AdminBrandingTab: React.FC<AdminBrandingTabProps> = ({
         <div className="flex justify-end">
           <button
             type="submit"
-            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold transition-colors cursor-pointer"
+            disabled={isSavingPwd}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold transition-colors cursor-pointer disabled:opacity-60"
           >
             <KeyRound className="w-4 h-4" />
-            <span>Simpan Sandi Baru</span>
+            <span>{isSavingPwd ? 'Menyimpan...' : 'Simpan Sandi Baru'}</span>
           </button>
         </div>
       </form>

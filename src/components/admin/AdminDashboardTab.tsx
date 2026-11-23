@@ -16,7 +16,8 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { autoFinalizeExpiredExams } from '@/src/lib/dataStore';
+import { autoFinalizeExpiredExams, getServerNowMs } from '@/src/lib/dataStore';
+import { countAnsweredEntries } from '@/src/lib/questionUtils';
 import {
   ALL_CLASSES,
   type ExamResult,
@@ -86,14 +87,14 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
   const [isFinishing, setIsFinishing] = useState(false);
 
   const [feedback, setFeedback] = useState('');
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [nowMs, setNowMs] = useState(() => getServerNowMs());
   const [listPage, setListPage] = useState(1);
   const [showAllRows, setShowAllRows] = useState(false);
 
   useEffect(() => {
     void autoFinalizeExpiredExams({ isAdmin: true });
     const timer = window.setInterval(() => {
-      setNowMs(Date.now());
+      setNowMs(getServerNowMs());
     }, 25_000);
     return () => window.clearInterval(timer);
   }, []);
@@ -740,7 +741,7 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
                 </tr>
               ) : (
                 displayedResults.map((res) => {
-                  const answeredCount = Object.keys(res.answers || {}).length;
+                  const answeredCount = countAnsweredEntries(res.answers);
                   const pct =
                     res.totalQuestions > 0
                       ? Math.round((answeredCount / res.totalQuestions) * 100)

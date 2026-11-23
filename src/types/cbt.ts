@@ -75,6 +75,7 @@ export interface SchoolProfile {
   committeeChairName: string;
   examTitle: string;
   logoDataUrl: string;
+  kemenagLogoDataUrl?: string;
   adminPassword: string;
   updatedAt: string;
 }

@@ -30,7 +30,6 @@ import {
 import {
   DEFAULT_SUPABASE_ANON_KEY,
   DEFAULT_SUPABASE_URL,
-  SUPABASE_SCHEMA_SQL,
   clearRuntimeServiceRoleKey,
   decodeJwtPayload,
   extractProjectRef,
@@ -41,6 +40,7 @@ import {
   saveSupabaseConfig,
   validateServiceRoleKey,
 } from '@/src/lib/supabase';
+import { SUPABASE_SCHEMA_SQL } from '@/src/lib/supabaseSchemaSql';
 import {
   type SyncOperationReport,
   type SyncTableStats,
@@ -90,7 +90,7 @@ const SETUP_GUIDE_STEPS: GuideStep[] = [
       'Pilih Region terdekat, disarankan "Southeast Asia (Singapore / ap-southeast-1)" agar latensi siswa saat ujian serentak minimal.',
       'Klik "Create new project" dan tunggu ±1–2 menit hingga status project berubah menjadi Active.',
     ],
-    note: 'Satu project Free Tier Supabase sudah mendukung ratusan ribu request REST/RPC dan Realtime WebSocket untuk ujian sekolah.',
+    note: 'Untuk simulasi kecil/uji coba Free Tier sudah cukup; namun untuk ujian serentak 800–1.000+ siswa disarankan Supabase Pro dengan compute minimal Small–Medium agar tidak terkena antrean koneksi atau pembatasan CPU/IOPS.',
   },
   {
     id: 'step_keys',
@@ -129,15 +129,15 @@ const SETUP_GUIDE_STEPS: GuideStep[] = [
   {
     id: 'step_realtime',
     stepNumber: 4,
-    title: 'Aktifkan Realtime Replication untuk Monitoring Live',
-    subtitle: 'Pembaruan otomatis progres, skor, & sinkronisasi role/akses antar perangkat',
+    title: 'Konfigurasi Realtime Replication Skala Besar',
+    subtitle: 'Sinkronisasi konfigurasi/jadwal instan tanpa membebani WAL database saat 800+ siswa ujian',
     estimatedTime: '1 menit',
     instructions: [
       'Di dashboard Supabase, buka menu kiri "Database" → pilih "Publications" (atau "Replication").',
       'Klik publication bernama "supabase_realtime".',
-      'Aktifkan toggle (ON) untuk tabel "exam_results" agar dashboard pengawas menerima event INSERT/UPDATE seketika saat siswa menjawab atau berpindah tab.',
-      '(Disarankan) Aktifkan juga toggle untuk "exam_schedules", "participants", "school_profile", dan "staff_accounts" agar perubahan role, sandi, dan jadwal langsung tersinkron ke semua perangkat.',
-      'Pastikan opsi "Aktifkan Realtime WebSocket" pada Parameter Kredensial API dalam kondisi aktif.',
+      'Biarkan tabel "exam_results" dalam kondisi NONAKTIF (OFF) untuk mencegah lonjakan beban WAL/broadcast saat ratusan siswa menyimpan jawaban serentak (Dashboard Admin menggunakan delta-sync ringan berkala).',
+      '(Disarankan) Aktifkan toggle (ON) untuk "exam_schedules", "participants", "school_profile", dan "staff_accounts" agar perubahan jadwal, token, dan role langsung tersinkron ke semua perangkat.',
+      'Skrip SQL terbaru juga otomatis mengeluarkan tabel exam_results dari publication supabase_realtime saat dijalankan.',
     ],
   },
   {

@@ -21,6 +21,8 @@ import {
   getServerNowMs,
   lockoutExamSession,
   saveActiveSessionLocal,
+  saveLocalResultProgressSnapshot,
+  subscribeDataChanges,
   submitFinalExam,
   upsertExamProgress,
 } from '@/src/lib/dataStore';
@@ -75,6 +77,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const [showNavDrawer, setShowNavDrawer] = useState(false);
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitProgressText, setSubmitProgressText] = useState('');
+  const [isExpiryQueueing, setIsExpiryQueueing] = useState(false);
+  const [expiryQueueSecondsLeft, setExpiryQueueSecondsLeft] = useState(0);
+  const [submitErrorMsg, setSubmitErrorMsg] = useState('');
   const [isFinalizingLockout, setIsFinalizingLockout] = useState(false);
   const [lockedResult, setLockedResult] = useState<ExamResult | undefined>(undefined);
   const [cheatWarningOpen, setCheatWarningOpen] = useState(false);
@@ -94,8 +100,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const unloadResetTimerRef = useRef<number | null>(null);
   const blurTimerRef = useRef<number | null>(null);
   const progressTimerRef = useRef<number | null>(null);
+  const firstDirtyProgressTsRef = useRef<number | null>(null);
+  const navSaveTimerRef = useRef<number | null>(null);
   const expiryPendingRef = useRef(false);
   const expiryJitterTimerRef = useRef<number | null>(null);
+  const expiryCountdownIntervalRef = useRef<number | null>(null);
   const lockedRef = useRef(isViolationLocked);
   lockedRef.current = isViolationLocked;
   const lockoutPromiseRef = useRef<Promise<ExamResult> | null>(null);
@@ -150,11 +159,24 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       window.clearTimeout(progressTimerRef.current);
       progressTimerRef.current = null;
     }
+    firstDirtyProgressTsRef.current = null;
+  }, []);
+
+  const clearPendingNavSaveTimer = useCallback(() => {
+    if (navSaveTimerRef.current !== null) {
+      window.clearTimeout(navSaveTimerRef.current);
+      navSaveTimerRef.current = null;
+    }
   }, []);
 
   const triggerLockoutFinalize = useCallback(
     (lockedSession: ActiveExamSession) => {
+      if (expiryJitterTimerRef.current !== null) {
+        window.clearTimeout(expiryJitterTimerRef.current);
+        expiryJitterTimerRef.current = null;
+      }
       clearPendingProgressTimer();
+      clearPendingNavSaveTimer();
       if (lockoutPromiseRef.current) return lockoutPromiseRef.current;
       setIsFinalizingLockout(true);
       const p = lockoutExamSession(lockedSession)
@@ -168,30 +190,68 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       lockoutPromiseRef.current = p;
       return p;
     },
-    [clearPendingProgressTimer]
+    [clearPendingNavSaveTimer, clearPendingProgressTimer]
   );
 
   const handleFinalizeExam = useCallback(async () => {
     if (submittingRef.current || lockedRef.current) return;
+    if (expiryJitterTimerRef.current !== null) {
+      window.clearTimeout(expiryJitterTimerRef.current);
+      expiryJitterTimerRef.current = null;
+    }
     clearPendingProgressTimer();
+    clearPendingNavSaveTimer();
     submittingRef.current = true;
     setIsSubmitting(true);
+    setSubmitErrorMsg('');
+    setSubmitProgressText('Menyimpan jawaban lokal...');
     try {
-      const result = await submitFinalExam(sessionRef.current);
+      // Ambil salinan snapshot jawaban terbaru langsung dari memori (sessionRef.current)
+      // dan simpan lokal segera sebelum mengirim ke server.
+      const currentMemSession = sessionRef.current;
+      const latestSessionSnapshot: ActiveExamSession = {
+        ...currentMemSession,
+        answers: { ...currentMemSession.answers },
+        flaggedQuestions: [...currentMemSession.flaggedQuestions],
+      };
+      saveActiveSessionLocal(latestSessionSnapshot);
+
+      const result = await submitFinalExam(latestSessionSnapshot, {
+        skipInitialJitter: expiryPendingRef.current,
+        onProgress: (msg) => setSubmitProgressText(msg),
+      });
+      // Jangan biarkan exitFullscreen() yang menggantung di WebView/Exam Browser menahan perpindahan ke layar selesai
       if (document.fullscreenElement && document.exitFullscreen) {
         try {
-          await document.exitFullscreen();
+          await Promise.race([
+            document.exitFullscreen().catch(() => {}),
+            new Promise((r) => window.setTimeout(r, 400)),
+          ]);
         } catch {
           // Ignore fullscreen exit rejection
         }
       }
       onExamCompleted(result);
+    } catch (err) {
+      submittingRef.current = false;
+      expiryPendingRef.current = false;
+      setIsExpiryQueueing(false);
+      setSubmitProgressText('');
+      setSubmitErrorMsg(
+        err instanceof Error
+          ? err.message
+          : 'Gagal mengumpulkan ujian. Silakan tekan tombol kirim ulang.'
+      );
     } finally {
       setIsSubmitting(false);
     }
-  }, [clearPendingProgressTimer, onExamCompleted]);
+  }, [clearPendingNavSaveTimer, clearPendingProgressTimer, onExamCompleted]);
 
-  // Countdown timer synced to server clock & clamped to startedAt + durationMinutes
+  const handleFinalizeExamRef = useRef(handleFinalizeExam);
+  handleFinalizeExamRef.current = handleFinalizeExam;
+
+  // Countdown timer synced to monotonic server clock & clamped to startedAt + durationMinutes.
+  // Sengaja hanya bergantung pada isViolationLocked agar timer antrean auto-submit tidak pernah terbatalkan oleh re-render induk.
   useEffect(() => {
     if (isViolationLocked) return;
 
@@ -202,12 +262,46 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       setRemainingSeconds(left);
       if (left <= 0) {
         if (!submittingRef.current && !expiryPendingRef.current) {
+          // Batalkan timer/debounce autosave & nav-save tertunda seketika agar tidak berbenturan
+          // dengan proses flush akhir, lalu amankan snapshot memori terbaru ke penyimpanan lokal
+          // (active_session, backup localStorage sinkron, DAN exam_results lokal).
+          clearPendingProgressTimer();
+          clearPendingNavSaveTimer();
+          const finalSnapshot: ActiveExamSession = {
+            ...sessionRef.current,
+            answers: { ...sessionRef.current.answers },
+            flaggedQuestions: [...sessionRef.current.flaggedQuestions],
+          };
+          saveActiveSessionLocal(finalSnapshot);
+          void saveLocalResultProgressSnapshot(finalSnapshot).catch(() => {});
+
           expiryPendingRef.current = true;
-          setIsSubmitting(true);
-          const jitterMs = Math.floor(Math.random() * 45_000);
+          setIsExpiryQueueing(true);
+          setShowSubmitModal(false);
+          // Sebarkan expiryJitter 2 - 30 detik agar 800-1.000 siswa merata sambil tetap selesai
+          // jauh sebelum EXPIRY_GRACE_MS (75s) & ADMIN_EXPIRY_GRACE_MS (300s) meski dengan retry submit.
+          const jitterMs = 2_000 + Math.floor(Math.random() * 28_000);
+          const scheduledAtMs = Date.now() + jitterMs;
+          setExpiryQueueSecondsLeft(Math.max(1, Math.ceil(jitterMs / 1000)));
+          if (expiryCountdownIntervalRef.current !== null) {
+            window.clearInterval(expiryCountdownIntervalRef.current);
+          }
+          expiryCountdownIntervalRef.current = window.setInterval(() => {
+            const secs = Math.max(0, Math.ceil((scheduledAtMs - Date.now()) / 1000));
+            setExpiryQueueSecondsLeft(secs);
+            if (secs <= 0 && expiryCountdownIntervalRef.current !== null) {
+              window.clearInterval(expiryCountdownIntervalRef.current);
+              expiryCountdownIntervalRef.current = null;
+            }
+          }, 500);
           expiryJitterTimerRef.current = window.setTimeout(() => {
             expiryJitterTimerRef.current = null;
-            void handleFinalizeExam();
+            if (expiryCountdownIntervalRef.current !== null) {
+              window.clearInterval(expiryCountdownIntervalRef.current);
+              expiryCountdownIntervalRef.current = null;
+            }
+            setExpiryQueueSecondsLeft(0);
+            void handleFinalizeExamRef.current();
           }, jitterMs);
         }
         return true;
@@ -220,6 +314,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         if (expiryJitterTimerRef.current !== null) {
           window.clearTimeout(expiryJitterTimerRef.current);
           expiryJitterTimerRef.current = null;
+          expiryPendingRef.current = false;
+        }
+        if (expiryCountdownIntervalRef.current !== null) {
+          window.clearInterval(expiryCountdownIntervalRef.current);
+          expiryCountdownIntervalRef.current = null;
         }
       };
     }
@@ -234,9 +333,14 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       if (expiryJitterTimerRef.current !== null) {
         window.clearTimeout(expiryJitterTimerRef.current);
         expiryJitterTimerRef.current = null;
+        expiryPendingRef.current = false;
+      }
+      if (expiryCountdownIntervalRef.current !== null) {
+        window.clearInterval(expiryCountdownIntervalRef.current);
+        expiryCountdownIntervalRef.current = null;
       }
     };
-  }, [handleFinalizeExam, isViolationLocked]);
+  }, [isViolationLocked, clearPendingProgressTimer, clearPendingNavSaveTimer]);
 
   // Protect active exam from accidental browser refresh & clean up timers
   useEffect(() => {
@@ -254,8 +358,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         unloadResetTimerRef.current = null;
       }, 2000);
 
-      if (!submittingRef.current && !lockedRef.current) {
-        flushExamProgressKeepalive(sessionRef.current);
+      if (!lockedRef.current) {
+        if (!submittingRef.current) {
+          flushExamProgressKeepalive(sessionRef.current);
+        }
+        // Tetap tahan penutupan tab mendadak baik saat mengerjakan maupun saat proses kirim akhir berlangsung
         e.preventDefault();
         e.returnValue = '';
       }
@@ -272,14 +379,30 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       }
     };
 
+    const handleOffline = () => {
+      setSyncIndicator('offline');
+    };
+
+    const unsubscribeSync = subscribeDataChanges((topic) => {
+      if (topic === 'sync_flushed' && progressTimerRef.current === null && !submittingRef.current) {
+        setSyncIndicator('synced');
+      }
+    });
+
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('offline', handleOffline);
     return () => {
       if (unloadResetTimerRef.current) {
         window.clearTimeout(unloadResetTimerRef.current);
       }
+      if (navSaveTimerRef.current) {
+        window.clearTimeout(navSaveTimerRef.current);
+      }
+      unsubscribeSync();
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('offline', handleOffline);
     };
   }, []);
 
@@ -314,6 +437,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
 
     const onVisibilityChange = () => {
       if (document.hidden && !isUnloadingRef.current) {
+        // Jika ada jawaban baru yang masih menunggu debounce 10-14 detik saat tab disembunyikan/berpindah aplikasi,
+        // segera kirim via keepalive agar tetap tersimpan meskipun browser mobile menghentikan proses tab.
+        if (!submittingRef.current && !lockedRef.current && progressTimerRef.current !== null) {
+          flushExamProgressKeepalive(sessionRef.current);
+        }
         window.setTimeout(() => {
           if (document.hidden && !isUnloadingRef.current) {
             recordViolation();
@@ -387,13 +515,29 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     };
   }, [clearPendingProgressTimer, triggerLockoutFinalize]);
 
+  // Autosave lokal berlangsung instan (0ms), sedangkan sync cloud diberi debounce 10-14 detik
+  // (maksimal tunggu 25 detik) untuk memangkas ~70% beban tulis database saat 800-1.000+ siswa aktif serentak.
   const persistProgress = useCallback(
     (updated: ActiveExamSession) => {
+      if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
       setSyncIndicator('syncing');
-      clearPendingProgressTimer();
+      const now = Date.now();
+      if (firstDirtyProgressTsRef.current === null) {
+        firstDirtyProgressTsRef.current = now;
+      }
+      if (progressTimerRef.current !== null) {
+        window.clearTimeout(progressTimerRef.current);
+        progressTimerRef.current = null;
+      }
+
+      const elapsedDirty = now - firstDirtyProgressTsRef.current;
+      const baseDelayMs = 10_000 + Math.floor(Math.random() * 4000);
+      const delayMs = elapsedDirty >= 25_000 ? 800 : Math.min(baseDelayMs, 26_000 - elapsedDirty);
+
       progressTimerRef.current = window.setTimeout(() => {
         progressTimerRef.current = null;
-        if (submittingRef.current || lockedRef.current) return;
+        firstDirtyProgressTsRef.current = null;
+        if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
         void (async () => {
           try {
             const res = await upsertExamProgress(sessionRef.current || updated, {
@@ -404,40 +548,46 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
             setSyncIndicator('offline');
           }
         })();
-      }, 3500);
+      }, delayMs);
     },
-    [clearPendingProgressTimer]
+    []
   );
 
   const handleSelectOption = (questionId: string, key: OptionKey) => {
     if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
+    // Perbarui sessionRef & backup lokal secara SINKRON sebelum setSession agar klik detik terakhir
+    // tidak pernah tertinggal akibat batching render React 19 jika timer habis di frame yang sama.
+    const prev = sessionRef.current;
     const updated: ActiveExamSession = {
-      ...session,
+      ...prev,
       answers: {
-        ...session.answers,
+        ...prev.answers,
         [questionId]: key,
       },
     };
+    sessionRef.current = updated;
     saveActiveSessionLocal(updated);
-    setSession(updated);
     void persistProgress(updated);
+    setSession(updated);
   };
 
   const commitMatchingMap = (questionId: string, nextMap: Record<string, string>) => {
     if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
-    const nextAnswers = { ...session.answers };
+    const prev = sessionRef.current;
+    const nextAnswers = { ...prev.answers };
     if (Object.keys(nextMap).length === 0) {
       delete nextAnswers[questionId];
     } else {
       nextAnswers[questionId] = JSON.stringify(nextMap);
     }
     const updated: ActiveExamSession = {
-      ...session,
+      ...prev,
       answers: nextAnswers,
     };
+    sessionRef.current = updated;
     saveActiveSessionLocal(updated);
-    setSession(updated);
     void persistProgress(updated);
+    setSession(updated);
   };
 
   const handlePairMatchingRight = (rightId: string) => {
@@ -497,26 +647,41 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
 
   const handleToggleFlag = (questionId: string) => {
     if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
-    const exists = flaggedQuestionSet.has(questionId);
+    const prev = sessionRef.current;
+    const exists = prev.flaggedQuestions.includes(questionId);
     const updated: ActiveExamSession = {
-      ...session,
+      ...prev,
       flaggedQuestions: exists
-        ? session.flaggedQuestions.filter((id) => id !== questionId)
-        : [...session.flaggedQuestions, questionId],
+        ? prev.flaggedQuestions.filter((id) => id !== questionId)
+        : [...prev.flaggedQuestions, questionId],
     };
+    sessionRef.current = updated;
     saveActiveSessionLocal(updated);
-    setSession(updated);
     void persistProgress(updated);
+    setSession(updated);
   };
 
   const handleJumpQuestion = (index: number) => {
-    if (index < 0 || index >= session.questions.length) return;
+    const prev = sessionRef.current;
+    if (index < 0 || index >= prev.questions.length || index === prev.currentIndex) {
+      setShowNavDrawer(false);
+      return;
+    }
     const updated: ActiveExamSession = {
-      ...session,
+      ...prev,
       currentIndex: index,
     };
-    saveActiveSessionLocal(updated);
+    sessionRef.current = updated;
     setSession(updated);
+    if (navSaveTimerRef.current !== null) {
+      window.clearTimeout(navSaveTimerRef.current);
+    }
+    navSaveTimerRef.current = window.setTimeout(() => {
+      navSaveTimerRef.current = null;
+      if (!submittingRef.current && !lockedRef.current) {
+        saveActiveSessionLocal(sessionRef.current);
+      }
+    }, 400);
     setShowNavDrawer(false);
   };
 
@@ -1273,8 +1438,40 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         </div>
       )}
 
+      {/* Expiry Auto-Submit Queue Modal */}
+      {isExpiryQueueing && !isViolationLocked && (
+        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-emerald-200 p-6 space-y-4 shadow-2xl text-center">
+            <div className="w-12 h-12 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center mx-auto">
+              <Clock className="w-6 h-6" />
+            </div>
+            <div className="space-y-1.5">
+              <h3 className="font-display font-bold text-slate-900 text-lg">
+                Waktu Ujian Telah Habis
+              </h3>
+              <p className="text-sm text-slate-600 leading-relaxed">
+                Jawaban Anda sudah dikunci dan sedang masuk antrean pengiriman otomatis ke server
+                sekolah agar tidak terjadi antrean padat. Mohon jangan menutup halaman ini.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={isSubmitting || expiryQueueSecondsLeft > 0}
+              onClick={() => void handleFinalizeExam()}
+              className="w-full py-3 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white font-semibold text-sm cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {isSubmitting
+                ? submitProgressText || 'Mengirim Jawaban ke Server...'
+                : expiryQueueSecondsLeft > 0
+                  ? `Mengantre Pengiriman Otomatis (${expiryQueueSecondsLeft} detik)...`
+                  : 'Kirim Jawaban Sekarang'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Final Submit Confirmation Modal */}
-      {showSubmitModal && (
+      {(showSubmitModal || submitErrorMsg) && !isExpiryQueueing && (
         <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="w-full max-w-md bg-white rounded-2xl border border-slate-200 p-6 space-y-5 shadow-2xl">
             <div className="flex items-start gap-3">
@@ -1299,12 +1496,28 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
               </div>
             </div>
 
+            {isSubmitting && submitProgressText && (
+              <div className="text-xs font-medium text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg p-3 flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 animate-pulse shrink-0" />
+                <span>{submitProgressText}</span>
+              </div>
+            )}
+
+            {submitErrorMsg && (
+              <div className="text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">
+                {submitErrorMsg}
+              </div>
+            )}
+
             <div className="flex items-center gap-3">
               <button
                 type="button"
                 disabled={isSubmitting}
-                onClick={() => setShowSubmitModal(false)}
-                className="flex-1 py-3 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 font-semibold text-sm cursor-pointer"
+                onClick={() => {
+                  setSubmitErrorMsg('');
+                  setShowSubmitModal(false);
+                }}
+                className="flex-1 py-3 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 font-semibold text-sm cursor-pointer disabled:opacity-50"
               >
                 Periksa Lagi
               </button>

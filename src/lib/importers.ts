@@ -870,7 +870,7 @@ export async function exportExamResultsPdf(
   const lookups = buildScheduleLookups(schedules);
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const [kemenagPng, schoolLogoPng] = await Promise.all([
-    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    convertDataUrlToPng(profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL),
     profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
   ]);
 
@@ -1015,9 +1015,9 @@ export async function exportExamResultsPdf(
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(8.5);
-  const principalLines = doc.splitTextToSize(profile.principalName || '-', maxWidth) as string[];
+  const chairLines = doc.splitTextToSize(profile.committeeChairName || '-', maxWidth) as string[];
   const nameLineHeight = 3.8;
-  const blockHeight = 20 + Math.max(1, principalLines.length) * nameLineHeight;
+  const blockHeight = 20 + Math.max(1, chairLines.length) * nameLineHeight;
 
   let signY = finalY + 6;
   if (signY + blockHeight > pageHeight - 8) {
@@ -1029,13 +1029,13 @@ export async function exportExamResultsPdf(
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5);
   doc.text('Mengetahui,', signX, signY);
-  doc.text('Kepala Sekolah / Ketua Panitia', signX, signY + 4.2);
+  doc.text('Ketua Panitia Ujian,', signX, signY + 4.2);
 
   const nameY = signY + 17;
   doc.setFont('helvetica', 'bold');
-  doc.text(principalLines, signX, nameY);
+  doc.text(chairLines, signX, nameY);
 
-  const lineY = nameY + Math.max(1, principalLines.length) * nameLineHeight + 0.8;
+  const lineY = nameY + Math.max(1, chairLines.length) * nameLineHeight + 0.8;
   doc.setDrawColor(100, 116, 139);
   doc.setLineWidth(0.3);
   doc.line(signX, lineY, signX + maxWidth, lineY);
@@ -1142,7 +1142,7 @@ export async function exportExamCardsPdf(
 ): Promise<void> {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const [kemenagPng, schoolLogoPng] = await Promise.all([
-    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    convertDataUrlToPng(profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL),
     profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
   ]);
 
@@ -1541,7 +1541,7 @@ export async function exportAttendancePdf(
 ): Promise<void> {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const [kemenagPng, schoolLogoPng] = await Promise.all([
-    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    convertDataUrlToPng(profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL),
     profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
   ]);
   const dateParts = formatIndonesianDateParts(meta.examDate);
@@ -1687,7 +1687,7 @@ export async function exportAttendancePdf(
       (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ??
       cursorY + 30;
 
-    const neededFooterHeight = 27;
+    const neededFooterHeight = 46;
     let footerY = tableEndY + 3.5;
     if (footerY + neededFooterHeight > pageHeight - 6) {
       doc.addPage();
@@ -1715,14 +1715,26 @@ export async function exportAttendancePdf(
     const rightSignX = pageWidth - marginX - 58;
     const sup1Name = meta.supervisor1.trim() || '............................................';
     const sup2Name = meta.supervisor2.trim() || '............................................';
+    const chairName =
+      (profile.committeeChairName || '').trim() || '............................................';
 
     doc.setFontSize(8.5);
     doc.text('Pengawas Ruang 1,', leftSignX, signTopY);
     doc.text('Pengawas Ruang 2 / Proktor,', rightSignX, signTopY);
 
     doc.setFont('helvetica', 'bold');
-    doc.text(fitTextSingleLine(doc, sup1Name, 60), leftSignX, signTopY + 13);
-    doc.text(fitTextSingleLine(doc, sup2Name, 60), rightSignX, signTopY + 13);
+    doc.text(fitTextSingleLine(doc, sup1Name, 60), leftSignX, signTopY + 12.5);
+    doc.text(fitTextSingleLine(doc, sup2Name, 60), rightSignX, signTopY + 12.5);
+
+    const chairSignY = signTopY + 18;
+    doc.setFont('helvetica', 'normal');
+    doc.text('Mengetahui,', pageWidth / 2, chairSignY, { align: 'center' });
+    doc.text('Ketua Panitia Ujian,', pageWidth / 2, chairSignY + 4, { align: 'center' });
+
+    doc.setFont('helvetica', 'bold');
+    doc.text(fitTextSingleLine(doc, chairName, 85), pageWidth / 2, chairSignY + 15.5, {
+      align: 'center',
+    });
   });
 
   const safeSchool = sanitizeFilenamePart(profile.schoolName, 'Sekolah');
@@ -1889,7 +1901,7 @@ export async function exportAttendanceWord(
   meta: ExamDocumentMeta
 ): Promise<void> {
   const [kemenagBytes, schoolLogoBytes] = await Promise.all([
-    dataUrlToPngUint8Array(KEMENAG_LOGO_DATA_URL),
+    dataUrlToPngUint8Array(profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL),
     profile.logoDataUrl ? dataUrlToPngUint8Array(profile.logoDataUrl) : Promise.resolve(null),
   ]);
   const dateParts = formatIndonesianDateParts(meta.examDate);
@@ -1906,6 +1918,8 @@ export async function exportAttendanceWord(
   const timeDisplay = meta.timeRange.trim() || '............ s.d. ............ WIB';
   const sup1Name = meta.supervisor1.trim() || '............................................';
   const sup2Name = meta.supervisor2.trim() || '............................................';
+  const chairName =
+    (profile.committeeChairName || '').trim() || '............................................';
 
   const children: Array<Paragraph | Table> = [];
 
@@ -2162,6 +2176,46 @@ export async function exportAttendanceWord(
         ],
       })
     );
+
+    children.push(
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        layout: TableLayoutType.FIXED,
+        borders: buildDocxNoBorders(),
+        rows: [
+          new TableRow({
+            cantSplit: true,
+            children: [
+              new TableCell({
+                width: { size: 100, type: WidthType.PERCENTAGE },
+                margins: { top: 140, bottom: 20, left: 40, right: 40 },
+                children: [
+                  new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    spacing: { after: 20 },
+                    children: [new TextRun({ text: 'Mengetahui,', size: 18, font: 'Calibri' })],
+                  }),
+                  new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    spacing: { after: 440 },
+                    children: [
+                      new TextRun({ text: 'Ketua Panitia Ujian,', size: 18, font: 'Calibri' }),
+                    ],
+                  }),
+                  new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    spacing: { after: 0 },
+                    children: [
+                      new TextRun({ text: chairName, bold: true, size: 18, font: 'Calibri' }),
+                    ],
+                  }),
+                ],
+              }),
+            ],
+          }),
+        ],
+      })
+    );
   });
 
   const doc = new Document({
@@ -2191,7 +2245,7 @@ export async function exportBeritaAcaraPdf(
 ): Promise<void> {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const [kemenagPng, schoolLogoPng] = await Promise.all([
-    convertDataUrlToPng(KEMENAG_LOGO_DATA_URL),
+    convertDataUrlToPng(profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL),
     profile.logoDataUrl ? convertDataUrlToPng(profile.logoDataUrl) : Promise.resolve(null),
   ]);
   const dateParts = formatIndonesianDateParts(meta.examDate);
@@ -2322,7 +2376,6 @@ export async function exportBeritaAcaraPdf(
   const sup1Name = meta.supervisor1.trim() || '............................................';
   const sup2Name = meta.supervisor2.trim() || '............................................';
   const chairName = (profile.committeeChairName || '').trim() || '............................................';
-  const principalName = (profile.principalName || '').trim() || '............................................';
 
   const leftColX = marginX + 4;
   const rightColX = pageWidth / 2 + 10;
@@ -2338,14 +2391,13 @@ export async function exportBeritaAcaraPdf(
   cursorY += 26;
   doc.setFont('helvetica', 'normal');
   doc.text('Mengetahui,', pageWidth / 2, cursorY, { align: 'center' });
-  cursorY += 4.8;
-
-  doc.text('Ketua Panitia Ujian,', leftColX, cursorY);
-  doc.text('Kepala Sekolah,', rightColX, cursorY);
+  cursorY += 4.5;
+  doc.text('Ketua Panitia Ujian,', pageWidth / 2, cursorY, { align: 'center' });
 
   doc.setFont('helvetica', 'bold');
-  doc.text(fitTextSingleLine(doc, chairName, 68), leftColX, cursorY + 17);
-  doc.text(fitTextSingleLine(doc, principalName, 68), rightColX, cursorY + 17);
+  doc.text(fitTextSingleLine(doc, chairName, 90), pageWidth / 2, cursorY + 17, {
+    align: 'center',
+  });
 
   const safeSchool = sanitizeFilenamePart(profile.schoolName, 'Sekolah');
   const safeSubj =
@@ -2361,7 +2413,7 @@ export async function exportBeritaAcaraWord(
   meta: ExamDocumentMeta
 ): Promise<void> {
   const [kemenagBytes, schoolLogoBytes] = await Promise.all([
-    dataUrlToPngUint8Array(KEMENAG_LOGO_DATA_URL),
+    dataUrlToPngUint8Array(profile.kemenagLogoDataUrl || KEMENAG_LOGO_DATA_URL),
     profile.logoDataUrl ? dataUrlToPngUint8Array(profile.logoDataUrl) : Promise.resolve(null),
   ]);
   const dateParts = formatIndonesianDateParts(meta.examDate);
@@ -2384,7 +2436,6 @@ export async function exportBeritaAcaraWord(
   const sup1Name = meta.supervisor1.trim() || '............................................';
   const sup2Name = meta.supervisor2.trim() || '............................................';
   const chairName = (profile.committeeChairName || '').trim() || '............................................';
-  const principalName = (profile.principalName || '').trim() || '............................................';
 
   const infoRows: Array<[string, string, boolean]> = [
     ['1. Mata Pelajaran', subjectDisplay, true],
@@ -2536,46 +2587,37 @@ export async function exportBeritaAcaraWord(
           }),
         ],
       }),
+    ],
+  });
+
+  const chairSignTable = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    layout: TableLayoutType.FIXED,
+    borders: buildDocxNoBorders(),
+    rows: [
       new TableRow({
         cantSplit: true,
         children: [
           new TableCell({
-            width: { size: 50, type: WidthType.PERCENTAGE },
-            margins: { top: 80, bottom: 40, left: 50, right: 50 },
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            margins: { top: 140, bottom: 40, left: 50, right: 50 },
             children: [
               new Paragraph({
+                alignment: AlignmentType.CENTER,
                 spacing: { after: 20 },
                 children: [new TextRun({ text: 'Mengetahui,', size: 18, font: 'Calibri' })],
               }),
               new Paragraph({
+                alignment: AlignmentType.CENTER,
                 spacing: { after: 520 },
                 children: [
                   new TextRun({ text: 'Ketua Panitia Ujian,', size: 19, font: 'Calibri' }),
                 ],
               }),
               new Paragraph({
+                alignment: AlignmentType.CENTER,
                 spacing: { after: 0 },
                 children: [new TextRun({ text: chairName, bold: true, size: 19, font: 'Calibri' })],
-              }),
-            ],
-          }),
-          new TableCell({
-            width: { size: 50, type: WidthType.PERCENTAGE },
-            margins: { top: 80, bottom: 40, left: 50, right: 50 },
-            children: [
-              new Paragraph({
-                spacing: { after: 20 },
-                children: [new TextRun({ text: ' ', size: 18, font: 'Calibri' })],
-              }),
-              new Paragraph({
-                spacing: { after: 520 },
-                children: [new TextRun({ text: 'Kepala Sekolah,', size: 19, font: 'Calibri' })],
-              }),
-              new Paragraph({
-                spacing: { after: 0 },
-                children: [
-                  new TextRun({ text: principalName, bold: true, size: 19, font: 'Calibri' }),
-                ],
               }),
             ],
           }),
@@ -2637,6 +2679,7 @@ export async function exportBeritaAcaraWord(
             ],
           }),
           signTable,
+          chairSignTable,
         ],
       },
     ],

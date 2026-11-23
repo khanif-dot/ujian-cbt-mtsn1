@@ -41,7 +41,10 @@ interface AdminRolesTabProps {
   currentStaffId: string;
   schedules: ExamSchedule[];
   questions: Question[];
-  onUpsertStaff: (account: StaffAccount) => Promise<StaffSyncResult | void>;
+  onUpsertStaff: (
+    account: StaffAccount,
+    options?: { updatePassword?: boolean }
+  ) => Promise<StaffSyncResult | void>;
   onDeleteStaff: (id: string) => Promise<StaffSyncResult | void>;
 }
 
@@ -138,7 +141,7 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
   onDeleteStaff,
 }) => {
   const [modalOpen, setModalOpen] = usePersistedState('cbt_draft_role_modal_open_v1', false);
-  const [form, setForm] = usePersistedState<RoleFormState>(
+  const [form, setForm, resetForm] = usePersistedState<RoleFormState>(
     'cbt_draft_role_form_v1',
     createEmptyForm
   );
@@ -306,8 +309,11 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       return;
     }
 
-    const resolvedPassword = cleanPwd || existingAcc?.password || '';
-    if (!resolvedPassword) {
+    const shouldUpdatePassword = Boolean(cleanPwd);
+    const resolvedPassword = shouldUpdatePassword
+      ? cleanPwd
+      : existingAcc?.password || '__CLOUD_MANAGED__';
+    if (!existingAcc && !shouldUpdatePassword) {
       setFormError('Sandi login wajib diisi minimal 4 karakter.');
       return;
     }
@@ -334,7 +340,8 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
       createdAt: form.createdAt || new Date().toISOString(),
     };
 
-    const syncRes = await onUpsertStaff(payload);
+    const syncRes = await onUpsertStaff(payload, { updatePassword: shouldUpdatePassword });
+    resetForm();
     setModalOpen(false);
     const actionLabel = form.id
       ? `Role & akses untuk "${payload.name}" (ID: ${payload.userId}) berhasil diperbarui`
@@ -513,7 +520,8 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
               {staffAccounts.map((acc) => {
                 const isMainAdmin = acc.userId.toLowerCase() === 'admin';
                 const isSelf = acc.id === currentStaffId;
-                const hashed = isPasswordHashed(acc.password);
+                const isCloudManaged = acc.password === '__CLOUD_MANAGED__';
+                const hashed = isPasswordHashed(acc.password) || isCloudManaged;
 
                 return (
                   <tr key={acc.id} className="hover:bg-slate-50/70 align-top">
@@ -542,7 +550,11 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
                       >
                         <KeyRound className="w-3.5 h-3.5 shrink-0" />
                         <span className="font-semibold">
-                          {hashed ? 'Tersandi (SHA-256)' : '••••••••'}
+                          {isCloudManaged
+                            ? 'Tersandi (Cloud)'
+                            : hashed
+                              ? 'Tersandi (SHA-256)'
+                              : '••••••••'}
                         </span>
                       </div>
                     </td>
@@ -580,7 +592,10 @@ export const AdminRolesTab: React.FC<AdminRolesTabProps> = ({
                         onClick={() =>
                           void (async () => {
                             const nextActive = !acc.isActive;
-                            const syncRes = await onUpsertStaff({ ...acc, isActive: nextActive });
+                            const syncRes = await onUpsertStaff(
+                              { ...acc, isActive: nextActive },
+                              { updatePassword: false }
+                            );
                             if (syncRes?.error) {
                               setFeedback({
                                 ok: false,

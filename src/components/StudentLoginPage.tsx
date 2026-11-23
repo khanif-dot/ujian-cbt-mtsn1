@@ -55,6 +55,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   const [errorMsg, setErrorMsg] = useState('');
   const [isChecking, setIsChecking] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const startingRef = useRef(false);
   const adminTapCountRef = useRef(0);
   const adminTapTimerRef = useRef<number | null>(null);
 
@@ -154,20 +155,39 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
     setIsChecking(true);
     try {
       const res = await validateParticipantAndToken(code, tkn);
-      if (res.status === 'not_found' || !res.participant) {
-        setVerifiedParticipant(null);
-        setCloudSyncedResults(null);
-        setErrorMsg(
-          `Nomor Peserta "${code}" tidak ditemukan atau tidak aktif. Periksa kembali kartu ujian Anda.`
-        );
-        return;
-      }
-
       if (res.status === 'wrong_token') {
         setVerifiedParticipant(null);
         setCloudSyncedResults(null);
         setErrorMsg(
           `Token tidak sesuai untuk Nomor Peserta "${code}". Periksa kembali token Anda.`
+        );
+        return;
+      }
+
+      if (res.status === 'inactive') {
+        setVerifiedParticipant(null);
+        setCloudSyncedResults(null);
+        setErrorMsg(
+          `Nomor Peserta "${code}" sedang dinonaktifkan oleh Panitia. Hubungi pengawas / proktor ujian.`
+        );
+        return;
+      }
+
+      if (res.status === 'server_busy') {
+        setVerifiedParticipant(null);
+        setCloudSyncedResults(null);
+        setErrorMsg(
+          res.errorMessage ||
+            'Server ujian sedang padat memproses antrean peserta lain. Mohon tunggu 3–5 detik lalu klik Cek Data & Masuk kembali.'
+        );
+        return;
+      }
+
+      if (res.status === 'not_found' || !res.participant) {
+        setVerifiedParticipant(null);
+        setCloudSyncedResults(null);
+        setErrorMsg(
+          `Nomor Peserta "${code}" tidak ditemukan. Periksa kembali kartu ujian Anda.`
         );
         return;
       }
@@ -199,34 +219,13 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (verifiedParticipant && activeSelectedSchedule) {
-      if (isSelectedSubjectLocked) {
+      if (isSelectedSubjectLocked || startingRef.current) {
         return;
       }
+      startingRef.current = true;
       setIsStarting(true);
       setErrorMsg('');
       try {
-        const freshResults = await syncStudentResultsFromCloud(
-          verifiedParticipant.participantNumber
-        );
-        setCloudSyncedResults(freshResults);
-
-        const normNum = verifiedParticipant.participantNumber.trim().toUpperCase();
-        const freshResult =
-          freshResults.find(
-            (r) =>
-              r.participantNumber.trim().toUpperCase() === normNum &&
-              r.examId === activeSelectedSchedule.id
-          ) || null;
-
-        if (freshResult && freshResult.status !== 'in_progress') {
-          setErrorMsg(
-            freshResult.status === 'submitted'
-              ? `Anda telah menyelesaikan ujian mata pelajaran ${activeSelectedSchedule.subject} dan tidak dapat mengulanginya.`
-              : `Akses ujian ${activeSelectedSchedule.subject} terkunci karena pelanggaran. Hubungi admin untuk Reset Ujian.`
-          );
-          return;
-        }
-
         try {
           if (document.documentElement.requestFullscreen) {
             await document.documentElement.requestFullscreen();
@@ -246,6 +245,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
           err instanceof Error ? err.message : 'Gagal memulai sesi ujian. Silakan coba lagi.'
         );
       } finally {
+        startingRef.current = false;
         setIsStarting(false);
       }
       return;

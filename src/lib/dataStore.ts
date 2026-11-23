@@ -46,14 +46,20 @@ const STORES = {
 } as const;
 
 const ACTIVE_SESSION_KEY = 'cbt_active_exam_session_v2';
+const ACTIVE_ANSWERS_BACKUP_KEY = 'cbt_active_answers_backup_v1';
+const SERVER_CLOCK_CACHE_KEY = 'cbt_server_clock_cache_v1';
+const STUDENT_PULL_COOLDOWN_KEY = 'cbt_student_pull_ts_v1';
+const FLUSH_QUEUE_LOCK_KEY = 'cbt_lock_flush_pending_v1';
 const CHANNEL_NAME = 'nusantara_cbt_sync';
 
 type SyncListener = (topic?: string) => void;
 
 const listeners = new Set<SyncListener>();
 let channel: BroadcastChannel | null = null;
-let resultsKeyMapCache: Map<string, { id: string; syncStatus?: string; fingerprint: string }> | null =
-  null;
+let resultsKeyMapCache: Map<
+  string,
+  { id: string; syncStatus?: string; finalized: boolean; fingerprint: string }
+> | null = null;
 let resultsSortedCache: ExamResult[] | null = null;
 let schedulesSortedCache: ExamSchedule[] | null = null;
 let participantsSortedCache: Participant[] | null = null;
@@ -62,6 +68,56 @@ let questionsSortedCache: Question[] | null = null;
 // Kredensial staf aktif disimpan hanya di memori JS (tidak pernah di localStorage) untuk otorisasi RPC admin
 let activeStaffCredentials: { userId: string; passwordHash: string } | null = null;
 const confirmedQuestionIdsSyncSet = new Set<string>();
+const confirmedCloudSessionKeys = new Set<string>();
+const lastCloudProgressConfirmedAt = new Map<string, number>();
+const lastLivePollCloudCheckAt = new Map<string, number>();
+const LIVE_POLL_RECENT_SYNC_SKIP_MS = 25_000;
+const LIVE_POLL_MAX_SKIP_WINDOW_MS = 120_000;
+const finalizingSessionKeys = new Set<string>();
+const finalizingSessionPromises = new Map<string, Promise<ExamResult>>();
+const RECENT_PREFLIGHT_CACHE_TTL_MS = 60_000;
+const recentlyVerifiedParticipants = new Map<
+  string,
+  { participant: Participant; verifiedAt: number }
+>();
+const verifiedSchedulesCache = new Map<
+  string,
+  { schedule: ExamSchedule; verifiedAt: number }
+>();
+const inFlightSchedulePreflight = new Map<
+  string,
+  Promise<{ data: Record<string, unknown> | null; error?: { message: string } | null }>
+>();
+const studentQuestionsCache = new Map<
+  string,
+  { questions: StudentQuestion[]; cachedAt: number }
+>();
+const inFlightStudentQuestions = new Map<string, Promise<StudentQuestion[]>>();
+const STUDENT_QUESTIONS_CACHE_TTL_MS = 120_000;
+
+export function normalizeParticipantNumber(raw: string | null | undefined): string {
+  return String(raw ?? '').trim().toUpperCase();
+}
+
+function areTimestampsEqual(a?: string | null, b?: string | null): boolean {
+  const sa = String(a ?? '').trim();
+  const sb = String(b ?? '').trim();
+  if (!sa || !sb) return false;
+  if (sa === sb) return true;
+  const ma = Date.parse(sa);
+  const mb = Date.parse(sb);
+  if (!Number.isFinite(ma) || !Number.isFinite(mb)) return false;
+  return Math.abs(ma - mb) < 1000;
+}
+
+function makeSessionSyncKey(participantNumber: string, examId: string): string {
+  return `${normalizeParticipantNumber(participantNumber)}::${examId}`;
+}
+
+function isExamResultFinalized(r: ExamResult | null | undefined): boolean {
+  if (!r) return false;
+  return r.status === 'submitted' || (r.status === 'flagged' && r.submittedAt !== null);
+}
 
 export function setActiveStaffCredentials(
   staff: { userId: string; password?: string } | null
@@ -77,17 +133,74 @@ export function setActiveStaffCredentials(
   }
   activeStaffCredentials = {
     userId: staff.userId.trim(),
-    passwordHash: pwdHash,
+    passwordHash: isPasswordHashed(pwdHash) ? pwdHash.toLowerCase() : pwdHash,
   };
 }
 
-function getStaffRpcAuthArgs(): {
+interface StaffRpcAuthArgs {
   p_staff_user_id: string | null;
   p_staff_password_sha256: string | null;
-} {
+}
+
+async function normalizePasswordToSha256(raw: string): Promise<string | null> {
+  const clean = (raw || '').trim();
+  if (!clean || clean === '__CLOUD_MANAGED__') return null;
+  if (isPasswordHashed(clean)) return clean.toLowerCase();
+  if (/^[0-9a-f]{64}$/i.test(clean)) return `sha256$${clean.toLowerCase()}`;
+  return (await hashPassword(clean)).toLowerCase();
+}
+
+/**
+ * Menyelesaikan kredensial staf (`p_staff_user_id` & `p_staff_password_sha256`) yang valid untuk semua RPC admin.
+ * Termasuk normalisasi hash SHA-256 dan fallback ke `school_profile.adminPassword` bila akun `admin` memakai kredensial utama.
+ */
+async function resolveStaffRpcAuthArgs(): Promise<StaffRpcAuthArgs> {
+  if (activeStaffCredentials?.userId) {
+    const activeSha = await normalizePasswordToSha256(activeStaffCredentials.passwordHash);
+    if (activeSha) {
+      activeStaffCredentials.passwordHash = activeSha;
+      return {
+        p_staff_user_id: activeStaffCredentials.userId.trim(),
+        p_staff_password_sha256: activeSha,
+      };
+    }
+  }
+
+  try {
+    const preferredUserId = activeStaffCredentials?.userId?.trim().toLowerCase() || 'admin';
+    const staffList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+    const matchedStaff = staffList.find(
+      (s) => s.isActive && s.userId.trim().toLowerCase() === preferredUserId
+    );
+    if (matchedStaff) {
+      const staffSha = await normalizePasswordToSha256(matchedStaff.password);
+      if (staffSha) {
+        return {
+          p_staff_user_id: matchedStaff.userId.trim(),
+          p_staff_password_sha256: staffSha,
+        };
+      }
+    }
+
+    if (preferredUserId === 'admin') {
+      const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
+      if (profile?.adminPassword) {
+        const profSha = await normalizePasswordToSha256(profile.adminPassword);
+        if (profSha) {
+          return {
+            p_staff_user_id: 'admin',
+            p_staff_password_sha256: profSha,
+          };
+        }
+      }
+    }
+  } catch {
+    // Ignore local IDB read error; fall back to null args
+  }
+
   return {
-    p_staff_user_id: activeStaffCredentials?.userId || null,
-    p_staff_password_sha256: activeStaffCredentials?.passwordHash || null,
+    p_staff_user_id: activeStaffCredentials?.userId?.trim() || null,
+    p_staff_password_sha256: null,
   };
 }
 
@@ -100,6 +213,121 @@ function isRpcSignatureMismatchError(msg: string): boolean {
   );
 }
 
+function isDigestRpcBugError(
+  err: { code?: string; message?: string } | null | undefined
+): boolean {
+  if (!err) return false;
+  const code = String(err.code || '').trim();
+  const msg = String(err.message || '').toLowerCase();
+  return code === '42883' || (msg.includes('digest') && msg.includes('does not exist'));
+}
+
+function isNetworkOrOfflineError(err: unknown): boolean {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+  const msg = (
+    err instanceof Error
+      ? err.message
+      : typeof err === 'object' && err !== null && 'message' in err
+        ? String((err as { message?: unknown }).message || '')
+        : String(err || '')
+  ).toLowerCase();
+  return (
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('network request failed') ||
+    msg.includes('load failed') ||
+    msg.includes('err_internet_disconnected') ||
+    msg.includes('timeout') ||
+    msg.includes('aborted')
+  );
+}
+
+function isTransientServerOrNetworkError(err: unknown): boolean {
+  if (isNetworkOrOfflineError(err)) return true;
+  if (!err || typeof err !== 'object') {
+    const raw = String(err || '').toLowerCase();
+    return (
+      raw.includes('503') ||
+      raw.includes('502') ||
+      raw.includes('504') ||
+      raw.includes('429') ||
+      raw.includes('pgrst003') ||
+      raw.includes('connection pool') ||
+      raw.includes('too many')
+    );
+  }
+  const obj = err as { status?: unknown; code?: unknown; message?: unknown; details?: unknown };
+  const status = Number(obj.status);
+  if ([408, 429, 500, 502, 503, 504].includes(status)) return true;
+  const code = String(obj.code || '').toUpperCase();
+  if (['PGRST003', 'PGRST000', '57014', '53300', '08000', '08003', '08006', '40001'].includes(code)) {
+    return true;
+  }
+  const combined = `${String(obj.message || '')} ${String(obj.details || '')}`.toLowerCase();
+  return (
+    combined.includes('connection pool') ||
+    combined.includes('timed out acquiring') ||
+    combined.includes('service unavailable') ||
+    combined.includes('too many requests') ||
+    combined.includes('too many connections') ||
+    combined.includes('statement timeout') ||
+    combined.includes('bad gateway') ||
+    combined.includes('gateway timeout') ||
+    combined.includes('rate limit') ||
+    combined.includes('503') ||
+    combined.includes('429')
+  );
+}
+
+function isBrowserExplicitlyOffline(): boolean {
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
+
+async function retryTransientSupabaseCall<T extends { error?: unknown }>(
+  fn: () => Promise<T>,
+  options?: {
+    backoffsMs?: number[];
+    jitterMs?: number;
+  }
+): Promise<T> {
+  const backoffs = options?.backoffsMs || [0, 350, 900];
+  const jitterMax = options?.jitterMs ?? 450;
+  let lastRes: T | null = null;
+  let lastErr: unknown = null;
+
+  for (let attempt = 0; attempt < backoffs.length; attempt++) {
+    if (isBrowserExplicitlyOffline()) {
+      if (lastRes) return lastRes;
+      throw lastErr instanceof Error ? lastErr : new Error('Offline');
+    }
+    if (attempt > 0) {
+      const waitMs = backoffs[attempt] + Math.floor(Math.random() * jitterMax);
+      await new Promise((r) => setTimeout(r, waitMs));
+      if (isBrowserExplicitlyOffline()) {
+        if (lastRes) return lastRes;
+        throw lastErr instanceof Error ? lastErr : new Error('Offline');
+      }
+    }
+    try {
+      const res = await fn();
+      if (!res || !res.error) {
+        return res;
+      }
+      lastRes = res;
+      if (!isTransientServerOrNetworkError(res.error) || attempt === backoffs.length - 1) {
+        return res;
+      }
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientServerOrNetworkError(err) || attempt === backoffs.length - 1) {
+        throw err;
+      }
+    }
+  }
+  if (lastRes) return lastRes;
+  throw lastErr instanceof Error ? lastErr : new Error('Transient request failed');
+}
+
 function invalidateStoreCache(storeName?: string): void {
   if (!storeName || storeName === STORES.RESULTS) {
     resultsKeyMapCache = null;
@@ -107,12 +335,15 @@ function invalidateStoreCache(storeName?: string): void {
   }
   if (!storeName || storeName === STORES.SCHEDULES) {
     schedulesSortedCache = null;
+    verifiedSchedulesCache.clear();
   }
   if (!storeName || storeName === STORES.PARTICIPANTS) {
     participantsSortedCache = null;
+    recentlyVerifiedParticipants.clear();
   }
   if (!storeName || storeName === STORES.QUESTIONS) {
     questionsSortedCache = null;
+    studentQuestionsCache.clear();
   }
 }
 
@@ -205,7 +436,14 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 function openDB(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    let req: IDBOpenDBRequest;
+    try {
+      req = indexedDB.open(DB_NAME, DB_VERSION);
+    } catch (err) {
+      dbPromise = null;
+      reject(err);
+      return;
+    }
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORES.META)) {
@@ -232,8 +470,25 @@ function openDB(): Promise<IDBDatabase> {
         db.createObjectStore(STORES.ACTIVE_SESSION, { keyPath: 'id' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onblocked = () => {
+      dbPromise = null;
+      reject(new Error('IndexedDB diblokir oleh tab lain.'));
+    };
+    req.onerror = () => {
+      dbPromise = null;
+      reject(req.error);
+    };
   });
   return dbPromise;
 }
@@ -357,13 +612,15 @@ function sha256FallbackHex(ascii: string): string {
 }
 
 export function isPasswordHashed(value: string): boolean {
-  return value.startsWith(HASH_PREFIX);
+  return value.trim().toLowerCase().startsWith(HASH_PREFIX);
 }
 
 export async function hashPassword(raw: string): Promise<string> {
   const trimmed = raw.trim();
   if (!trimmed) return '';
-  if (isPasswordHashed(trimmed)) return trimmed;
+  if (isPasswordHashed(trimmed)) {
+    return HASH_PREFIX + trimmed.slice(HASH_PREFIX.length).toLowerCase();
+  }
   try {
     if (typeof globalThis !== 'undefined' && globalThis.crypto?.subtle) {
       const data = new TextEncoder().encode(trimmed);
@@ -383,71 +640,184 @@ export async function verifyPassword(input: string, stored: string): Promise<boo
   if (!cleanInput || !cleanStored) return false;
   if (isPasswordHashed(cleanStored)) {
     const hashed = await hashPassword(cleanInput);
-    return hashed === cleanStored;
+    return hashed.toLowerCase() === cleanStored.toLowerCase();
+  }
+  if (/^[a-f0-9]{64}$/i.test(cleanStored)) {
+    const hashed = await hashPassword(cleanInput);
+    return hashed.slice(HASH_PREFIX.length).toLowerCase() === cleanStored.toLowerCase();
   }
   return cleanInput === cleanStored;
 }
 
 // ============================================================================
-// SERVER CLOCK OFFSET (ANTI MANIPULASI JAM PERANGKAT)
+// SERVER CLOCK OFFSET & MONOTONIC ANCHOR (ANTI MANIPULASI JAM PERANGKAT)
 // ============================================================================
 let serverClockOffsetMs = 0;
 let lastClockSyncMs = 0;
+let syncedServerEpochMs: number | null = null;
+let syncedPerfNowMs: number | null = null;
+let lastDriftResyncTriggerMs = 0;
+let clockSyncInFlight: Promise<number> | null = null;
+
+function getMonotonicPerfMs(): number {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+export function applyServerTimeSample(
+  serverMs: number,
+  wallMidpointMs: number,
+  perfMidpointMs: number
+): void {
+  if (!Number.isFinite(serverMs)) return;
+  serverClockOffsetMs = serverMs - wallMidpointMs;
+  syncedServerEpochMs = serverMs;
+  syncedPerfNowMs = perfMidpointMs;
+  lastClockSyncMs = Date.now();
+}
 
 export function getServerNowMs(): number {
-  return Date.now() + serverClockOffsetMs;
+  const wallNow = Date.now() + serverClockOffsetMs;
+  if (syncedServerEpochMs !== null && syncedPerfNowMs !== null) {
+    const monotonicNow = syncedServerEpochMs + Math.max(0, getMonotonicPerfMs() - syncedPerfNowMs);
+    const drift = wallNow - monotonicNow;
+    // Jika jam OS dimundurkan (drift < -2 detik), tetap gunakan monotonicNow agar siswa tidak mendapat waktu ekstra.
+    // Jika perangkat bangun dari sleep atau jam dimajukan jauh (> 15 detik), gunakan nilai terbesar & picu resync server.
+    if (drift > 15_000 && Date.now() - lastDriftResyncTriggerMs > 15_000) {
+      lastDriftResyncTriggerMs = Date.now();
+      void syncServerClock(true);
+    }
+    return Math.max(monotonicNow, wallNow);
+  }
+  return wallNow;
 }
 
 export function getServerClockOffsetMs(): number {
   return serverClockOffsetMs;
 }
 
+const CROSS_TAB_CLOCK_CACHE_TTL_MS = 60_000;
+const CROSS_TAB_CLOCK_FORCE_MIN_GAP_MS = 15_000;
+
+function readSharedClockCache(): { offsetMs: number; serverEpochMs: number; syncedAt: number } | null {
+  try {
+    const raw = localStorage.getItem(SERVER_CLOCK_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<{
+      offsetMs: number;
+      serverEpochMs: number;
+      syncedAt: number;
+    }>;
+    if (
+      typeof parsed.offsetMs === 'number' &&
+      Number.isFinite(parsed.offsetMs) &&
+      typeof parsed.syncedAt === 'number' &&
+      Number.isFinite(parsed.syncedAt)
+    ) {
+      return {
+        offsetMs: parsed.offsetMs,
+        serverEpochMs:
+          typeof parsed.serverEpochMs === 'number' && Number.isFinite(parsed.serverEpochMs)
+            ? parsed.serverEpochMs
+            : parsed.syncedAt + parsed.offsetMs,
+        syncedAt: parsed.syncedAt,
+      };
+    }
+  } catch {
+    // Ignore localStorage restrictions
+  }
+  return null;
+}
+
+function writeSharedClockCache(offsetMs: number, serverEpochMs: number): void {
+  try {
+    localStorage.setItem(
+      SERVER_CLOCK_CACHE_KEY,
+      JSON.stringify({ offsetMs, serverEpochMs, syncedAt: Date.now() })
+    );
+  } catch {
+    // Ignore localStorage restrictions
+  }
+}
+
 export async function syncServerClock(force = false): Promise<number> {
   if (!isLiveSupabaseConfigured()) return serverClockOffsetMs;
-  if (!force && Date.now() - lastClockSyncMs < 300_000) {
+  const now = Date.now();
+  if (!force && now - lastClockSyncMs < 300_000 && syncedServerEpochMs !== null) {
     return serverClockOffsetMs;
   }
-  try {
-    const supabase = getSupabaseClient();
-    const reqStart = Date.now();
-    const { data, error } = await supabase.rpc('get_server_time');
-    const reqEnd = Date.now();
-    if (!error && typeof data === 'string') {
-      const serverMs = new Date(data).getTime();
-      if (Number.isFinite(serverMs)) {
-        const midpoint = Math.round((reqStart + reqEnd) / 2);
-        serverClockOffsetMs = serverMs - midpoint;
-        lastClockSyncMs = Date.now();
-        return serverClockOffsetMs;
-      }
+  // Koordinasi lintas-tab: jika tab lain di perangkat yang sama baru saja menyinkronkan jam server,
+  // pakai ulang offset terbaru agar 3-5 tab yang online serentak tidak menggandakan RPC get_server_time.
+  const sharedClock = readSharedClockCache();
+  if (sharedClock) {
+    const cacheAgeMs = now - sharedClock.syncedAt;
+    const thresholdMs = force ? CROSS_TAB_CLOCK_FORCE_MIN_GAP_MS : CROSS_TAB_CLOCK_CACHE_TTL_MS;
+    if (cacheAgeMs >= 0 && cacheAgeMs < thresholdMs) {
+      const estimatedServerMs = sharedClock.serverEpochMs + cacheAgeMs;
+      applyServerTimeSample(estimatedServerMs, now, getMonotonicPerfMs());
+      return serverClockOffsetMs;
     }
-  } catch {
-    // Fallback below using HTTP Date header
+  }
+  // Deduplikasi in-flight promise lock agar pemanggilan bersamaan (cold load / ensureInitialized / syncFromSupabase)
+  // cukup menembakkan 1 RPC get_server_time saja.
+  if (clockSyncInFlight) {
+    return clockSyncInFlight;
   }
 
-  try {
-    const { url, anonKey } = getSupabaseConfig();
-    if (url && anonKey) {
+  clockSyncInFlight = (async () => {
+    try {
+      const supabase = getSupabaseClient();
       const reqStart = Date.now();
-      const resp = await fetch(`${url.replace(/\/+$/, '')}/rest/v1/`, {
-        method: 'HEAD',
-        headers: { apikey: anonKey },
-      });
+      const perfStart = getMonotonicPerfMs();
+      const { data, error } = await supabase.rpc('get_server_time');
       const reqEnd = Date.now();
-      const dateHeader = resp.headers.get('date');
-      if (dateHeader) {
-        const serverMs = new Date(dateHeader).getTime();
+      const perfEnd = getMonotonicPerfMs();
+      if (!error && typeof data === 'string') {
+        const serverMs = new Date(data).getTime();
         if (Number.isFinite(serverMs)) {
-          const midpoint = Math.round((reqStart + reqEnd) / 2);
-          serverClockOffsetMs = serverMs - midpoint;
-          lastClockSyncMs = Date.now();
+          const wallMidpoint = Math.round((reqStart + reqEnd) / 2);
+          const perfMidpoint = perfStart + (perfEnd - perfStart) / 2;
+          applyServerTimeSample(serverMs, wallMidpoint, perfMidpoint);
+          writeSharedClockCache(serverClockOffsetMs, serverMs);
+          return serverClockOffsetMs;
         }
       }
+    } catch {
+      // Fallback below using HTTP Date header
     }
-  } catch {
-    // Keep existing offset if offline
-  }
-  return serverClockOffsetMs;
+
+    try {
+      const { url, anonKey } = getSupabaseConfig();
+      if (url && anonKey) {
+        const reqStart = Date.now();
+        const perfStart = getMonotonicPerfMs();
+        const resp = await fetch(`${url.replace(/\/+$/, '')}/rest/v1/`, {
+          method: 'HEAD',
+          headers: { apikey: anonKey },
+        });
+        const reqEnd = Date.now();
+        const perfEnd = getMonotonicPerfMs();
+        const dateHeader = resp.headers.get('date');
+        if (dateHeader) {
+          const serverMs = new Date(dateHeader).getTime();
+          if (Number.isFinite(serverMs)) {
+            const wallMidpoint = Math.round((reqStart + reqEnd) / 2);
+            const perfMidpoint = perfStart + (perfEnd - perfStart) / 2;
+            applyServerTimeSample(serverMs, wallMidpoint, perfMidpoint);
+          }
+        }
+      }
+    } catch {
+      // Keep existing offset if offline
+    }
+    return serverClockOffsetMs;
+  })().finally(() => {
+    clockSyncInFlight = null;
+  });
+
+  return clockSyncInFlight;
 }
 
 // ============================================================================
@@ -476,8 +846,8 @@ async function idbPutParticipantsSafe(items: Participant[], clearFirst = false):
   if (clearFirst) {
     const dedup = new Map<string, Participant>();
     for (const item of items) {
-      const key = item.participantNumber.trim().toUpperCase();
-      dedup.set(key, { ...item, participantNumber: item.participantNumber.trim() });
+      const key = normalizeParticipantNumber(item.participantNumber);
+      dedup.set(key, { ...item, participantNumber: key });
     }
     await idbPutMany(STORES.PARTICIPANTS, Array.from(dedup.values()), true);
     return;
@@ -486,7 +856,7 @@ async function idbPutParticipantsSafe(items: Participant[], clearFirst = false):
   const existing = await idbGetAll<Participant>(STORES.PARTICIPANTS);
   const byNumber = new Map<string, Participant>();
   for (const row of existing) {
-    byNumber.set(row.participantNumber.trim().toUpperCase(), row);
+    byNumber.set(normalizeParticipantNumber(row.participantNumber), row);
   }
 
   const db = await openDB();
@@ -494,14 +864,14 @@ async function idbPutParticipantsSafe(items: Participant[], clearFirst = false):
     const tx = db.transaction(STORES.PARTICIPANTS, 'readwrite');
     const store = tx.objectStore(STORES.PARTICIPANTS);
     for (const rawItem of items) {
-      const normNum = rawItem.participantNumber.trim().toUpperCase();
+      const normNum = normalizeParticipantNumber(rawItem.participantNumber);
       const conflict = byNumber.get(normNum);
       if (conflict && conflict.id !== rawItem.id) {
         store.delete(conflict.id);
       }
       const cleanItem: Participant = {
         ...rawItem,
-        participantNumber: rawItem.participantNumber.trim(),
+        participantNumber: normNum,
       };
       byNumber.set(normNum, cleanItem);
       store.put(cleanItem);
@@ -614,13 +984,13 @@ export async function ensureInitialized(): Promise<void> {
         'current'
       );
       if (savedIdb?.session && Array.isArray(savedIdb.session.questions)) {
-        cachedActiveSession = savedIdb.session;
+        cachedActiveSession = reconcileSessionWithEmergencyBackup(savedIdb.session);
       } else {
         const legacyRaw = localStorage.getItem(ACTIVE_SESSION_KEY);
         if (legacyRaw) {
           const parsed = JSON.parse(legacyRaw) as Partial<ActiveExamSession>;
           if (parsed && Array.isArray(parsed.questions) && parsed.participant && parsed.schedule) {
-            cachedActiveSession = parsed as ActiveExamSession;
+            cachedActiveSession = reconcileSessionWithEmergencyBackup(parsed as ActiveExamSession);
             await idbPut(STORES.ACTIVE_SESSION, { id: 'current', session: cachedActiveSession });
             try {
               localStorage.setItem(
@@ -700,9 +1070,141 @@ function buildQuestionDbRow(q: Question, includeExtendedColumns = true): Record<
 }
 
 const PUBLIC_SCHOOL_PROFILE_COLUMNS =
+  'id,school_name,address,academic_year,principal_name,committee_chair_name,exam_title,logo_data_url,kemenag_logo_data_url,updated_at';
+const PUBLIC_SCHOOL_PROFILE_COLUMNS_LEGACY =
   'id,school_name,address,academic_year,principal_name,committee_chair_name,exam_title,logo_data_url,updated_at';
 const ADMIN_SCHOOL_PROFILE_COLUMNS =
+  'id,school_name,address,academic_year,principal_name,committee_chair_name,exam_title,logo_data_url,kemenag_logo_data_url,admin_password,updated_at';
+const ADMIN_SCHOOL_PROFILE_COLUMNS_LEGACY =
   'id,school_name,address,academic_year,principal_name,committee_chair_name,exam_title,logo_data_url,admin_password,updated_at';
+
+let schoolProfileHasKemenagColumn: boolean | null = null;
+let staffUpsertProfileHasKemenagArg: boolean | null = null;
+
+function isMissingKemenagLogoColumnError(msg: string): boolean {
+  const lower = (msg || '').toLowerCase();
+  return (
+    lower.includes('kemenag_logo_data_url') ||
+    (lower.includes('permission denied') && lower.includes('school_profile'))
+  );
+}
+
+async function fetchSchoolProfileRow(
+  client: SupabaseClient,
+  includeAdminCols: boolean
+): Promise<{ data: Record<string, unknown> | null; error: { message: string } | null }> {
+  const primaryCols = includeAdminCols ? ADMIN_SCHOOL_PROFILE_COLUMNS : PUBLIC_SCHOOL_PROFILE_COLUMNS;
+  const legacyCols = includeAdminCols
+    ? ADMIN_SCHOOL_PROFILE_COLUMNS_LEGACY
+    : PUBLIC_SCHOOL_PROFILE_COLUMNS_LEGACY;
+
+  if (schoolProfileHasKemenagColumn === false) {
+    const cachedLegacy = await client
+      .from('school_profile')
+      .select(legacyCols)
+      .eq('id', 'default')
+      .maybeSingle();
+    return {
+      data: (cachedLegacy.data as unknown as Record<string, unknown> | null) || null,
+      error: cachedLegacy.error,
+    };
+  }
+
+  const first = await client
+    .from('school_profile')
+    .select(primaryCols)
+    .eq('id', 'default')
+    .maybeSingle();
+
+  if (first.error && isMissingKemenagLogoColumnError(first.error.message)) {
+    schoolProfileHasKemenagColumn = false;
+    const fallback = await client
+      .from('school_profile')
+      .select(legacyCols)
+      .eq('id', 'default')
+      .maybeSingle();
+    return {
+      data: (fallback.data as unknown as Record<string, unknown> | null) || null,
+      error: fallback.error,
+    };
+  }
+
+  if (!first.error) {
+    schoolProfileHasKemenagColumn = true;
+  }
+
+  return {
+    data: (first.data as unknown as Record<string, unknown> | null) || null,
+    error: first.error,
+  };
+}
+
+async function upsertSchoolProfileRowDirect(
+  client: SupabaseClient,
+  row: Record<string, unknown>
+): Promise<{ error: { message: string } | null }> {
+  if (schoolProfileHasKemenagColumn === false && 'kemenag_logo_data_url' in row) {
+    const legacyRow = { ...row };
+    delete legacyRow.kemenag_logo_data_url;
+    const retry = await client.from('school_profile').upsert(legacyRow);
+    return { error: retry.error };
+  }
+  const first = await client.from('school_profile').upsert(row);
+  if (first.error && 'kemenag_logo_data_url' in row && isMissingKemenagLogoColumnError(first.error.message)) {
+    schoolProfileHasKemenagColumn = false;
+    const legacyRow = { ...row };
+    delete legacyRow.kemenag_logo_data_url;
+    const retry = await client.from('school_profile').upsert(legacyRow);
+    return { error: retry.error };
+  }
+  if (!first.error && 'kemenag_logo_data_url' in row) {
+    schoolProfileHasKemenagColumn = true;
+  }
+  return { error: first.error };
+}
+
+async function callStaffUpsertSchoolProfileRpc(
+  supabase: SupabaseClient,
+  payload: Record<string, unknown>
+): Promise<{ error: { message: string } | null }> {
+  if (staffUpsertProfileHasKemenagArg === false && 'p_kemenag_logo_data_url' in payload) {
+    const legacyPayload = { ...payload };
+    delete legacyPayload.p_kemenag_logo_data_url;
+    const retry = await supabase.rpc('staff_upsert_school_profile', legacyPayload);
+    return { error: retry.error };
+  }
+  const first = await supabase.rpc('staff_upsert_school_profile', payload);
+  if (
+    first.error &&
+    'p_kemenag_logo_data_url' in payload &&
+    isRpcSignatureMismatchError(first.error.message)
+  ) {
+    staffUpsertProfileHasKemenagArg = false;
+    const legacyPayload = { ...payload };
+    delete legacyPayload.p_kemenag_logo_data_url;
+    const retry = await supabase.rpc('staff_upsert_school_profile', legacyPayload);
+    return { error: retry.error };
+  }
+  if (!first.error && 'p_kemenag_logo_data_url' in payload) {
+    staffUpsertProfileHasKemenagArg = true;
+  }
+  return { error: first.error };
+}
+
+function resolveCloudKemenagLogo(
+  profRow: Record<string, unknown>,
+  existingProfile?: SchoolProfile
+): string {
+  if ('kemenag_logo_data_url' in profRow) {
+    return (
+      String(profRow.kemenag_logo_data_url || '') ||
+      SEED_SCHOOL_PROFILE.kemenagLogoDataUrl ||
+      ''
+    );
+  }
+  return existingProfile?.kemenagLogoDataUrl || SEED_SCHOOL_PROFILE.kemenagLogoDataUrl || '';
+}
+
 const EXAM_RESULTS_ADMIN_COLUMNS =
   'id,participant_id,participant_number,student_name,class_name,exam_id,exam_title,subject,answers,flagged_questions,question_ids,correct_count,total_questions,score,tab_switch_count,status,started_at,submitted_at,updated_at';
 const EXAM_RESULTS_ADMIN_COLUMNS_LEGACY =
@@ -749,6 +1251,8 @@ async function fetchSingleExamResult(
   const normUpper = rawParticipantNumber.trim().toUpperCase();
   if (!normUpper) return { data: null, error: null };
 
+  // Pencocokan eksak menggunakan UNIQUE index (participant_number, exam_id) karena trigger DB
+  // sudah menormalisasi participant_number menjadi UPPER(TRIM(...)). Hindari .ilike() Seq Scan.
   let activeCols = columns;
   let exactRes = await client
     .from('exam_results')
@@ -774,20 +1278,9 @@ async function fetchSingleExamResult(
   }
 
   if (exactRes.error) return { data: null, error: exactRes.error };
-  if (exactRes.data) {
-    return { data: exactRes.data as unknown as Record<string, unknown>, error: null };
-  }
-
-  const fallbackRes = await client
-    .from('exam_results')
-    .select(activeCols)
-    .ilike('participant_number', escapeLikePattern(normUpper))
-    .eq('exam_id', examId)
-    .limit(1)
-    .maybeSingle();
   return {
-    data: (fallbackRes.data as unknown as Record<string, unknown> | null) || null,
-    error: fallbackRes.error,
+    data: (exactRes.data as unknown as Record<string, unknown> | null) || null,
+    error: null,
   };
 }
 
@@ -799,6 +1292,8 @@ async function fetchExamResultsForParticipant(
   const normUpper = rawParticipantNumber.trim().toUpperCase();
   if (!normUpper) return { data: [], error: null };
 
+  // Pencocokan eksak terindeks pada participant_number yang sudah dinormalisasi UPPER(TRIM(...)) di DB.
+  // Tanpa fallback .ilike() yang memicu Sequential Scan saat siswa belum memiliki baris hasil ujian.
   let activeCols = columns;
   let exactRes = await client
     .from('exam_results')
@@ -818,19 +1313,11 @@ async function fetchExamResultsForParticipant(
   }
 
   if (exactRes.error) return { data: [], error: exactRes.error };
-  if (Array.isArray(exactRes.data) && exactRes.data.length > 0) {
-    return { data: exactRes.data as unknown as Record<string, unknown>[], error: null };
-  }
-
-  const fallbackRes = await client
-    .from('exam_results')
-    .select(activeCols)
-    .ilike('participant_number', escapeLikePattern(normUpper));
   return {
-    data: Array.isArray(fallbackRes.data)
-      ? (fallbackRes.data as unknown as Record<string, unknown>[])
+    data: Array.isArray(exactRes.data)
+      ? (exactRes.data as unknown as Record<string, unknown>[])
       : [],
-    error: fallbackRes.error,
+    error: null,
   };
 }
 
@@ -956,15 +1443,12 @@ interface QuestionsCloudMeta {
 let lastQuestionsCloudMeta: QuestionsCloudMeta | null = null;
 
 async function fetchQuestionsCloudMeta(
-  client: SupabaseClient
+  client: SupabaseClient,
+  isAdminClient = false
 ): Promise<QuestionsCloudMeta | null> {
   try {
-    let { data, error } = await client.rpc('get_questions_sync_meta', getStaffRpcAuthArgs());
-    if (error && isRpcSignatureMismatchError(error.message)) {
-      const legacy = await client.rpc('get_questions_sync_meta');
-      data = legacy.data;
-      error = legacy.error;
-    }
+    const authArgs = await resolveStaffRpcAuthArgs();
+    const { data, error } = await client.rpc('get_questions_sync_meta', authArgs);
     if (!error && Array.isArray(data) && data[0]) {
       return {
         totalCount: Number(data[0].total_count || 0),
@@ -972,7 +1456,11 @@ async function fetchQuestionsCloudMeta(
       };
     }
   } catch {
-    // Fallback to head count query
+    // RPC meta check failed
+  }
+  // Hanya izinkan direct SELECT ke tabel questions jika memakai service_role (adminClient)
+  if (!isAdminClient) {
+    return null;
   }
   try {
     const { count, error } = await client
@@ -991,7 +1479,7 @@ async function shouldDownloadAllQuestions(
   adminClient: SupabaseClient,
   localCount: number
 ): Promise<{ shouldFetch: boolean; meta: QuestionsCloudMeta | null }> {
-  const meta = await fetchQuestionsCloudMeta(adminClient);
+  const meta = await fetchQuestionsCloudMeta(adminClient, true);
   if (!meta) {
     return { shouldFetch: true, meta: null };
   }
@@ -1053,17 +1541,34 @@ let lastAdminStaticPullMs = 0;
 let lastAdminResultsDeltaIso: string | null = null;
 let lastAdminAutoFinalizeMs = 0;
 
+function normalizeDbAnswersMap(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'string') {
+      out[k] = v;
+    } else if (v !== null && v !== undefined && typeof v === 'object') {
+      try {
+        out[k] = JSON.stringify(v);
+      } catch {
+        // Ignore unserializable entry
+      }
+    }
+  }
+  return out;
+}
+
 function mapDbExamResultRow(r: Record<string, unknown>): ExamResult {
   return {
     id: String(r.id),
     participantId: String(r.participant_id || ''),
-    participantNumber: String(r.participant_number || ''),
+    participantNumber: normalizeParticipantNumber(String(r.participant_number || '')),
     studentName: String(r.student_name || ''),
     className: String(r.class_name || ''),
     examId: String(r.exam_id || ''),
     examTitle: String(r.exam_title || ''),
     subject: String(r.subject || ''),
-    answers: (r.answers as Record<string, string>) || {},
+    answers: normalizeDbAnswersMap(r.answers),
     flaggedQuestions: Array.isArray(r.flagged_questions)
       ? (r.flagged_questions as string[])
       : [],
@@ -1106,13 +1611,16 @@ async function syncResultsStoreAtomic(
         cloudResults.map((c) => `${c.participantNumber.trim().toUpperCase()}::${c.examId}`)
       );
 
+      const localByKey = new Map<string, ExamResult>();
+
       for (const lr of localList) {
         localById.set(lr.id, lr);
         const normNum = lr.participantNumber.trim().toUpperCase();
         const key = `${normNum}::${lr.examId}`;
-        if (lr.syncStatus === 'pending') {
+        localByKey.set(key, lr);
+        if (lr.syncStatus === 'pending' || finalizingSessionKeys.has(key)) {
           pendingKeySet.add(key);
-          hasPending = true;
+          if (lr.syncStatus === 'pending') hasPending = true;
           continue;
         }
         const inScope = !scopeParticipantUpper || normNum === scopeParticipantUpper;
@@ -1125,7 +1633,11 @@ async function syncResultsStoreAtomic(
       for (const cr of cloudResults) {
         const key = `${cr.participantNumber.trim().toUpperCase()}::${cr.examId}`;
         if (!pendingKeySet.has(key)) {
-          const prev = localById.get(cr.id);
+          const prev = localById.get(cr.id) || localByKey.get(key);
+          // Jangan pernah menimpa jawaban final lokal yang sudah sah dengan baris cloud stale (in_progress)
+          if (isExamResultFinalized(prev) && !isExamResultFinalized(cr)) {
+            continue;
+          }
           if (!prev || buildResultFingerprint(prev) !== buildResultFingerprint(cr)) {
             changed = true;
           }
@@ -1145,16 +1657,20 @@ async function syncResultsStoreAtomic(
 }
 
 async function ensureResultsKeyMapCache(): Promise<
-  Map<string, { id: string; syncStatus?: string; fingerprint: string }>
+  Map<string, { id: string; syncStatus?: string; finalized: boolean; fingerprint: string }>
 > {
   if (resultsKeyMapCache) return resultsKeyMapCache;
   const localList = await idbGetAll<ExamResult>(STORES.RESULTS);
-  const map = new Map<string, { id: string; syncStatus?: string; fingerprint: string }>();
+  const map = new Map<
+    string,
+    { id: string; syncStatus?: string; finalized: boolean; fingerprint: string }
+  >();
   for (const lr of localList) {
     const key = `${lr.participantNumber.trim().toUpperCase()}::${lr.examId}`;
     map.set(key, {
       id: lr.id,
       syncStatus: lr.syncStatus,
+      finalized: isExamResultFinalized(lr),
       fingerprint: buildResultFingerprint(lr),
     });
   }
@@ -1177,8 +1693,15 @@ async function mergeResultsStoreDelta(
   for (const dr of deltaResults) {
     const key = `${dr.participantNumber.trim().toUpperCase()}::${dr.examId}`;
     const existing = keyMap.get(key);
+    if (finalizingSessionKeys.has(key)) {
+      continue;
+    }
     if (existing && existing.syncStatus === 'pending') {
       hasPending = true;
+      continue;
+    }
+    const drFinalized = isExamResultFinalized(dr);
+    if (existing && existing.finalized && !drFinalized) {
       continue;
     }
     const incomingFingerprint = buildResultFingerprint(dr);
@@ -1196,6 +1719,7 @@ async function mergeResultsStoreDelta(
     keyMap.set(key, {
       id: dr.id,
       syncStatus: dr.syncStatus,
+      finalized: drFinalized,
       fingerprint: incomingFingerprint,
     });
   }
@@ -1305,6 +1829,10 @@ export async function forceDeleteExamResultForReset(
 ): Promise<void> {
   await ensureInitialized();
   const normNum = participantNumber.trim().toUpperCase();
+  const sessionKey = makeSessionSyncKey(normNum, examId);
+  confirmedCloudSessionKeys.delete(sessionKey);
+  lastCloudProgressConfirmedAt.delete(sessionKey);
+  lastLivePollCloudCheckAt.delete(sessionKey);
   for (const key of confirmedQuestionIdsSyncSet) {
     if (key.endsWith(`::${normNum}::${examId}`)) {
       confirmedQuestionIdsSyncSet.delete(key);
@@ -1337,13 +1865,17 @@ export async function syncStudentResultsFromCloud(
   const normNum = participantNumber.trim().toUpperCase();
   if (!normNum) return [];
 
-  if (isLiveSupabaseConfigured()) {
+  if (isLiveSupabaseConfigured() && !isBrowserExplicitlyOffline()) {
     try {
       const supabase = getSupabaseClient();
-      const { data, error } = await fetchExamResultsForParticipant(
-        supabase,
-        normNum,
-        EXAM_RESULTS_ADMIN_COLUMNS
+      const { data, error } = await retryTransientSupabaseCall(
+        () =>
+          fetchExamResultsForParticipant(
+            supabase,
+            normNum,
+            EXAM_RESULTS_ADMIN_COLUMNS
+          ),
+        { backoffsMs: [0, 350, 900], jitterMs: 450 }
       );
 
       if (!error && Array.isArray(data)) {
@@ -1362,20 +1894,45 @@ export async function syncStudentResultsFromCloud(
   return allLocal.filter((r) => r.participantNumber.trim().toUpperCase() === normNum);
 }
 
+const CROSS_TAB_STUDENT_PULL_COOLDOWN_MS = 15_000;
+
+export type SyncTableScope =
+  | 'profile'
+  | 'schedules'
+  | 'participants'
+  | 'staff_accounts'
+  | 'results';
+
 export async function syncFromSupabase(options?: {
   force?: boolean;
   currentParticipantNumber?: string;
   isAdmin?: boolean;
   resultsOnly?: boolean;
+  deltaPreferred?: boolean;
+  tables?: SyncTableScope[];
 }): Promise<void> {
   if (!isLiveSupabaseConfigured()) return;
   const wantAdmin = Boolean(options?.isAdmin);
   const now = Date.now();
-  if (!options?.force && !syncInFlight && now - lastSyncPullMs < 1500) {
+  if (!options?.force && !options?.tables?.length && !syncInFlight && now - lastSyncPullMs < 1500) {
     return;
+  }
+  // Koordinasi lintas-tab pada browser yang sama agar 3-5 tab siswa yang online bersamaan
+  // tidak menarik profil & jadwal secara duplikat.
+  if (!wantAdmin && !options?.force && !syncInFlight) {
+    try {
+      const lastSharedPull = Number(localStorage.getItem(STUDENT_PULL_COOLDOWN_KEY) || '0');
+      if (Number.isFinite(lastSharedPull) && now - lastSharedPull >= 0 && now - lastSharedPull < CROSS_TAB_STUDENT_PULL_COOLDOWN_MS) {
+        return;
+      }
+      localStorage.setItem(STUDENT_PULL_COOLDOWN_KEY, String(now));
+    } catch {
+      // Ignore localStorage restrictions
+    }
   }
   if (
     !options?.force &&
+    !options?.tables?.length &&
     wantAdmin &&
     options?.resultsOnly &&
     !syncInFlight &&
@@ -1386,7 +1943,7 @@ export async function syncFromSupabase(options?: {
   if (syncInFlight) {
     const runningAsAdmin = syncInFlightIsAdmin;
     await syncInFlight;
-    if (!wantAdmin || runningAsAdmin) {
+    if (!wantAdmin || (runningAsAdmin && !options?.tables?.length)) {
       return;
     }
   }
@@ -1398,8 +1955,17 @@ export async function syncFromSupabase(options?: {
         isAdmin: wantAdmin,
         force: options?.force,
         resultsOnly: options?.resultsOnly,
+        deltaPreferred: options?.deltaPreferred,
+        tables: options?.tables,
       });
       lastSyncPullMs = Date.now();
+      if (!wantAdmin) {
+        try {
+          localStorage.setItem(STUDENT_PULL_COOLDOWN_KEY, String(lastSyncPullMs));
+        } catch {
+          // Ignore localStorage restrictions
+        }
+      }
     } finally {
       syncInFlight = null;
       syncInFlightIsAdmin = false;
@@ -1422,6 +1988,8 @@ async function pullFromSupabaseSilent(options?: {
   isAdmin?: boolean;
   force?: boolean;
   resultsOnly?: boolean;
+  deltaPreferred?: boolean;
+  tables?: SyncTableScope[];
 }): Promise<void> {
   try {
     await syncServerClock();
@@ -1429,12 +1997,15 @@ async function pullFromSupabaseSilent(options?: {
     const adminClient = getSupabaseAdminClient();
     const isAdmin = Boolean(options?.isAdmin);
     const readClient = isAdmin && adminClient ? adminClient : supabase;
-    const normParticipant = options?.currentParticipantNumber?.trim().toUpperCase() || '';
+    const normParticipant = normalizeParticipantNumber(options?.currentParticipantNumber);
 
     if (isAdmin) {
+      const requestedTables =
+        options?.tables && options.tables.length > 0 ? new Set<SyncTableScope>(options.tables) : null;
       const shouldFetchStatic =
         !options?.resultsOnly &&
-        (Boolean(options?.force) ||
+        (Boolean(requestedTables) ||
+          Boolean(options?.force) ||
           lastAdminStaticPullMs === 0 ||
           Date.now() - lastAdminStaticPullMs > 300_000);
 
@@ -1442,7 +2013,7 @@ async function pullFromSupabaseSilent(options?: {
         if (Date.now() - lastAdminAutoFinalizeMs >= ADMIN_SYNC_THROTTLE_MS) {
           lastAdminAutoFinalizeMs = Date.now();
           void autoFinalizeExpiredExams({
-            currentParticipantNumber: options?.currentParticipantNumber,
+            currentParticipantNumber: normParticipant || undefined,
             isAdmin: true,
           });
         }
@@ -1489,9 +2060,22 @@ async function pullFromSupabaseSilent(options?: {
         return;
       }
 
-      lastAdminStaticPullMs = Date.now();
-      lastAdminDeltaPullMs = Date.now();
-      const useFullResultsReconcile = !lastAdminResultsDeltaIso || Boolean(options?.force);
+      const wantProfile = !requestedTables || requestedTables.has('profile');
+      const wantSchedules = !requestedTables || requestedTables.has('schedules');
+      const wantParticipants = !requestedTables || requestedTables.has('participants');
+      const wantStaff = !requestedTables || requestedTables.has('staff_accounts');
+      const wantResults = !requestedTables || requestedTables.has('results');
+
+      if (!requestedTables) {
+        lastAdminStaticPullMs = Date.now();
+        lastAdminDeltaPullMs = Date.now();
+      }
+      // Hanya lakukan full reconcile exam_results pada cold load awal atau full-pull eksplisit.
+      // Saat deltaPreferred aktif (mis. tombol Sinkronkan Cloud pada Dashboard/Rekap), gunakan delta + rekonsiliasi ID saja agar hemat bandwidth & DB saat 800+ peserta aktif.
+      const useFullResultsReconcile =
+        wantResults &&
+        (!lastAdminResultsDeltaIso ||
+          (Boolean(options?.force) && !options?.deltaPreferred && !requestedTables));
       const changedTopics: string[] = [];
 
       const fetchStaffForAdminSilent = async (): Promise<{
@@ -1501,63 +2085,118 @@ async function pullFromSupabaseSilent(options?: {
         if (adminClient) {
           return fetchAllRowsByIdPaginated(adminClient, 'staff_accounts');
         }
-        const rpcRes = await supabase.rpc('staff_list_accounts', getStaffRpcAuthArgs());
+        const authArgs = await resolveStaffRpcAuthArgs();
+        if (!authArgs.p_staff_user_id || !authArgs.p_staff_password_sha256) {
+          return { data: [] };
+        }
+        const rpcRes = await supabase.rpc('staff_list_accounts', authArgs);
         if (!rpcRes.error && Array.isArray(rpcRes.data)) {
           return { data: rpcRes.data as Record<string, unknown>[] };
-        }
-        if (rpcRes.error && isRpcSignatureMismatchError(rpcRes.error.message)) {
-          return fetchAllRowsByIdPaginated(supabase, 'staff_accounts');
         }
         return { data: [], error: rpcRes.error?.message };
       };
 
-      const [profRes, schedRes, partRes, staffRes] = await Promise.all([
-        readClient
-          .from('school_profile')
-          .select(adminClient ? ADMIN_SCHOOL_PROFILE_COLUMNS : PUBLIC_SCHOOL_PROFILE_COLUMNS)
-          .eq('id', 'default')
-          .maybeSingle(),
-        fetchAllRowsByIdPaginated(readClient, 'exam_schedules'),
-        fetchAllRowsByIdPaginated(readClient, 'participants'),
-        fetchStaffForAdminSilent(),
+      const fetchParticipantsForAdminSilent = async (): Promise<{
+        data: Record<string, unknown>[];
+        error?: string;
+      }> => {
+        if (adminClient) {
+          return fetchAllRowsByIdPaginated(adminClient, 'participants');
+        }
+        const authArgs = await resolveStaffRpcAuthArgs();
+        if (authArgs.p_staff_user_id && authArgs.p_staff_password_sha256) {
+          const rpcRes = await supabase.rpc('staff_list_participants', authArgs);
+          if (!rpcRes.error && Array.isArray(rpcRes.data)) {
+            return { data: rpcRes.data as Record<string, unknown>[] };
+          }
+          if (rpcRes.error && !isRpcSignatureMismatchError(rpcRes.error.message)) {
+            return { data: [], error: rpcRes.error.message };
+          }
+        }
+        return fetchAllRowsByIdPaginated(readClient, 'participants');
+      };
+
+      const existingProfileForMeta = wantProfile
+        ? await idbGet<SchoolProfile>(STORES.META, 'default')
+        : undefined;
+
+      const [profMetaRes, schedRes, partRes, staffRes] = await Promise.all([
+        wantProfile
+          ? readClient.from('school_profile').select('id,updated_at').eq('id', 'default').maybeSingle()
+          : Promise.resolve({ data: null, error: null }),
+        wantSchedules
+          ? fetchAllRowsByIdPaginated(readClient, 'exam_schedules')
+          : Promise.resolve({ data: [] as Record<string, unknown>[], error: undefined }),
+        wantParticipants
+          ? fetchParticipantsForAdminSilent()
+          : Promise.resolve({ data: [] as Record<string, unknown>[], error: undefined }),
+        wantStaff
+          ? fetchStaffForAdminSilent()
+          : Promise.resolve({ data: [] as Record<string, unknown>[], error: undefined }),
       ]);
 
-      const hasCloudProfile = Boolean(!profRes.error && profRes.data);
+      let hasCloudProfile = Boolean(!profMetaRes.error && profMetaRes.data);
 
-      if (hasCloudProfile && profRes.data) {
+      if (wantProfile && hasCloudProfile && profMetaRes.data) {
         lastProfilePullMs = Date.now();
-        const existingProfile = await idbGet<SchoolProfile>(STORES.META, 'default');
-        const profRow = profRes.data as unknown as Record<string, unknown>;
-        const resolvedAdminPwd =
-          (typeof profRow.admin_password === 'string' && profRow.admin_password) ||
-          existingProfile?.adminPassword ||
-          SEED_SCHOOL_PROFILE.adminPassword;
-        const nextProfile: SchoolProfile = {
-          id: 'default',
-          schoolName: String(profRow.school_name || ''),
-          address: String(profRow.address || ''),
-          academicYear: String(profRow.academic_year || ''),
-          principalName: String(profRow.principal_name || ''),
-          committeeChairName: String(profRow.committee_chair_name || ''),
-          examTitle: String(profRow.exam_title || ''),
-          logoDataUrl: String(profRow.logo_data_url || '') || SEED_SCHOOL_PROFILE.logoDataUrl,
-          adminPassword: resolvedAdminPwd,
-          updatedAt: String(profRow.updated_at || new Date().toISOString()),
-        };
-        const profileDiffers =
-          !existingProfile ||
-          existingProfile.updatedAt !== nextProfile.updatedAt ||
-          existingProfile.schoolName !== nextProfile.schoolName ||
-          existingProfile.examTitle !== nextProfile.examTitle ||
-          existingProfile.adminPassword !== nextProfile.adminPassword ||
-          existingProfile.logoDataUrl !== nextProfile.logoDataUrl;
-        if (profileDiffers) {
-          await idbPut(STORES.META, nextProfile);
-          changedTopics.push('profile');
+        const remoteUpdatedAt = String(profMetaRes.data.updated_at || '');
+        const needsFullProfileFetch =
+          !existingProfileForMeta ||
+          !existingProfileForMeta.logoDataUrl ||
+          !existingProfileForMeta.kemenagLogoDataUrl ||
+          !areTimestampsEqual(remoteUpdatedAt, existingProfileForMeta.updatedAt);
+
+        if (needsFullProfileFetch) {
+          const profRes = await fetchSchoolProfileRow(readClient, Boolean(adminClient));
+          if (!profRes.error && profRes.data) {
+            const profRow = profRes.data;
+            const cloudAdminPwd =
+              typeof profRow.admin_password === 'string' && profRow.admin_password.trim()
+                ? profRow.admin_password.trim()
+                : '';
+            const verifiedActiveAdminPwd =
+              activeStaffCredentials?.userId.toLowerCase() === 'admin'
+                ? activeStaffCredentials.passwordHash
+                : '';
+            const resolvedAdminPwd =
+              cloudAdminPwd || verifiedActiveAdminPwd || '__CLOUD_MANAGED__';
+            const nextProfile: SchoolProfile = {
+              id: 'default',
+              schoolName: String(profRow.school_name || ''),
+              address: String(profRow.address || ''),
+              academicYear: String(profRow.academic_year || ''),
+              principalName: String(profRow.principal_name || ''),
+              committeeChairName: String(profRow.committee_chair_name || ''),
+              examTitle: String(profRow.exam_title || ''),
+              logoDataUrl: String(profRow.logo_data_url || '') || SEED_SCHOOL_PROFILE.logoDataUrl,
+              kemenagLogoDataUrl: resolveCloudKemenagLogo(profRow, existingProfileForMeta),
+              adminPassword: resolvedAdminPwd,
+              updatedAt: String(profRow.updated_at || new Date().toISOString()),
+            };
+            const profileDiffers =
+              !existingProfileForMeta ||
+              !areTimestampsEqual(existingProfileForMeta.updatedAt, nextProfile.updatedAt) ||
+              existingProfileForMeta.schoolName !== nextProfile.schoolName ||
+              existingProfileForMeta.address !== nextProfile.address ||
+              existingProfileForMeta.academicYear !== nextProfile.academicYear ||
+              existingProfileForMeta.principalName !== nextProfile.principalName ||
+              existingProfileForMeta.committeeChairName !== nextProfile.committeeChairName ||
+              existingProfileForMeta.examTitle !== nextProfile.examTitle ||
+              existingProfileForMeta.adminPassword !== nextProfile.adminPassword ||
+              existingProfileForMeta.logoDataUrl !== nextProfile.logoDataUrl ||
+              (existingProfileForMeta.kemenagLogoDataUrl || '') !==
+                (nextProfile.kemenagLogoDataUrl || '');
+            if (profileDiffers) {
+              await idbPut(STORES.META, nextProfile);
+              changedTopics.push('profile');
+            }
+          } else {
+            hasCloudProfile = false;
+          }
         }
       }
 
-      if (!schedRes.error && (schedRes.data.length > 0 || hasCloudProfile)) {
+      if (wantSchedules && !schedRes.error && (schedRes.data.length > 0 || hasCloudProfile || Boolean(requestedTables))) {
         const nextSchedules: ExamSchedule[] = schedRes.data.map((r) => ({
           id: r.id,
           title: r.title,
@@ -1586,17 +2225,21 @@ async function pullFromSupabaseSilent(options?: {
           await idbPutMany(STORES.SCHEDULES, nextSchedules, true);
           changedTopics.push('schedules');
         }
+        const verifiedAt = Date.now();
+        for (const sched of nextSchedules) {
+          verifiedSchedulesCache.set(sched.id, { schedule: sched, verifiedAt });
+        }
       }
 
-      if (!partRes.error && (partRes.data.length > 0 || hasCloudProfile)) {
+      if (wantParticipants && !partRes.error && (partRes.data.length > 0 || hasCloudProfile || Boolean(requestedTables))) {
         const nextParticipants: Participant[] = partRes.data.map((r) => ({
           id: String(r.id),
-          participantNumber: r.participant_number,
-          token: r.token || 'CBT2026',
-          fullName: r.full_name,
-          className: r.class_name,
-          isActive: r.is_active,
-          createdAt: r.created_at,
+          participantNumber: normalizeParticipantNumber(String(r.participant_number || '')),
+          token: String(r.token || 'CBT2026'),
+          fullName: String(r.full_name || ''),
+          className: String(r.class_name || ''),
+          isActive: Boolean(r.is_active ?? true),
+          createdAt: String(r.created_at || ''),
         }));
         const existingParts = await idbGetAll<Participant>(STORES.PARTICIPANTS);
         let partsChanged = existingParts.length !== nextParticipants.length;
@@ -1623,77 +2266,83 @@ async function pullFromSupabaseSilent(options?: {
         }
       }
 
-      if (useFullResultsReconcile) {
-        const resRes = await fetchAllRowsByIdPaginated(
-          readClient,
-          'exam_results',
-          EXAM_RESULTS_ADMIN_COLUMNS,
-          100_000
-        );
-        if (!resRes.error) {
-          lastAdminResultsDeltaIso = getMaxUpdatedAtIso(resRes.data as Record<string, unknown>[]);
-          const cloudResults = resRes.data.map((r) =>
-            mapDbExamResultRow(r as Record<string, unknown>)
+      if (wantResults) {
+        if (useFullResultsReconcile) {
+          const resRes = await fetchAllRowsByIdPaginated(
+            readClient,
+            'exam_results',
+            EXAM_RESULTS_ADMIN_COLUMNS,
+            100_000
           );
-          const localResults = await idbGetAll<ExamResult>(STORES.RESULTS);
-          let resultsDiffer = localResults.length !== cloudResults.length;
-          if (!resultsDiffer) {
-            const localById = new Map(localResults.map((r) => [r.id, r]));
-            for (const cr of cloudResults) {
-              const lr = localById.get(cr.id);
-              if (!lr) {
-                resultsDiffer = true;
-                break;
-              }
-              if (lr.syncStatus === 'pending') continue;
-              if (buildResultFingerprint(lr) !== buildResultFingerprint(cr)) {
-                resultsDiffer = true;
-                break;
+          if (!resRes.error) {
+            lastAdminResultsDeltaIso = getMaxUpdatedAtIso(resRes.data as Record<string, unknown>[]);
+            const cloudResults = resRes.data.map((r) =>
+              mapDbExamResultRow(r as Record<string, unknown>)
+            );
+            const localResults = await idbGetAll<ExamResult>(STORES.RESULTS);
+            let resultsDiffer = localResults.length !== cloudResults.length;
+            if (!resultsDiffer) {
+              const localById = new Map(localResults.map((r) => [r.id, r]));
+              for (const cr of cloudResults) {
+                const lr = localById.get(cr.id);
+                if (!lr) {
+                  resultsDiffer = true;
+                  break;
+                }
+                if (lr.syncStatus === 'pending') continue;
+                if (buildResultFingerprint(lr) !== buildResultFingerprint(cr)) {
+                  resultsDiffer = true;
+                  break;
+                }
               }
             }
+            if (resultsDiffer || options?.force) {
+              const { hasPending } = await syncResultsStoreAtomic(cloudResults);
+              if (hasPending) {
+                void flushPendingSyncQueue();
+              }
+              changedTopics.push('results');
+            }
           }
-          if (resultsDiffer || options?.force) {
-            const { hasPending } = await syncResultsStoreAtomic(cloudResults);
+        } else if (lastAdminResultsDeltaIso) {
+          const [deltaRes, deletedCount] = await Promise.all([
+            fetchExamResultsDelta(readClient, lastAdminResultsDeltaIso),
+            reconcileDeletedResultsAdmin(readClient),
+          ]);
+          if (!deltaRes.error) {
+            lastAdminResultsDeltaIso = deltaRes.maxUpdatedAt;
+            const deltaMapped = deltaRes.data.map((r) => mapDbExamResultRow(r));
+            const { hasPending, updatedCount } = await mergeResultsStoreDelta(deltaMapped);
             if (hasPending) {
               void flushPendingSyncQueue();
             }
+            if (updatedCount > 0 || deletedCount > 0) {
+              changedTopics.push('results');
+            }
+          } else if (deletedCount > 0) {
             changedTopics.push('results');
           }
-        }
-      } else if (lastAdminResultsDeltaIso) {
-        const [deltaRes, deletedCount] = await Promise.all([
-          fetchExamResultsDelta(readClient, lastAdminResultsDeltaIso),
-          reconcileDeletedResultsAdmin(readClient),
-        ]);
-        if (!deltaRes.error) {
-          lastAdminResultsDeltaIso = deltaRes.maxUpdatedAt;
-          const deltaMapped = deltaRes.data.map((r) => mapDbExamResultRow(r));
-          const { hasPending, updatedCount } = await mergeResultsStoreDelta(deltaMapped);
-          if (hasPending) {
-            void flushPendingSyncQueue();
-          }
-          if (updatedCount > 0 || deletedCount > 0) {
-            changedTopics.push('results');
-          }
-        } else if (deletedCount > 0) {
-          changedTopics.push('results');
         }
       }
 
-      if (!staffRes.error && staffRes.data.length > 0) {
+      if (wantStaff && !staffRes.error && staffRes.data.length > 0) {
         const existingStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-        const existingByUser = new Map(
-          existingStaff.map((e) => [e.userId.trim().toLowerCase(), e])
-        );
+        const activeUserLower = activeStaffCredentials?.userId.trim().toLowerCase() || '';
         const mappedStaff: StaffAccount[] = staffRes.data.map((s) => {
           const userId = String(s.user_id || '');
-          const localPrev = existingByUser.get(userId.trim().toLowerCase());
-          const rawPwd = typeof s.password_hash === 'string' ? s.password_hash : '';
+          const normUser = userId.trim().toLowerCase();
+          const rawPwd = typeof s.password_hash === 'string' ? s.password_hash.trim() : '';
+          // Jangan pernah mempertahankan sandi seed lokal (proktor123/guru123/admin123) saat cloud tidak mengembalikan hash.
+          const resolvedPwd =
+            rawPwd ||
+            (normUser && normUser === activeUserLower && activeStaffCredentials?.passwordHash
+              ? activeStaffCredentials.passwordHash
+              : '__CLOUD_MANAGED__');
           return {
             id: String(s.id),
             userId,
             name: String(s.name || ''),
-            password: rawPwd || localPrev?.password || '__CLOUD_MANAGED__',
+            password: resolvedPwd,
             roleType: s.role_type as StaffAccount['roleType'],
             roleLabel: String(s.role_label || 'Staff'),
             allowedTabs: Array.isArray(s.allowed_tabs)
@@ -1732,7 +2381,7 @@ async function pullFromSupabaseSilent(options?: {
         }
       }
 
-      if (adminClient) {
+      if (!requestedTables && adminClient) {
         const localQuestions = await idbGetAll<Question>(STORES.QUESTIONS);
         const check = await shouldDownloadAllQuestions(adminClient, localQuestions.length);
         if (check.shouldFetch) {
@@ -1751,7 +2400,9 @@ async function pullFromSupabaseSilent(options?: {
       if (changedTopics.length > 0) {
         broadcastDataChange(`supabase_pull_changed:${changedTopics.join(',')}`);
       }
-      maybeAutoFinalizeAdmin();
+      if (wantResults) {
+        maybeAutoFinalizeAdmin();
+      }
       return;
     }
 
@@ -1790,27 +2441,30 @@ async function pullFromSupabaseSilent(options?: {
       const needsFullProfile =
         !localProfile ||
         !localProfile.logoDataUrl ||
-        profMetaRes.data.updated_at !== localProfile.updatedAt;
+        !localProfile.kemenagLogoDataUrl ||
+        !areTimestampsEqual(String(profMetaRes.data.updated_at || ''), localProfile.updatedAt);
 
       if (needsFullProfile) {
-        const profRes = await supabase
-          .from('school_profile')
-          .select(PUBLIC_SCHOOL_PROFILE_COLUMNS)
-          .eq('id', 'default')
-          .maybeSingle();
+        const profRes = await fetchSchoolProfileRow(supabase, false);
 
         if (!profRes.error && profRes.data) {
+          const profRow = profRes.data;
+          const safeAdminPwd =
+            activeStaffCredentials?.userId.toLowerCase() === 'admin'
+              ? activeStaffCredentials.passwordHash
+              : '__CLOUD_MANAGED__';
           await idbPut(STORES.META, {
             id: 'default',
-            schoolName: profRes.data.school_name,
-            address: profRes.data.address,
-            academicYear: profRes.data.academic_year,
-            principalName: profRes.data.principal_name,
-            committeeChairName: profRes.data.committee_chair_name,
-            examTitle: profRes.data.exam_title,
-            logoDataUrl: profRes.data.logo_data_url || SEED_SCHOOL_PROFILE.logoDataUrl,
-            adminPassword: localProfile?.adminPassword || SEED_SCHOOL_PROFILE.adminPassword,
-            updatedAt: profRes.data.updated_at,
+            schoolName: String(profRow.school_name || ''),
+            address: String(profRow.address || ''),
+            academicYear: String(profRow.academic_year || ''),
+            principalName: String(profRow.principal_name || ''),
+            committeeChairName: String(profRow.committee_chair_name || ''),
+            examTitle: String(profRow.exam_title || ''),
+            logoDataUrl: String(profRow.logo_data_url || '') || SEED_SCHOOL_PROFILE.logoDataUrl,
+            kemenagLogoDataUrl: resolveCloudKemenagLogo(profRow, localProfile),
+            adminPassword: safeAdminPwd,
+            updatedAt: String(profRow.updated_at || new Date().toISOString()),
           } satisfies SchoolProfile);
         } else {
           hasCloudProfile = false;
@@ -1819,23 +2473,24 @@ async function pullFromSupabaseSilent(options?: {
     }
 
     if (shouldFetchSchedules && !schedRes.error && (schedRes.data.length > 0 || hasCloudProfile)) {
-      lastStudentSchedulesPullMs = Date.now();
-      await idbPutMany(
-        STORES.SCHEDULES,
-        schedRes.data.map((r) => ({
-          id: r.id,
-          title: r.title,
-          subject: r.subject,
-          kkm: Number(r.kkm ?? 75),
-          durationMinutes: r.duration_minutes,
-          targetClasses: r.target_classes,
-          isActive: r.is_active,
-          randomizeQuestions: Boolean(r.randomize_questions ?? false),
-          maxTabSwitches: r.max_tab_switches,
-          createdAt: r.created_at,
-        })),
-        true
-      );
+      const mappedSchedules: ExamSchedule[] = schedRes.data.map((r) => ({
+        id: r.id,
+        title: r.title,
+        subject: r.subject,
+        kkm: Number(r.kkm ?? 75),
+        durationMinutes: r.duration_minutes,
+        targetClasses: r.target_classes,
+        isActive: r.is_active,
+        randomizeQuestions: Boolean(r.randomize_questions ?? false),
+        maxTabSwitches: r.max_tab_switches,
+        createdAt: r.created_at,
+      }));
+      await idbPutMany(STORES.SCHEDULES, mappedSchedules, true);
+      const verifiedAt = Date.now();
+      lastStudentSchedulesPullMs = verifiedAt;
+      for (const sched of mappedSchedules) {
+        verifiedSchedulesCache.set(sched.id, { schedule: sched, verifiedAt });
+      }
     }
 
     if (normParticipant && !myResRes.error && Array.isArray(myResRes.data)) {
@@ -1864,103 +2519,109 @@ async function pullFromSupabaseSilent(options?: {
 export async function getSchoolProfile(): Promise<SchoolProfile> {
   await ensureInitialized();
   const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
-  return profile || SEED_SCHOOL_PROFILE;
+  if (!profile) return SEED_SCHOOL_PROFILE;
+  return {
+    ...profile,
+    kemenagLogoDataUrl:
+      profile.kemenagLogoDataUrl || SEED_SCHOOL_PROFILE.kemenagLogoDataUrl,
+  };
 }
 
-export async function saveSchoolProfile(profile: SchoolProfile): Promise<void> {
+export async function saveSchoolProfile(
+  profile: SchoolProfile,
+  options?: { updateAdminPassword?: boolean }
+): Promise<CloudSyncWriteResult> {
   await ensureInitialized();
-  const hashedAdminPwd = await hashPassword(profile.adminPassword || 'admin123');
+  const existingProfile = await idbGet<SchoolProfile>(STORES.META, 'default');
+  const shouldUpdateAdminPwd = Boolean(options?.updateAdminPassword);
+  const rawAdminPwd = (profile.adminPassword || '').trim();
+  const hasRealNewAdminPwd =
+    shouldUpdateAdminPwd && Boolean(rawAdminPwd) && rawAdminPwd !== '__CLOUD_MANAGED__';
+  const hashedAdminPwd = hasRealNewAdminPwd ? await hashPassword(rawAdminPwd) : null;
+
+  // Tangkap kredensial RPC LAMA sebelum memperbarui activeStaffCredentials agar assert_verified_staff di server menerima permintaan
+  const oldAuthArgs = await resolveStaffRpcAuthArgs();
+  const isUpdatingSelfAdmin =
+    (activeStaffCredentials?.userId || oldAuthArgs.p_staff_user_id || '').trim().toLowerCase() ===
+    'admin';
+
   const updated: SchoolProfile = {
     ...profile,
     id: 'default',
-    adminPassword: hashedAdminPwd,
+    adminPassword:
+      hashedAdminPwd ||
+      existingProfile?.adminPassword ||
+      (isLiveSupabaseConfigured() ? '__CLOUD_MANAGED__' : SEED_SCHOOL_PROFILE.adminPassword),
     updatedAt: new Date().toISOString(),
   };
   await idbPut(STORES.META, updated);
 
-  if (activeStaffCredentials?.userId.toLowerCase() === 'admin') {
-    activeStaffCredentials.passwordHash = hashedAdminPwd;
+  let updatedAdminAccount: StaffAccount | null = null;
+  if (hashedAdminPwd) {
+    const staffList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+    const existingAdmin = staffList.find((s) => s.userId.toLowerCase() === 'admin');
+    const baseAdmin = existingAdmin || {
+      ...SEED_STAFF_ACCOUNTS[0],
+      allowedTabs: ALL_ADMIN_TABS,
+    };
+    updatedAdminAccount = { ...baseAdmin, password: hashedAdminPwd };
+    await idbPutStaffSafe([updatedAdminAccount]);
   }
 
-  // Keep primary 'admin' staff account password in sync (hashed in staff_accounts)
-  const staffList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-  const existingAdmin = staffList.find((s) => s.userId.toLowerCase() === 'admin');
-  const baseAdmin = existingAdmin || {
-    ...SEED_STAFF_ACCOUNTS[0],
-    allowedTabs: ALL_ADMIN_TABS,
-  };
-  if (!existingAdmin || existingAdmin.password !== hashedAdminPwd) {
-    const updatedAdmin: StaffAccount = { ...baseAdmin, password: hashedAdminPwd };
-    await idbPutStaffSafe([updatedAdmin]);
-    if (isLiveSupabaseConfigured()) {
-      try {
-        const adminClient = getSupabaseAdminClient();
-        const supabase = getSupabaseClient();
-        if (adminClient) {
-          await adminClient.from('staff_accounts').upsert(
-            {
-              id: updatedAdmin.id,
-              user_id: updatedAdmin.userId,
-              name: updatedAdmin.name,
-              password_hash: updatedAdmin.password,
-              role_type: updatedAdmin.roleType,
-              role_label: updatedAdmin.roleLabel,
-              allowed_tabs: updatedAdmin.allowedTabs,
-              assigned_subjects: updatedAdmin.assignedSubjects,
-              restrict_to_assigned_subjects: updatedAdmin.restrictToAssignedSubjects,
-              is_active: updatedAdmin.isActive,
-              created_at: updatedAdmin.createdAt,
-            },
-            { onConflict: 'user_id' }
-          );
-        } else {
-          const { error: rpcErr } = await supabase.rpc('staff_upsert_account', {
-            ...getStaffRpcAuthArgs(),
-            p_id: updatedAdmin.id,
-            p_target_user_id: updatedAdmin.userId,
-            p_name: updatedAdmin.name,
-            p_password_hash: updatedAdmin.password,
-            p_role_type: updatedAdmin.roleType,
-            p_role_label: updatedAdmin.roleLabel,
-            p_allowed_tabs: updatedAdmin.allowedTabs,
-            p_assigned_subjects: updatedAdmin.assignedSubjects,
-            p_restrict_to_assigned_subjects: updatedAdmin.restrictToAssignedSubjects,
-            p_is_active: updatedAdmin.isActive,
-            p_created_at: updatedAdmin.createdAt,
-          });
-          if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-            await supabase.from('staff_accounts').upsert(
-              {
-                id: updatedAdmin.id,
-                user_id: updatedAdmin.userId,
-                name: updatedAdmin.name,
-                password_hash: updatedAdmin.password,
-                role_type: updatedAdmin.roleType,
-                role_label: updatedAdmin.roleLabel,
-                allowed_tabs: updatedAdmin.allowedTabs,
-                assigned_subjects: updatedAdmin.assignedSubjects,
-                restrict_to_assigned_subjects: updatedAdmin.restrictToAssignedSubjects,
-                is_active: updatedAdmin.isActive,
-                created_at: updatedAdmin.createdAt,
-              },
-              { onConflict: 'user_id' }
-            );
-          }
-        }
-      } catch {
-        // Ignore if staff_accounts table not yet migrated
-      }
-    }
-  }
-
-  broadcastDataChange('profile');
+  let synced = false;
+  let syncError: string | undefined;
 
   if (isLiveSupabaseConfigured()) {
     try {
       const adminClient = getSupabaseAdminClient();
       const supabase = getSupabaseClient();
+      let staffSynced = !hashedAdminPwd;
+
+      if (hashedAdminPwd && updatedAdminAccount) {
+        if (adminClient) {
+          const { error: stErr } = await adminClient.from('staff_accounts').upsert(
+            {
+              id: updatedAdminAccount.id,
+              user_id: updatedAdminAccount.userId,
+              name: updatedAdminAccount.name,
+              password_hash: updatedAdminAccount.password,
+              role_type: updatedAdminAccount.roleType,
+              role_label: updatedAdminAccount.roleLabel,
+              allowed_tabs: updatedAdminAccount.allowedTabs,
+              assigned_subjects: updatedAdminAccount.assignedSubjects,
+              restrict_to_assigned_subjects: updatedAdminAccount.restrictToAssignedSubjects,
+              is_active: updatedAdminAccount.isActive,
+              created_at: updatedAdminAccount.createdAt,
+            },
+            { onConflict: 'user_id' }
+          );
+          if (stErr) syncError = stErr.message;
+          else staffSynced = true;
+        } else {
+          const { error: rpcErr } = await supabase.rpc('staff_upsert_account', {
+            ...oldAuthArgs,
+            p_id: updatedAdminAccount.id,
+            p_target_user_id: updatedAdminAccount.userId,
+            p_name: updatedAdminAccount.name,
+            p_password_hash: updatedAdminAccount.password,
+            p_role_type: updatedAdminAccount.roleType,
+            p_role_label: updatedAdminAccount.roleLabel,
+            p_allowed_tabs: updatedAdminAccount.allowedTabs,
+            p_assigned_subjects: updatedAdminAccount.assignedSubjects,
+            p_restrict_to_assigned_subjects: updatedAdminAccount.restrictToAssignedSubjects,
+            p_is_active: updatedAdminAccount.isActive,
+            p_created_at: updatedAdminAccount.createdAt,
+          });
+          if (!rpcErr) {
+            staffSynced = true;
+          } else {
+            syncError = rpcErr.message;
+          }
+        }
+      }
+
       if (adminClient) {
-        await adminClient.from('school_profile').upsert({
+        const row: Record<string, unknown> = {
           id: 'default',
           school_name: updated.schoolName,
           address: updated.address,
@@ -1969,12 +2630,27 @@ export async function saveSchoolProfile(profile: SchoolProfile): Promise<void> {
           committee_chair_name: updated.committeeChairName,
           exam_title: updated.examTitle,
           logo_data_url: updated.logoDataUrl,
-          admin_password: hashedAdminPwd,
+          kemenag_logo_data_url: updated.kemenagLogoDataUrl || '',
           updated_at: updated.updatedAt,
-        });
+        };
+        if (hashedAdminPwd) {
+          row.admin_password = hashedAdminPwd;
+        }
+        const { error: profErr } = await upsertSchoolProfileRowDirect(adminClient, row);
+        if (profErr) {
+          syncError = syncError ? `${syncError}; ${profErr.message}` : profErr.message;
+        } else if (staffSynced) {
+          synced = true;
+        }
       } else {
-        const { error: rpcErr } = await supabase.rpc('staff_upsert_school_profile', {
-          ...getStaffRpcAuthArgs(),
+        // Jika sandi admin baru saja berhasil disimpan ke staff_accounts, gunakan kredensial baru untuk RPC berikutnya (dengan fallback ke lama)
+        const profileAuthArgs =
+          isUpdatingSelfAdmin && hashedAdminPwd && staffSynced
+            ? { p_staff_user_id: 'admin', p_staff_password_sha256: hashedAdminPwd }
+            : oldAuthArgs;
+
+        let { error: rpcErr } = await callStaffUpsertSchoolProfileRpc(supabase, {
+          ...profileAuthArgs,
           p_school_name: updated.schoolName,
           p_address: updated.address,
           p_academic_year: updated.academicYear,
@@ -1982,28 +2658,56 @@ export async function saveSchoolProfile(profile: SchoolProfile): Promise<void> {
           p_committee_chair_name: updated.committeeChairName,
           p_exam_title: updated.examTitle,
           p_logo_data_url: updated.logoDataUrl,
+          p_kemenag_logo_data_url: updated.kemenagLogoDataUrl ?? '',
           p_admin_password_hash: hashedAdminPwd,
           p_updated_at: updated.updatedAt,
         });
-        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-          await supabase.from('school_profile').upsert({
-            id: 'default',
-            school_name: updated.schoolName,
-            address: updated.address,
-            academic_year: updated.academicYear,
-            principal_name: updated.principalName,
-            committee_chair_name: updated.committeeChairName,
-            exam_title: updated.examTitle,
-            logo_data_url: updated.logoDataUrl,
-            admin_password: hashedAdminPwd,
-            updated_at: updated.updatedAt,
+
+        if (
+          rpcErr &&
+          isUpdatingSelfAdmin &&
+          hashedAdminPwd &&
+          staffSynced &&
+          rpcErr.message.toLowerCase().includes('unauthorized')
+        ) {
+          const retry = await callStaffUpsertSchoolProfileRpc(supabase, {
+            ...oldAuthArgs,
+            p_school_name: updated.schoolName,
+            p_address: updated.address,
+            p_academic_year: updated.academicYear,
+            p_principal_name: updated.principalName,
+            p_committee_chair_name: updated.committeeChairName,
+            p_exam_title: updated.examTitle,
+            p_logo_data_url: updated.logoDataUrl,
+            p_kemenag_logo_data_url: updated.kemenagLogoDataUrl ?? '',
+            p_admin_password_hash: hashedAdminPwd,
+            p_updated_at: updated.updatedAt,
           });
+          rpcErr = retry.error;
+        }
+
+        if (!rpcErr) {
+          if (staffSynced) synced = true;
+        } else {
+          syncError = syncError ? `${syncError}; ${rpcErr.message}` : rpcErr.message;
         }
       }
-    } catch {
-      // Cached locally
+
+      if (isUpdatingSelfAdmin && hashedAdminPwd && staffSynced && activeStaffCredentials) {
+        activeStaffCredentials.passwordHash = hashedAdminPwd;
+      }
+    } catch (err) {
+      syncError = err instanceof Error ? err.message : 'Gagal terhubung ke Supabase';
     }
+  } else if (isUpdatingSelfAdmin && hashedAdminPwd && activeStaffCredentials) {
+    activeStaffCredentials.passwordHash = hashedAdminPwd;
   }
+
+  broadcastDataChange('profile');
+  if (hashedAdminPwd) {
+    broadcastDataChange('staff_accounts');
+  }
+  return { synced, error: syncError };
 }
 
 // ============================================================================
@@ -2020,73 +2724,51 @@ export async function getStaffAccounts(): Promise<StaffAccount[]> {
 }
 
 export async function upsertStaffAccount(
-  account: StaffAccount
+  account: StaffAccount,
+  options?: { updatePassword?: boolean }
 ): Promise<{ synced: boolean; error?: string }> {
   await ensureInitialized();
-  const rawPassword = account.password.trim();
-  const isCloudPlaceholder = rawPassword === '__CLOUD_MANAGED__';
-  const hashedPassword = isCloudPlaceholder
-    ? '__CLOUD_MANAGED__'
-    : rawPassword
-      ? await hashPassword(rawPassword)
-      : '';
+  const existingStaffList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
+  const existingLocal = existingStaffList.find(
+    (s) =>
+      s.id === account.id ||
+      s.userId.trim().toLowerCase() === account.userId.trim().toLowerCase()
+  );
+
+  const rawPassword = (account.password || '').trim();
+  const isCloudPlaceholder = !rawPassword || rawPassword === '__CLOUD_MANAGED__';
+  const shouldUpdatePassword =
+    options?.updatePassword !== undefined
+      ? Boolean(options.updatePassword) && !isCloudPlaceholder
+      : !isCloudPlaceholder;
+
+  const hashedPassword = shouldUpdatePassword ? await hashPassword(rawPassword) : '';
+  const localPasswordToStore = shouldUpdatePassword
+    ? hashedPassword
+    : existingLocal?.password || '__CLOUD_MANAGED__';
+  const cloudPasswordToSend = shouldUpdatePassword ? hashedPassword : '';
+
+  // Tangkap kredensial RPC LAMA sebelum mengubah activeStaffCredentials agar RPC terotorisasi
+  const oldAuthArgs = await resolveStaffRpcAuthArgs();
+  const normalizedUserId = account.userId.trim();
+  const isUpdatingSelf = Boolean(
+    activeStaffCredentials &&
+      (activeStaffCredentials.userId.trim().toLowerCase() === normalizedUserId.toLowerCase() ||
+        (existingLocal &&
+          activeStaffCredentials.userId.trim().toLowerCase() ===
+            existingLocal.userId.trim().toLowerCase()))
+  );
+
   const normalized: StaffAccount = {
     ...account,
-    userId: account.userId.trim(),
-    password: hashedPassword,
+    userId: normalizedUserId,
+    password: localPasswordToStore,
   };
   await idbPutStaffSafe([normalized]);
 
-  if (
-    activeStaffCredentials &&
-    activeStaffCredentials.userId.trim().toLowerCase() === normalized.userId.toLowerCase() &&
-    hashedPassword &&
-    !isCloudPlaceholder
-  ) {
-    activeStaffCredentials.passwordHash = hashedPassword;
-  }
-
-  if (normalized.userId.toLowerCase() === 'admin' && hashedPassword && !isCloudPlaceholder) {
-    const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
-    if (profile && profile.adminPassword !== hashedPassword) {
-      const updatedProfile = {
-        ...profile,
-        adminPassword: hashedPassword,
-        updatedAt: new Date().toISOString(),
-      };
-      await idbPut(STORES.META, updatedProfile);
-      if (isLiveSupabaseConfigured()) {
-        try {
-          const adminClient = getSupabaseAdminClient();
-          const supabase = getSupabaseClient();
-          if (adminClient) {
-            await adminClient
-              .from('school_profile')
-              .update({ admin_password: hashedPassword, updated_at: updatedProfile.updatedAt })
-              .eq('id', 'default');
-          } else {
-            await supabase.rpc('staff_upsert_school_profile', {
-              ...getStaffRpcAuthArgs(),
-              p_school_name: updatedProfile.schoolName,
-              p_address: updatedProfile.address,
-              p_academic_year: updatedProfile.academicYear,
-              p_principal_name: updatedProfile.principalName,
-              p_committee_chair_name: updatedProfile.committeeChairName,
-              p_exam_title: updatedProfile.examTitle,
-              p_logo_data_url: updatedProfile.logoDataUrl,
-              p_admin_password_hash: hashedPassword,
-              p_updated_at: updatedProfile.updatedAt,
-            });
-          }
-        } catch {
-          // Cached locally
-        }
-      }
-    }
-  }
-
   let synced = false;
   let syncError: string | undefined;
+  let staffCloudSaved = false;
 
   if (isLiveSupabaseConfigured()) {
     try {
@@ -2105,24 +2787,66 @@ export async function upsertStaffAccount(
           is_active: normalized.isActive,
           created_at: normalized.createdAt,
         };
-        if (!isCloudPlaceholder && normalized.password) {
-          dbRow.password_hash = normalized.password;
+        if (shouldUpdatePassword && hashedPassword) {
+          dbRow.password_hash = hashedPassword;
         }
-        const { error } = await adminClient
-          .from('staff_accounts')
-          .upsert(dbRow, { onConflict: 'user_id' });
-        if (error) {
-          syncError = error.message;
+
+        if (!shouldUpdatePassword) {
+          const { data: updRows, error: updErr } = await adminClient
+            .from('staff_accounts')
+            .update({
+              user_id: normalized.userId,
+              name: normalized.name,
+              role_type: normalized.roleType,
+              role_label: normalized.roleLabel,
+              allowed_tabs: normalized.allowedTabs,
+              assigned_subjects: normalized.assignedSubjects,
+              restrict_to_assigned_subjects: normalized.restrictToAssignedSubjects,
+              is_active: normalized.isActive,
+            })
+            .eq('id', normalized.id)
+            .select('id');
+          if (updErr) {
+            syncError = updErr.message;
+          } else if (Array.isArray(updRows) && updRows.length > 0) {
+            staffCloudSaved = true;
+          } else {
+            const { error: byUidErr } = await adminClient
+              .from('staff_accounts')
+              .update({
+                name: normalized.name,
+                role_type: normalized.roleType,
+                role_label: normalized.roleLabel,
+                allowed_tabs: normalized.allowedTabs,
+                assigned_subjects: normalized.assignedSubjects,
+                restrict_to_assigned_subjects: normalized.restrictToAssignedSubjects,
+                is_active: normalized.isActive,
+              })
+              .ilike('user_id', escapeLikePattern(normalized.userId));
+            if (byUidErr) syncError = byUidErr.message;
+            else staffCloudSaved = true;
+          }
         } else {
-          synced = true;
+          const { error } = await adminClient
+            .from('staff_accounts')
+            .upsert(dbRow, { onConflict: 'id' });
+          if (error) {
+            const retry = await adminClient
+              .from('staff_accounts')
+              .upsert(dbRow, { onConflict: 'user_id' });
+            if (retry.error) syncError = retry.error.message;
+            else staffCloudSaved = true;
+          } else {
+            staffCloudSaved = true;
+          }
         }
       } else {
-        const { error: rpcErr } = await supabase.rpc('staff_upsert_account', {
-          ...getStaffRpcAuthArgs(),
+        const rpcPayload = {
+          ...oldAuthArgs,
           p_id: normalized.id,
           p_target_user_id: normalized.userId,
           p_name: normalized.name,
-          p_password_hash: normalized.password,
+          p_password_hash: cloudPasswordToSend,
           p_role_type: normalized.roleType,
           p_role_label: normalized.roleLabel,
           p_allowed_tabs: normalized.allowedTabs,
@@ -2130,38 +2854,136 @@ export async function upsertStaffAccount(
           p_restrict_to_assigned_subjects: normalized.restrictToAssignedSubjects,
           p_is_active: normalized.isActive,
           p_created_at: normalized.createdAt,
-        });
+        };
+        let { error: rpcErr } = await supabase.rpc('staff_upsert_account', rpcPayload);
+
+        // Tangani kasus ubah kapitalisasi / rename ID pada database lama yang masih memakai ON CONFLICT (user_id)
+        if (
+          rpcErr &&
+          shouldUpdatePassword &&
+          (rpcErr.code === '23505' || rpcErr.message.toLowerCase().includes('staff_accounts_pkey')) &&
+          existingLocal &&
+          existingLocal.userId !== normalized.userId &&
+          existingLocal.userId.toLowerCase() !== 'admin'
+        ) {
+          await supabase.rpc('staff_delete_account', {
+            ...oldAuthArgs,
+            p_target_id: existingLocal.id,
+            p_target_user_id: existingLocal.userId,
+          });
+          const retry = await supabase.rpc('staff_upsert_account', rpcPayload);
+          rpcErr = retry.error;
+        }
+
         if (!rpcErr) {
-          synced = true;
-        } else if (isRpcSignatureMismatchError(rpcErr.message) && !isCloudPlaceholder) {
-          const { error } = await supabase.from('staff_accounts').upsert(
-            {
-              id: normalized.id,
-              user_id: normalized.userId,
-              name: normalized.name,
-              password_hash: normalized.password,
-              role_type: normalized.roleType,
-              role_label: normalized.roleLabel,
-              allowed_tabs: normalized.allowedTabs,
-              assigned_subjects: normalized.assignedSubjects,
-              restrict_to_assigned_subjects: normalized.restrictToAssignedSubjects,
-              is_active: normalized.isActive,
-              created_at: normalized.createdAt,
-            },
-            { onConflict: 'user_id' }
-          );
-          if (error) syncError = error.message;
-          else synced = true;
+          staffCloudSaved = true;
         } else {
           syncError = rpcErr.message;
+        }
+      }
+
+      // Sinkronkan juga school_profile.admin_password ketika sandi akun admin utama diubah
+      if (normalized.userId.toLowerCase() === 'admin' && shouldUpdatePassword && hashedPassword) {
+        const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
+        const updatedProfile: SchoolProfile = {
+          ...(profile || SEED_SCHOOL_PROFILE),
+          id: 'default',
+          adminPassword: hashedPassword,
+          updatedAt: new Date().toISOString(),
+        };
+        await idbPut(STORES.META, updatedProfile);
+
+        if (adminClient) {
+          const { error: profErr } = await adminClient
+            .from('school_profile')
+            .update({ admin_password: hashedPassword, updated_at: updatedProfile.updatedAt })
+            .eq('id', 'default');
+          if (profErr) {
+            syncError = syncError ? `${syncError}; ${profErr.message}` : profErr.message;
+          }
+        } else {
+          const profileAuthArgs =
+            isUpdatingSelf && staffCloudSaved
+              ? { p_staff_user_id: normalized.userId, p_staff_password_sha256: hashedPassword }
+              : oldAuthArgs;
+
+          let { error: profRpcErr } = await callStaffUpsertSchoolProfileRpc(supabase, {
+            ...profileAuthArgs,
+            p_school_name: updatedProfile.schoolName,
+            p_address: updatedProfile.address,
+            p_academic_year: updatedProfile.academicYear,
+            p_principal_name: updatedProfile.principalName,
+            p_committee_chair_name: updatedProfile.committeeChairName,
+            p_exam_title: updatedProfile.examTitle,
+            p_logo_data_url: updatedProfile.logoDataUrl,
+            p_kemenag_logo_data_url: updatedProfile.kemenagLogoDataUrl ?? null,
+            p_admin_password_hash: hashedPassword,
+            p_updated_at: updatedProfile.updatedAt,
+          });
+          if (
+            profRpcErr &&
+            isUpdatingSelf &&
+            staffCloudSaved &&
+            profRpcErr.message.toLowerCase().includes('unauthorized')
+          ) {
+            const retry = await callStaffUpsertSchoolProfileRpc(supabase, {
+              ...oldAuthArgs,
+              p_school_name: updatedProfile.schoolName,
+              p_address: updatedProfile.address,
+              p_academic_year: updatedProfile.academicYear,
+              p_principal_name: updatedProfile.principalName,
+              p_committee_chair_name: updatedProfile.committeeChairName,
+              p_exam_title: updatedProfile.examTitle,
+              p_logo_data_url: updatedProfile.logoDataUrl,
+              p_kemenag_logo_data_url: updatedProfile.kemenagLogoDataUrl ?? null,
+              p_admin_password_hash: hashedPassword,
+              p_updated_at: updatedProfile.updatedAt,
+            });
+            profRpcErr = retry.error;
+          }
+          if (profRpcErr) {
+            syncError = syncError ? `${syncError}; ${profRpcErr.message}` : profRpcErr.message;
+          }
+        }
+      }
+
+      if (staffCloudSaved && !syncError) {
+        synced = true;
+      }
+
+      // Perbarui kredensial aktif di memori HANYA setelah tersimpan ke cloud
+      if (isUpdatingSelf && staffCloudSaved && activeStaffCredentials) {
+        activeStaffCredentials.userId = normalized.userId;
+        if (shouldUpdatePassword && hashedPassword) {
+          activeStaffCredentials.passwordHash = hashedPassword;
         }
       }
     } catch (err) {
       syncError = err instanceof Error ? err.message : 'Gagal terhubung ke Supabase';
     }
+  } else {
+    if (normalized.userId.toLowerCase() === 'admin' && shouldUpdatePassword && hashedPassword) {
+      const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
+      if (profile) {
+        await idbPut(STORES.META, {
+          ...profile,
+          adminPassword: hashedPassword,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+    if (isUpdatingSelf && activeStaffCredentials) {
+      activeStaffCredentials.userId = normalized.userId;
+      if (shouldUpdatePassword && hashedPassword) {
+        activeStaffCredentials.passwordHash = hashedPassword;
+      }
+    }
   }
 
   broadcastDataChange('staff_accounts');
+  if (normalized.userId.toLowerCase() === 'admin' && shouldUpdatePassword) {
+    broadcastDataChange('profile');
+  }
   return { synced, error: syncError };
 }
 
@@ -2196,17 +3018,14 @@ export async function deleteStaffAccount(
           synced = true;
         }
       } else {
+        const authArgs = await resolveStaffRpcAuthArgs();
         const { error: rpcErr } = await supabase.rpc('staff_delete_account', {
-          ...getStaffRpcAuthArgs(),
+          ...authArgs,
           p_target_id: id,
           p_target_user_id: existing?.userId || null,
         });
         if (!rpcErr) {
           synced = true;
-        } else if (isRpcSignatureMismatchError(rpcErr.message)) {
-          const { error: idErr } = await supabase.from('staff_accounts').delete().eq('id', id);
-          if (idErr) syncError = idErr.message;
-          else synced = true;
         } else {
           syncError = rpcErr.message;
         }
@@ -2220,10 +3039,36 @@ export async function deleteStaffAccount(
   return { synced, error: syncError };
 }
 
+export async function verifyStaffPassword(
+  rawUserId: string,
+  rawPassword: string
+): Promise<boolean> {
+  const res = await authenticateStaffInternal(rawUserId, rawPassword, false);
+  return res.ok;
+}
+
 export async function authenticateStaff(
   rawUserId: string,
   rawPassword: string
-): Promise<{ ok: boolean; staff: StaffAccount | null; message?: string }> {
+): Promise<{
+  ok: boolean;
+  staff: StaffAccount | null;
+  message?: string;
+  sqlUpdateRequired?: boolean;
+}> {
+  return authenticateStaffInternal(rawUserId, rawPassword, true);
+}
+
+async function authenticateStaffInternal(
+  rawUserId: string,
+  rawPassword: string,
+  establishSession: boolean
+): Promise<{
+  ok: boolean;
+  staff: StaffAccount | null;
+  message?: string;
+  sqlUpdateRequired?: boolean;
+}> {
   await ensureInitialized();
   const normId = rawUserId.trim().toLowerCase();
   const pwd = rawPassword.trim();
@@ -2234,6 +3079,8 @@ export async function authenticateStaff(
   if (!pwd) {
     return { ok: false, staff: null, message: 'Masukkan Sandi / PIN terlebih dahulu.' };
   }
+
+  let allowLocalFallback = !isLiveSupabaseConfigured();
 
   if (isLiveSupabaseConfigured()) {
     try {
@@ -2265,66 +3112,171 @@ export async function authenticateStaff(
             isActive: Boolean(row.is_active),
             createdAt: String(row.created_at || new Date().toISOString()),
           };
-          await idbPutStaffSafe([verified]);
-          setActiveStaffCredentials(verified);
+          if (establishSession) {
+            await idbPutStaffSafe([verified]);
+            if (verified.userId.trim().toLowerCase() === 'admin') {
+              const existingProf = await idbGet<SchoolProfile>(STORES.META, 'default');
+              if (existingProf) {
+                await idbPut(STORES.META, { ...existingProf, adminPassword: hashedPwd });
+              }
+            }
+            setActiveStaffCredentials(verified);
+          }
           return { ok: true, staff: verified };
         }
-        const rpcMsg = row.message ? String(row.message) : '';
-        if (rpcMsg && rpcMsg !== 'not_found') {
+        const rpcMsg = row.message ? String(row.message).trim() : '';
+        const lowerMsg = rpcMsg.toLowerCase();
+        if (row.is_active === false || lowerMsg.includes('dinonaktifkan') || lowerMsg === 'inactive') {
+          return {
+            ok: false,
+            staff: null,
+            message:
+              rpcMsg && lowerMsg !== 'inactive'
+                ? rpcMsg
+                : `Akun dengan ID "${rawUserId.trim()}" sedang dinonaktifkan oleh Administrator.`,
+          };
+        }
+        if (
+          lowerMsg === 'wrong_password' ||
+          lowerMsg.includes('sandi') ||
+          lowerMsg.includes('pin tidak sesuai')
+        ) {
+          return {
+            ok: false,
+            staff: null,
+            message:
+              rpcMsg && lowerMsg !== 'wrong_password' ? rpcMsg : 'Sandi / PIN tidak sesuai.',
+          };
+        }
+        if (rpcMsg && lowerMsg !== 'not_found') {
           return { ok: false, staff: null, message: rpcMsg };
         }
-      }
-
-      // Fallback untuk database lama yang belum menjalankan fungsi RPC verify_staff_login
-      if (rpcErr) {
-        const adminClient = getSupabaseAdminClient();
-        const readClient = adminClient || supabase;
-        const { data: remoteStaff, error: staffErr } = await readClient
-          .from('staff_accounts')
-          .select('*')
-          .ilike('user_id', escapeLikePattern(normId))
-          .limit(1)
-          .maybeSingle();
-
-        if (!staffErr && remoteStaff) {
-          const mapped: StaffAccount = {
-            id: String(remoteStaff.id),
-            userId: String(remoteStaff.user_id),
-            name: String(remoteStaff.name),
-            password: String(remoteStaff.password_hash || ''),
-            roleType: remoteStaff.role_type,
-            roleLabel: String(remoteStaff.role_label || 'Staff'),
-            allowedTabs: Array.isArray(remoteStaff.allowed_tabs) ? remoteStaff.allowed_tabs : [],
-            assignedSubjects: Array.isArray(remoteStaff.assigned_subjects)
-              ? remoteStaff.assigned_subjects
-              : [],
-            restrictToAssignedSubjects: Boolean(remoteStaff.restrict_to_assigned_subjects),
-            isActive: Boolean(remoteStaff.is_active),
-            createdAt: remoteStaff.created_at,
-          };
-          await idbPutStaffSafe([mapped]);
-        } else if (normId === 'admin' && adminClient) {
-          const { data: prof } = await adminClient
+        if (lowerMsg === 'not_found' || !rpcMsg) {
+          // Cek apakah database cloud sudah terisi (otoritatif). Jika ya, jangan fallback ke akun seed lokal!
+          const { data: cloudProf, error: profCheckErr } = await supabase
             .from('school_profile')
-            .select('admin_password')
+            .select('id')
             .eq('id', 'default')
             .maybeSingle();
-          if (prof?.admin_password) {
-            const localList = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-            const localAdmin = localList.find(
-              (acc) => acc.userId.trim().toLowerCase() === 'admin'
-            );
-            if (localAdmin) {
-              await idbPutStaffSafe([
-                { ...localAdmin, password: await hashPassword(prof.admin_password) },
-              ]);
+          if (!profCheckErr && cloudProf) {
+            return {
+              ok: false,
+              staff: null,
+              message: `ID "${rawUserId.trim()}" tidak ditemukan di database server.`,
+            };
+          }
+          if (!profCheckErr && !cloudProf && normId !== 'admin') {
+            return {
+              ok: false,
+              staff: null,
+              message: `ID "${rawUserId.trim()}" tidak ditemukan di database server.`,
+            };
+          }
+          // Hanya izinkan bootstrap awal lokal untuk 'admin' saat database cloud masih kosong total
+          allowLocalFallback = normId === 'admin';
+        }
+      } else if (rpcErr) {
+        // Pada PostgreSQL PL/pgSQL, error 42883 ("function digest(text, unknown) does not exist") terjadi saat
+        // planning ekspresi IF di fungsi verify_staff_login versi lama — SEBELUM sandi dibandingkan.
+        // Akibatnya login ditolak meski sandi benar. Tampilkan instruksi pembaruan SQL tanpa membuka bypass lokal.
+        if (isDigestRpcBugError(rpcErr)) {
+          return {
+            ok: false,
+            staff: null,
+            sqlUpdateRequired: true,
+            message:
+              'Fungsi login server (verify_staff_login) di Supabase masih versi lama (error digest 42883), sehingga login selalu ditolak meskipun sandi benar. Jalankan Skrip SQL terbaru di Supabase SQL Editor lalu coba login lagi.',
+          };
+        }
+
+        if (isNetworkOrOfflineError(rpcErr)) {
+          allowLocalFallback = true;
+        } else if (isRpcSignatureMismatchError(rpcErr.message)) {
+          // Hanya izinkan pembacaan tabel staff_accounts langsung bila service_role (adminClient) aktif
+          const adminClient = getSupabaseAdminClient();
+          if (adminClient) {
+            const { data: remoteStaff, error: staffErr } = await adminClient
+              .from('staff_accounts')
+              .select('*')
+              .ilike('user_id', escapeLikePattern(normId))
+              .limit(1)
+              .maybeSingle();
+
+            if (!staffErr && remoteStaff) {
+              const mapped: StaffAccount = {
+                id: String(remoteStaff.id),
+                userId: String(remoteStaff.user_id),
+                name: String(remoteStaff.name),
+                password: String(remoteStaff.password_hash || ''),
+                roleType: remoteStaff.role_type,
+                roleLabel: String(remoteStaff.role_label || 'Staff'),
+                allowedTabs: Array.isArray(remoteStaff.allowed_tabs) ? remoteStaff.allowed_tabs : [],
+                assignedSubjects: Array.isArray(remoteStaff.assigned_subjects)
+                  ? remoteStaff.assigned_subjects
+                  : [],
+                restrictToAssignedSubjects: Boolean(remoteStaff.restrict_to_assigned_subjects),
+                isActive: Boolean(remoteStaff.is_active),
+                createdAt: remoteStaff.created_at,
+              };
+              if (!mapped.isActive) {
+                return {
+                  ok: false,
+                  staff: null,
+                  message: `Akun dengan ID "${mapped.userId}" sedang dinonaktifkan oleh Administrator.`,
+                };
+              }
+              const ok = await verifyPassword(pwd, mapped.password);
+              if (!ok) {
+                return { ok: false, staff: null, message: 'Sandi / PIN tidak sesuai.' };
+              }
+              const verified: StaffAccount = { ...mapped, password: hashedPwd };
+              if (establishSession) {
+                await idbPutStaffSafe([verified]);
+                setActiveStaffCredentials(verified);
+              }
+              return { ok: true, staff: verified };
+            }
+            if (!staffErr && !remoteStaff) {
+              return {
+                ok: false,
+                staff: null,
+                message: `ID "${rawUserId.trim()}" tidak ditemukan di database server.`,
+              };
             }
           }
+          return {
+            ok: false,
+            staff: null,
+            sqlUpdateRequired: true,
+            message:
+              'Fungsi login server (verify_staff_login) belum terpasang di Supabase. Salin dan jalankan Skrip SQL terbaru di Supabase SQL Editor lalu coba login lagi.',
+          };
+        } else {
+          return {
+            ok: false,
+            staff: null,
+            message: `Gagal memverifikasi akun ke server (${rpcErr.message}).`,
+          };
         }
       }
-    } catch {
-      // Fallback to local cache when offline
+    } catch (err) {
+      if (isNetworkOrOfflineError(err)) {
+        allowLocalFallback = true;
+      } else {
+        return {
+          ok: false,
+          staff: null,
+          message:
+            err instanceof Error
+              ? `Gagal memverifikasi akun ke server (${err.message}).`
+              : 'Gagal memverifikasi akun ke server.',
+        };
+      }
     }
+  }
+
+  if (!allowLocalFallback) {
+    return { ok: false, staff: null, message: 'Sandi / PIN tidak sesuai.' };
   }
 
   const list = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
@@ -2344,10 +3296,16 @@ export async function authenticateStaff(
   let valid = await verifyPassword(pwd, matched.password);
   if (!valid && normId === 'admin') {
     const profile = await idbGet<SchoolProfile>(STORES.META, 'default');
-    if (profile && (await verifyPassword(pwd, profile.adminPassword))) {
+    if (
+      profile &&
+      profile.adminPassword !== '__CLOUD_MANAGED__' &&
+      (await verifyPassword(pwd, profile.adminPassword))
+    ) {
       valid = true;
       matched = { ...matched, password: await hashPassword(pwd) };
-      await idbPutStaffSafe([matched]);
+      if (establishSession) {
+        await idbPutStaffSafe([matched]);
+      }
     }
   }
 
@@ -2355,13 +3313,13 @@ export async function authenticateStaff(
     return { ok: false, staff: null, message: 'Sandi / PIN tidak sesuai.' };
   }
 
-  // Upgrade legacy plaintext stored hash transparently
-  if (!isPasswordHashed(matched.password)) {
-    matched = { ...matched, password: await hashPassword(matched.password) };
-    await idbPutStaffSafe([matched]);
+  if (establishSession) {
+    if (!isPasswordHashed(matched.password)) {
+      matched = { ...matched, password: await hashPassword(matched.password) };
+      await idbPutStaffSafe([matched]);
+    }
+    setActiveStaffCredentials(matched);
   }
-
-  setActiveStaffCredentials(matched);
   return { ok: true, staff: matched };
 }
 
@@ -2403,22 +3361,32 @@ export async function upsertParticipants(items: Participant[]): Promise<void> {
 
   if (isLiveSupabaseConfigured()) {
     try {
+      const adminClient = getSupabaseAdminClient();
       const supabase = getSupabaseClient();
+      const authArgs = adminClient ? null : await resolveStaffRpcAuthArgs();
       const CHUNK = 50;
       for (let i = 0; i < normalizedItems.length; i += CHUNK) {
         const chunk = normalizedItems.slice(i, i + CHUNK);
-        await supabase.from('participants').upsert(
-          chunk.map((p) => ({
-            id: p.id,
-            participant_number: p.participantNumber,
-            token: p.token,
-            full_name: p.fullName,
-            class_name: p.className,
-            is_active: p.isActive,
-            created_at: p.createdAt,
-          })),
-          { onConflict: 'participant_number' }
-        );
+        const rows = chunk.map((p) => ({
+          id: p.id,
+          participant_number: p.participantNumber,
+          token: p.token,
+          full_name: p.fullName,
+          class_name: p.className,
+          is_active: p.isActive,
+          created_at: p.createdAt,
+        }));
+        if (adminClient) {
+          await adminClient.from('participants').upsert(rows, { onConflict: 'participant_number' });
+        } else {
+          const { error: rpcErr } = await supabase.rpc('staff_upsert_participants_batch', {
+            ...(authArgs || {}),
+            p_participants: rows,
+          });
+          if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
+            await supabase.from('participants').upsert(rows, { onConflict: 'participant_number' });
+          }
+        }
       }
     } catch {
       // Local-first persists regardless
@@ -2433,8 +3401,21 @@ export async function deleteParticipant(id: string): Promise<void> {
 
   if (isLiveSupabaseConfigured()) {
     try {
+      const adminClient = getSupabaseAdminClient();
       const supabase = getSupabaseClient();
-      await supabase.from('participants').delete().eq('id', id);
+      if (adminClient) {
+        await adminClient.from('participants').delete().eq('id', id);
+      } else {
+        const authArgs = await resolveStaffRpcAuthArgs();
+        const { error: rpcErr } = await supabase.rpc('staff_delete_participants', {
+          ...authArgs,
+          p_ids: [id],
+          p_delete_all: false,
+        });
+        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
+          await supabase.from('participants').delete().eq('id', id);
+        }
+      }
     } catch {
       // Ignore offline error
     }
@@ -2459,20 +3440,46 @@ export async function clearAllParticipants(): Promise<number> {
 
   if (isLiveSupabaseConfigured()) {
     try {
+      const adminClient = getSupabaseAdminClient();
       const supabase = getSupabaseClient();
-      const idRes = await fetchAllRowsByIdPaginated<{ id: string }>(
-        supabase,
-        'participants',
-        'id'
-      );
-      if (!idRes.error && idRes.data.length > 0) {
-        const CHUNK = 50;
-        const ids = idRes.data.map((r) => String(r.id));
-        for (let i = 0; i < ids.length; i += CHUNK) {
-          await supabase.from('participants').delete().in('id', ids.slice(i, i + CHUNK));
+      if (adminClient) {
+        const idRes = await fetchAllRowsByIdPaginated<{ id: string }>(
+          adminClient,
+          'participants',
+          'id'
+        );
+        if (!idRes.error && idRes.data.length > 0) {
+          const CHUNK = 50;
+          const ids = idRes.data.map((r) => String(r.id));
+          for (let i = 0; i < ids.length; i += CHUNK) {
+            await adminClient.from('participants').delete().in('id', ids.slice(i, i + CHUNK));
+          }
+        } else {
+          await adminClient.from('participants').delete().not('id', 'is', null);
         }
       } else {
-        await supabase.from('participants').delete().not('id', 'is', null);
+        const authArgs = await resolveStaffRpcAuthArgs();
+        const { error: rpcErr } = await supabase.rpc('staff_delete_participants', {
+          ...authArgs,
+          p_ids: null,
+          p_delete_all: true,
+        });
+        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
+          const idRes = await fetchAllRowsByIdPaginated<{ id: string }>(
+            supabase,
+            'participants',
+            'id'
+          );
+          if (!idRes.error && idRes.data.length > 0) {
+            const CHUNK = 50;
+            const ids = idRes.data.map((r) => String(r.id));
+            for (let i = 0; i < ids.length; i += CHUNK) {
+              await supabase.from('participants').delete().in('id', ids.slice(i, i + CHUNK));
+            }
+          } else {
+            await supabase.from('participants').delete().not('id', 'is', null);
+          }
+        }
       }
     } catch {
       // Local delete persists regardless
@@ -2486,81 +3493,176 @@ export async function validateParticipantAndToken(
   rawNumber: string,
   rawToken: string
 ): Promise<{
-  status: 'ok' | 'not_found' | 'wrong_token';
+  status: 'ok' | 'not_found' | 'inactive' | 'wrong_token' | 'server_busy';
   participant: Participant | null;
   source: 'supabase' | 'local-cache';
+  errorMessage?: string;
 }> {
   await ensureInitialized();
-  const normalizedNum = rawNumber.trim().toUpperCase();
-  const normalizedToken = rawToken.trim().toUpperCase();
+  const normalizedNum = normalizeParticipantNumber(rawNumber);
+  const normalizedToken = (rawToken || '').trim().toUpperCase();
   if (!normalizedNum) {
     return { status: 'not_found', participant: null, source: 'local-cache' };
   }
 
   let found: Participant | null = null;
   let source: 'supabase' | 'local-cache' = 'local-cache';
+  let allowLocalFallback = !isLiveSupabaseConfigured();
+  let hadServerOrNetworkFailure = false;
 
-  if (isLiveSupabaseConfigured()) {
-    try {
-      const supabase = getSupabaseClient();
-      const { data: rpcData, error: rpcErr } = await supabase.rpc('verify_participant_login', {
-        p_participant_number: normalizedNum,
-        p_token: normalizedToken,
-      });
+  const isBrowserOffline =
+    typeof navigator !== 'undefined' && navigator.onLine === false;
 
-      if (!rpcErr && Array.isArray(rpcData) && rpcData[0]) {
-        const row = rpcData[0] as Record<string, unknown>;
-        const rpcStatus = String(row.status || 'not_found');
-        if (rpcStatus === 'ok') {
-          const verified: Participant = {
-            id: String(row.id),
-            participantNumber: String(row.participant_number),
-            token: String(row.token || ''),
-            fullName: String(row.full_name),
-            className: String(row.class_name),
-            isActive: Boolean(row.is_active),
-            createdAt: String(row.created_at),
-          };
-          await idbPutParticipantsSafe([verified]);
-          return { status: 'ok', participant: verified, source: 'supabase' };
-        }
-        if (rpcStatus === 'wrong_token') {
-          return { status: 'wrong_token', participant: null, source: 'supabase' };
-        }
-        return { status: 'not_found', participant: null, source: 'supabase' };
+  if (isLiveSupabaseConfigured() && isBrowserOffline) {
+    allowLocalFallback = true;
+    hadServerOrNetworkFailure = true;
+  } else if (isLiveSupabaseConfigured()) {
+    const supabase = getSupabaseClient();
+    const retryBackoffs = [0, 380, 950, 1900];
+
+    for (let attempt = 0; attempt < retryBackoffs.length; attempt++) {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        allowLocalFallback = true;
+        hadServerOrNetworkFailure = true;
+        break;
+      }
+      if (retryBackoffs[attempt] > 0) {
+        const jitter = Math.floor(Math.random() * 450);
+        await new Promise((r) => setTimeout(r, retryBackoffs[attempt] + jitter));
       }
 
-      // Fallback untuk database lama sebelum skrip RPC verify_participant_login dijalankan
-      if (rpcErr) {
-        const { data, error } = await fetchSingleParticipantByNumber(supabase, normalizedNum, true);
+      try {
+        const { data: rpcData, error: rpcErr } = await supabase.rpc('verify_participant_login', {
+          p_participant_number: normalizedNum,
+          p_token: normalizedToken,
+        });
 
-        if (!error && data) {
-          found = {
-            id: String(data.id),
-            participantNumber: String(data.participant_number),
-            token: String(data.token || ''),
-            fullName: String(data.full_name),
-            className: String(data.class_name),
-            isActive: Boolean(data.is_active),
-            createdAt: String(data.created_at),
-          };
-          source = 'supabase';
-          await idbPutParticipantsSafe([found]);
+        if (!rpcErr && Array.isArray(rpcData) && rpcData[0]) {
+          const row = rpcData[0] as Record<string, unknown>;
+          const rpcStatus = String(row.status || 'not_found').trim().toLowerCase();
+          if (rpcStatus === 'ok') {
+            const verified: Participant = {
+              id: String(row.id),
+              participantNumber: normalizeParticipantNumber(
+                String(row.participant_number || normalizedNum)
+              ),
+              token: String(row.token || ''),
+              fullName: String(row.full_name),
+              className: String(row.class_name),
+              isActive: Boolean(row.is_active),
+              createdAt: String(row.created_at),
+            };
+            await idbPutParticipantsSafe([verified]);
+            recentlyVerifiedParticipants.set(verified.participantNumber, {
+              participant: verified,
+              verifiedAt: Date.now(),
+            });
+            return { status: 'ok', participant: verified, source: 'supabase' };
+          }
+          if (rpcStatus === 'inactive' || row.is_active === false) {
+            return { status: 'inactive', participant: null, source: 'supabase' };
+          }
+          if (rpcStatus === 'wrong_token') {
+            return { status: 'wrong_token', participant: null, source: 'supabase' };
+          }
+          return { status: 'not_found', participant: null, source: 'supabase' };
         }
+
+        if (rpcErr) {
+          if (isRpcSignatureMismatchError(rpcErr.message)) {
+            // Fallback untuk database lama sebelum RPC verify_participant_login dijalankan
+            const { data, error } = await fetchSingleParticipantByNumber(
+              supabase,
+              normalizedNum,
+              false
+            );
+            if (!error && data) {
+              const mapped: Participant = {
+                id: String(data.id),
+                participantNumber: normalizeParticipantNumber(
+                  String(data.participant_number || normalizedNum)
+                ),
+                token: String(data.token || ''),
+                fullName: String(data.full_name),
+                className: String(data.class_name),
+                isActive: Boolean(data.is_active),
+                createdAt: String(data.created_at),
+              };
+              if (!mapped.isActive) {
+                return { status: 'inactive', participant: null, source: 'supabase' };
+              }
+              found = mapped;
+              source = 'supabase';
+              await idbPutParticipantsSafe([found]);
+              if ((found.token || '').trim().toUpperCase() === normalizedToken) {
+                recentlyVerifiedParticipants.set(found.participantNumber, {
+                  participant: found,
+                  verifiedAt: Date.now(),
+                });
+              }
+              break;
+            }
+            if (!error && !data) {
+              return { status: 'not_found', participant: null, source: 'supabase' };
+            }
+            hadServerOrNetworkFailure = true;
+            if (isNetworkOrOfflineError(error)) {
+              allowLocalFallback = true;
+            }
+            if (!isTransientServerOrNetworkError(error)) {
+              break;
+            }
+            continue;
+          }
+
+          hadServerOrNetworkFailure = true;
+          if (isNetworkOrOfflineError(rpcErr)) {
+            allowLocalFallback = true;
+          }
+          if (isTransientServerOrNetworkError(rpcErr) && attempt < retryBackoffs.length - 1) {
+            continue;
+          }
+          break;
+        }
+      } catch (err) {
+        hadServerOrNetworkFailure = true;
+        if (isNetworkOrOfflineError(err)) {
+          allowLocalFallback = true;
+        }
+        if (isTransientServerOrNetworkError(err) && attempt < retryBackoffs.length - 1) {
+          continue;
+        }
+        break;
       }
-    } catch {
-      // Fallback to local cache
+    }
+  }
+
+  if (!found && allowLocalFallback) {
+    const all = await idbGetAll<Participant>(STORES.PARTICIPANTS);
+    const matchedLocal =
+      all.find((p) => normalizeParticipantNumber(p.participantNumber) === normalizedNum) || null;
+    if (matchedLocal) {
+      if (!matchedLocal.isActive) {
+        return { status: 'inactive', participant: null, source: 'local-cache' };
+      }
+      found = {
+        ...matchedLocal,
+        participantNumber: normalizeParticipantNumber(matchedLocal.participantNumber),
+      };
     }
   }
 
   if (!found) {
-    const all = await idbGetAll<Participant>(STORES.PARTICIPANTS);
-    found =
-      all.find((p) => p.participantNumber.trim().toUpperCase() === normalizedNum && p.isActive) ||
-      null;
-  }
-
-  if (!found) {
+    // Jangan pernah menampilkan pesan palsu "Nomor Peserta tidak ditemukan" saat server padat (503/429) atau jaringan terputus
+    if (hadServerOrNetworkFailure) {
+      return {
+        status: 'server_busy',
+        participant: null,
+        source: 'supabase',
+        errorMessage:
+          'Server ujian sedang padat memproses antrean peserta lain atau koneksi tidak stabil. Tunggu beberapa detik lalu klik Cek Data & Masuk kembali.',
+      };
+    }
     return { status: 'not_found', participant: null, source };
   }
 
@@ -2592,8 +3694,9 @@ export async function upsertExamSchedule(schedule: ExamSchedule): Promise<CloudS
   }
 
   try {
-    const client = getSupabaseAdminClient() || getSupabaseClient();
-    const { error } = await client.from('exam_schedules').upsert({
+    const adminClient = getSupabaseAdminClient();
+    const supabase = getSupabaseClient();
+    const row = {
       id: schedule.id,
       title: schedule.title,
       subject: schedule.subject,
@@ -2604,11 +3707,26 @@ export async function upsertExamSchedule(schedule: ExamSchedule): Promise<CloudS
       randomize_questions: Boolean(schedule.randomizeQuestions ?? false),
       max_tab_switches: schedule.maxTabSwitches,
       created_at: schedule.createdAt,
-    });
-    if (error) {
-      return { synced: false, error: error.message };
+    };
+    if (adminClient) {
+      const { error } = await adminClient.from('exam_schedules').upsert(row);
+      if (error) return { synced: false, error: error.message };
+      return { synced: true };
     }
-    return { synced: true };
+    const authArgs = await resolveStaffRpcAuthArgs();
+    const { error: rpcErr } = await supabase.rpc('staff_upsert_exam_schedules_batch', {
+      ...authArgs,
+      p_schedules: [row],
+    });
+    if (!rpcErr) {
+      return { synced: true };
+    }
+    if (isRpcSignatureMismatchError(rpcErr.message)) {
+      const { error } = await supabase.from('exam_schedules').upsert(row);
+      if (error) return { synced: false, error: error.message };
+      return { synced: true };
+    }
+    return { synced: false, error: rpcErr.message };
   } catch (err) {
     return {
       synced: false,
@@ -2627,12 +3745,28 @@ export async function deleteExamSchedule(id: string): Promise<CloudSyncWriteResu
   }
 
   try {
-    const client = getSupabaseAdminClient() || getSupabaseClient();
-    const { error } = await client.from('exam_schedules').delete().eq('id', id);
-    if (error) {
-      return { synced: false, error: error.message };
+    const adminClient = getSupabaseAdminClient();
+    const supabase = getSupabaseClient();
+    if (adminClient) {
+      const { error } = await adminClient.from('exam_schedules').delete().eq('id', id);
+      if (error) return { synced: false, error: error.message };
+      return { synced: true };
     }
-    return { synced: true };
+    const authArgs = await resolveStaffRpcAuthArgs();
+    const { error: rpcErr } = await supabase.rpc('staff_delete_exam_schedules', {
+      ...authArgs,
+      p_ids: [id],
+      p_delete_all: false,
+    });
+    if (!rpcErr) {
+      return { synced: true };
+    }
+    if (isRpcSignatureMismatchError(rpcErr.message)) {
+      const { error } = await supabase.from('exam_schedules').delete().eq('id', id);
+      if (error) return { synced: false, error: error.message };
+      return { synced: true };
+    }
+    return { synced: false, error: rpcErr.message };
   } catch (err) {
     return {
       synced: false,
@@ -2676,13 +3810,33 @@ export async function clearAllSchedules(allowedSubjects?: string[]): Promise<num
 
   if (isLiveSupabaseConfigured()) {
     try {
-      const client = getSupabaseAdminClient() || getSupabaseClient();
-      if (!hasRestriction) {
-        await client.from('exam_schedules').delete().not('id', 'is', null);
+      const adminClient = getSupabaseAdminClient();
+      const supabase = getSupabaseClient();
+      if (adminClient) {
+        if (!hasRestriction) {
+          await adminClient.from('exam_schedules').delete().not('id', 'is', null);
+        } else {
+          const CHUNK = 50;
+          for (let i = 0; i < targetIds.length; i += CHUNK) {
+            await adminClient.from('exam_schedules').delete().in('id', targetIds.slice(i, i + CHUNK));
+          }
+        }
       } else {
-        const CHUNK = 50;
-        for (let i = 0; i < targetIds.length; i += CHUNK) {
-          await client.from('exam_schedules').delete().in('id', targetIds.slice(i, i + CHUNK));
+        const authArgs = await resolveStaffRpcAuthArgs();
+        const { error: rpcErr } = await supabase.rpc('staff_delete_exam_schedules', {
+          ...authArgs,
+          p_ids: hasRestriction ? targetIds : null,
+          p_delete_all: !hasRestriction,
+        });
+        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
+          if (!hasRestriction) {
+            await supabase.from('exam_schedules').delete().not('id', 'is', null);
+          } else {
+            const CHUNK = 50;
+            for (let i = 0; i < targetIds.length; i += CHUNK) {
+              await supabase.from('exam_schedules').delete().in('id', targetIds.slice(i, i + CHUNK));
+            }
+          }
         }
       }
     } catch {
@@ -2874,32 +4028,21 @@ export async function upsertQuestions(items: Question[]): Promise<CloudSyncWrite
       return { synced: true };
     }
 
+    const authArgs = await resolveStaffRpcAuthArgs();
     for (let i = 0; i < items.length; i += CHUNK) {
       const chunk = items.slice(i, i + CHUNK);
       const extendedPayload = chunk.map((q) => buildQuestionDbRow(q, true));
       let { error: rpcError } = await supabase.rpc('upsert_questions_batch', {
         p_questions: extendedPayload,
-        ...getStaffRpcAuthArgs(),
+        ...authArgs,
       });
-      if (rpcError && isRpcSignatureMismatchError(rpcError.message)) {
-        const legacyRpc = await supabase.rpc('upsert_questions_batch', {
-          p_questions: extendedPayload,
-        });
-        rpcError = legacyRpc.error;
-      }
       if (rpcError && isMissingQuestionColumnsError(rpcError.message)) {
         const legacyPayload = chunk.map((q) => buildQuestionDbRow(q, false));
         const retry = await supabase.rpc('upsert_questions_batch', {
           p_questions: legacyPayload,
-          ...getStaffRpcAuthArgs(),
+          ...authArgs,
         });
         rpcError = retry.error;
-        if (rpcError && isRpcSignatureMismatchError(rpcError.message)) {
-          const retryLegacy = await supabase.rpc('upsert_questions_batch', {
-            p_questions: legacyPayload,
-          });
-          rpcError = retryLegacy.error;
-        }
       }
       if (rpcError) {
         return { synced: false, error: rpcError.message };
@@ -2935,14 +4078,11 @@ export async function deleteQuestion(id: string): Promise<CloudSyncWriteResult> 
       return { synced: true };
     }
 
-    let { error: rpcError } = await supabase.rpc('delete_question_by_id', {
+    const authArgs = await resolveStaffRpcAuthArgs();
+    const { error: rpcError } = await supabase.rpc('delete_question_by_id', {
       p_id: id,
-      ...getStaffRpcAuthArgs(),
+      ...authArgs,
     });
-    if (rpcError && isRpcSignatureMismatchError(rpcError.message)) {
-      const legacy = await supabase.rpc('delete_question_by_id', { p_id: id });
-      rpcError = legacy.error;
-    }
     if (rpcError) {
       return { synced: false, error: rpcError.message };
     }
@@ -2985,18 +4125,16 @@ export async function deleteQuestionsBatch(ids: string[]): Promise<number> {
           await adminClient.from('questions').delete().in('id', uniqueIds.slice(i, i + CHUNK));
         }
       } else {
+        const authArgs = await resolveStaffRpcAuthArgs();
         const CHUNK = 20;
         for (let i = 0; i < uniqueIds.length; i += CHUNK) {
           await Promise.all(
-            uniqueIds.slice(i, i + CHUNK).map(async (id) => {
-              const res = await supabase.rpc('delete_question_by_id', {
+            uniqueIds.slice(i, i + CHUNK).map((id) =>
+              supabase.rpc('delete_question_by_id', {
                 p_id: id,
-                ...getStaffRpcAuthArgs(),
-              });
-              if (res.error && isRpcSignatureMismatchError(res.error.message)) {
-                await supabase.rpc('delete_question_by_id', { p_id: id });
-              }
-            })
+                ...authArgs,
+              })
+            )
           );
         }
       }
@@ -3043,19 +4181,17 @@ export async function clearAllQuestions(allowedSubjects?: string[]): Promise<num
       if (adminClient) {
         await adminClient.from('questions').delete().not('id', 'is', null);
       } else {
+        const authArgs = await resolveStaffRpcAuthArgs();
         const allIds = all.map((q) => q.id);
         const CHUNK = 20;
         for (let i = 0; i < allIds.length; i += CHUNK) {
           await Promise.all(
-            allIds.slice(i, i + CHUNK).map(async (id) => {
-              const res = await supabase.rpc('delete_question_by_id', {
+            allIds.slice(i, i + CHUNK).map((id) =>
+              supabase.rpc('delete_question_by_id', {
                 p_id: id,
-                ...getStaffRpcAuthArgs(),
-              });
-              if (res.error && isRpcSignatureMismatchError(res.error.message)) {
-                await supabase.rpc('delete_question_by_id', { p_id: id });
-              }
-            })
+                ...authArgs,
+              })
+            )
           );
         }
       }
@@ -3077,56 +4213,136 @@ export async function getStudentQuestionsForClass(
 ): Promise<StudentQuestion[]> {
   await ensureInitialized();
 
-  let rpcHadFailure = false;
+  const cacheKey = `${className.trim().toUpperCase()}::${(subject || '').trim().toLowerCase()}`;
+  const metaCacheId = `student_q_cache_${cacheKey}`;
+  const now = Date.now();
 
-  if (isLiveSupabaseConfigured()) {
-    const supabase = getSupabaseClient();
-    const retryDelays = [0, 250, 600];
+  const memCached = studentQuestionsCache.get(cacheKey);
+  if (
+    memCached &&
+    memCached.questions.length > 0 &&
+    now - memCached.cachedAt < STUDENT_QUESTIONS_CACHE_TTL_MS
+  ) {
+    return memCached.questions;
+  }
 
-    for (let attempt = 0; attempt < retryDelays.length; attempt++) {
-      if (retryDelays[attempt] > 0) {
-        await new Promise((r) => setTimeout(r, retryDelays[attempt]));
-      }
-      try {
-        const { data, error } = await supabase.rpc('get_student_questions', {
-          p_class_name: className,
-          p_subject: subject || null,
-        });
-        if (!error && Array.isArray(data)) {
-          if (data.length > 0) {
-            return data.map((q) => hydrateStudentQuestionFromDbRow(q));
-          }
-          rpcHadFailure = false;
+  // Deduplikasi in-flight: klik ganda atau permintaan paralel mapel & kelas yang sama berbagi 1 RPC
+  const existingFlight = inFlightStudentQuestions.get(cacheKey);
+  if (existingFlight) {
+    return existingFlight;
+  }
+
+  const loaderPromise = (async (): Promise<StudentQuestion[]> => {
+    let rpcHadFailure = false;
+
+    if (isLiveSupabaseConfigured() && !isBrowserExplicitlyOffline()) {
+      const supabase = getSupabaseClient();
+      // 5 percobaan dengan exponential backoff berbatas + jitter agar tahan badai 800 peserta mulai ujian serentak
+      const RETRY_BACKOFFS_MS = [0, 400, 1000, 2000, 3200];
+
+      for (let attempt = 0; attempt < RETRY_BACKOFFS_MS.length; attempt++) {
+        if (isBrowserExplicitlyOffline()) {
+          rpcHadFailure = true;
           break;
         }
-        rpcHadFailure = true;
-      } catch {
-        rpcHadFailure = true;
+        if (attempt > 0) {
+          const jitter = Math.floor(Math.random() * 800);
+          await new Promise((r) => setTimeout(r, RETRY_BACKOFFS_MS[attempt] + jitter));
+          if (isBrowserExplicitlyOffline()) {
+            rpcHadFailure = true;
+            break;
+          }
+        }
+        try {
+          const { data, error } = await supabase.rpc('get_student_questions', {
+            p_class_name: className,
+            p_subject: subject || null,
+          });
+          if (!error && Array.isArray(data)) {
+            if (data.length > 0) {
+              const hydrated = data.map((q) => hydrateStudentQuestionFromDbRow(q));
+              studentQuestionsCache.set(cacheKey, { questions: hydrated, cachedAt: Date.now() });
+              void idbPut(STORES.META, {
+                id: metaCacheId,
+                cachedAt: Date.now(),
+                questions: hydrated,
+              }).catch(() => {});
+              return hydrated;
+            }
+            rpcHadFailure = false;
+            break;
+          }
+          rpcHadFailure = true;
+          if (error && !isTransientServerOrNetworkError(error)) {
+            break;
+          }
+        } catch (err) {
+          rpcHadFailure = true;
+          if (!isTransientServerOrNetworkError(err)) {
+            break;
+          }
+        }
       }
+    } else if (isLiveSupabaseConfigured() && isBrowserExplicitlyOffline()) {
+      rpcHadFailure = true;
+    }
+
+    // Fallback ke cache soal ter-sanitasi di IndexedDB (khusus perangkat siswa yang sudah pernah memuat mapel ini)
+    try {
+      const cachedMeta = await idbGet<{
+        id: string;
+        cachedAt: number;
+        questions: StudentQuestion[];
+      }>(STORES.META, metaCacheId);
+      if (
+        cachedMeta &&
+        Array.isArray(cachedMeta.questions) &&
+        cachedMeta.questions.length > 0 &&
+        Date.now() - Number(cachedMeta.cachedAt || 0) < 6 * 60 * 60 * 1000
+      ) {
+        studentQuestionsCache.set(cacheKey, {
+          questions: cachedMeta.questions,
+          cachedAt: Date.now(),
+        });
+        return cachedMeta.questions;
+      }
+    } catch {
+      // Ignore IDB meta cache read issues
+    }
+
+    const all = await idbGetAll<Question>(STORES.QUESTIONS);
+    const localFiltered = all
+      .filter(
+        (q) =>
+          q.targetClasses.includes(className) &&
+          (!subject || q.subject.toLowerCase() === subject.toLowerCase())
+      )
+      .sort((a, b) => a.orderIndex - b.orderIndex || a.id.localeCompare(b.id))
+      .map((q) => sanitizeQuestionForStudent(q));
+
+    if (localFiltered.length > 0) {
+      return localFiltered;
+    }
+
+    if (rpcHadFailure && isLiveSupabaseConfigured()) {
+      throw new Error(
+        isBrowserExplicitlyOffline()
+          ? 'Perangkat sedang offline dan soal belum tersimpan di cache lokal. Hubungkan internet lalu coba lagi.'
+          : 'Server bank soal sedang sibuk memuat data. Silakan tekan tombol Mulai Ujian kembali beberapa detik lagi.'
+      );
+    }
+
+    return localFiltered;
+  })();
+
+  inFlightStudentQuestions.set(cacheKey, loaderPromise);
+  try {
+    return await loaderPromise;
+  } finally {
+    if (inFlightStudentQuestions.get(cacheKey) === loaderPromise) {
+      inFlightStudentQuestions.delete(cacheKey);
     }
   }
-
-  const all = await idbGetAll<Question>(STORES.QUESTIONS);
-  const localFiltered = all
-    .filter(
-      (q) =>
-        q.targetClasses.includes(className) &&
-        (!subject || q.subject.toLowerCase() === subject.toLowerCase())
-    )
-    .sort((a, b) => a.orderIndex - b.orderIndex || a.id.localeCompare(b.id))
-    .map((q) => sanitizeQuestionForStudent(q));
-
-  if (localFiltered.length > 0) {
-    return localFiltered;
-  }
-
-  if (rpcHadFailure && isLiveSupabaseConfigured()) {
-    throw new Error(
-      'Server bank soal sedang sibuk memuat data. Silakan tekan tombol Mulai Ujian kembali beberapa detik lagi.'
-    );
-  }
-
-  return localFiltered;
 }
 
 export interface CloudQuestionCoverageItem {
@@ -3210,9 +4426,25 @@ export async function fetchQuestionCoverageFromCloud(
           )
         : (async () => {
             const collected = new Set<string>();
+            if (!adminClient) {
+              const authArgs = await resolveStaffRpcAuthArgs();
+              if (authArgs.p_staff_user_id && authArgs.p_staff_password_sha256) {
+                const rpcRes = await supabase.rpc('staff_list_participants', authArgs);
+                if (!rpcRes.error && Array.isArray(rpcRes.data)) {
+                  for (const row of rpcRes.data) {
+                    const cls = String((row as { class_name?: string }).class_name || '')
+                      .trim()
+                      .toUpperCase();
+                    if (cls) collected.add(cls);
+                  }
+                  return Array.from(collected).sort((a, b) => a.localeCompare(b, 'id'));
+                }
+              }
+            }
+            const partClient = adminClient || supabase;
             const pageSize = 1000;
             for (let from = 0; from < 20_000; from += pageSize) {
-              const { data, error } = await supabase
+              const { data, error } = await partClient
                 .from('participants')
                 .select('class_name')
                 .range(from, from + pageSize - 1);
@@ -3298,17 +4530,11 @@ export async function fetchQuestionCoverageFromCloud(
     const summaryItems: CloudQuestionCoverageItem[] = [];
     let summaryMissingOrError: string | null = null;
     const summaryPageSize = 1000;
+    const coverageAuthArgs = await resolveStaffRpcAuthArgs();
     for (let from = 0; from < 50_000; from += summaryPageSize) {
-      let { data, error } = await supabase
-        .rpc('get_question_coverage_summary', getStaffRpcAuthArgs())
+      const { data, error } = await supabase
+        .rpc('get_question_coverage_summary', coverageAuthArgs)
         .range(from, from + summaryPageSize - 1);
-      if (error && isRpcSignatureMismatchError(error.message)) {
-        const legacy = await supabase
-          .rpc('get_question_coverage_summary')
-          .range(from, from + summaryPageSize - 1);
-        data = legacy.data;
-        error = legacy.error;
-      }
       if (error) {
         summaryMissingOrError = error.message;
         break;
@@ -3400,14 +4626,87 @@ export async function fetchQuestionCoverageFromCloud(
 // ============================================================================
 // ACTIVE EXAM SESSION & BACKGROUND SYNC TO SUPABASE `exam_results`
 // ============================================================================
+interface EmergencyAnswersBackup {
+  resultId: string;
+  participantNumber: string;
+  examId: string;
+  answers: Record<string, string>;
+  flaggedQuestions: string[];
+  tabSwitchCount: number;
+  savedAt: number;
+}
+
+function readEmergencyAnswersBackup(): EmergencyAnswersBackup | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_ANSWERS_BACKUP_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<EmergencyAnswersBackup>;
+    if (
+      parsed &&
+      typeof parsed.participantNumber === 'string' &&
+      typeof parsed.examId === 'string' &&
+      parsed.answers &&
+      typeof parsed.answers === 'object'
+    ) {
+      return {
+        resultId: String(parsed.resultId || ''),
+        participantNumber: parsed.participantNumber.trim().toUpperCase(),
+        examId: parsed.examId,
+        answers: normalizeDbAnswersMap(parsed.answers),
+        flaggedQuestions: Array.isArray(parsed.flaggedQuestions)
+          ? (parsed.flaggedQuestions as string[])
+          : [],
+        tabSwitchCount: Number(parsed.tabSwitchCount || 0),
+        savedAt: Number(parsed.savedAt || 0),
+      };
+    }
+  } catch {
+    // Ignore localStorage parse errors
+  }
+  return null;
+}
+
+function reconcileSessionWithEmergencyBackup(session: ActiveExamSession): ActiveExamSession {
+  const backup = readEmergencyAnswersBackup();
+  if (!backup) return session;
+  const normPNum = session.participant.participantNumber.trim().toUpperCase();
+  const sameSession =
+    (backup.resultId && backup.resultId === session.resultId) ||
+    (backup.participantNumber === normPNum && backup.examId === session.schedule.id);
+  if (!sameSession) return session;
+
+  // Gabungkan jawaban dari backup sinkron localStorage bila transaksi async IndexedDB sempat terpotong saat tab ditutup mendadak
+  const mergedAnswers: Record<string, string> = {
+    ...session.answers,
+    ...backup.answers,
+  };
+  const backupKeys = Object.keys(backup.answers).length;
+  const sessionKeys = Object.keys(session.answers).length;
+  const effectiveAnswers =
+    backupKeys >= sessionKeys ? { ...backup.answers } : mergedAnswers;
+
+  return {
+    ...session,
+    answers: effectiveAnswers,
+    flaggedQuestions:
+      backup.flaggedQuestions.length > 0 || session.flaggedQuestions.length === 0
+        ? [...backup.flaggedQuestions]
+        : [...session.flaggedQuestions],
+    tabSwitchCount: Math.max(session.tabSwitchCount || 0, backup.tabSwitchCount || 0),
+  };
+}
+
 export function getSavedActiveSession(): ActiveExamSession | null {
-  if (cachedActiveSession) return cachedActiveSession;
+  if (cachedActiveSession) {
+    cachedActiveSession = reconcileSessionWithEmergencyBackup(cachedActiveSession);
+    return cachedActiveSession;
+  }
   try {
     const raw = localStorage.getItem(ACTIVE_SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<ActiveExamSession>;
     if (parsed && Array.isArray(parsed.questions) && parsed.participant && parsed.schedule) {
-      cachedActiveSession = parsed as ActiveExamSession;
+      cachedActiveSession = reconcileSessionWithEmergencyBackup(parsed as ActiveExamSession);
       return cachedActiveSession;
     }
     return null;
@@ -3418,12 +4717,13 @@ export function getSavedActiveSession(): ActiveExamSession | null {
 
 export function saveActiveSessionLocal(session: ActiveExamSession): void {
   cachedActiveSession = session;
+  const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
   try {
     localStorage.setItem(
       ACTIVE_SESSION_KEY,
       JSON.stringify({
         resultId: session.resultId,
-        participantNumber: session.participant.participantNumber,
+        participantNumber: normParticipantNum,
         examId: session.schedule.id,
         startedAt: session.startedAt,
         endsAt: session.endsAt,
@@ -3432,6 +4732,22 @@ export function saveActiveSessionLocal(session: ActiveExamSession): void {
   } catch {
     // Ignore localStorage quota restrictions; full session persists in IndexedDB
   }
+  // Tulis backup jawaban secara SINKRON ke localStorage agar jawaban detik akhir / sebelum tab ditutup
+  // 100% aman meskipun transaksi async IndexedDB terpotong oleh penutupan proses browser.
+  try {
+    const backup: EmergencyAnswersBackup = {
+      resultId: session.resultId,
+      participantNumber: normParticipantNum,
+      examId: session.schedule.id,
+      answers: { ...session.answers },
+      flaggedQuestions: [...session.flaggedQuestions],
+      tabSwitchCount: session.tabSwitchCount,
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(ACTIVE_ANSWERS_BACKUP_KEY, JSON.stringify(backup));
+  } catch {
+    // Ignore localStorage quota restrictions on very large answer sets
+  }
   void idbPut(STORES.ACTIVE_SESSION, { id: 'current', session }).catch(() => {});
 }
 
@@ -3439,10 +4755,54 @@ export function clearActiveSessionLocal(): void {
   cachedActiveSession = null;
   try {
     localStorage.removeItem(ACTIVE_SESSION_KEY);
+    localStorage.removeItem(ACTIVE_ANSWERS_BACKUP_KEY);
   } catch {
     // Ignore localStorage restrictions
   }
   void idbDelete(STORES.ACTIVE_SESSION, 'current').catch(() => {});
+}
+
+/**
+ * Menyimpan snapshot progres `in_progress` terbaru langsung ke IndexedDB `exam_results` (lokal saja,
+ * tanpa request jaringan) dengan status `pending` agar tidak pernah terjadi stale-overwrite saat
+ * masa tunggu expiry jitter atau ketika tab ditutup mendadak.
+ */
+export async function saveLocalResultProgressSnapshot(session: ActiveExamSession): Promise<void> {
+  await ensureInitialized();
+  const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
+  const sessionKey = makeSessionSyncKey(normParticipantNum, session.schedule.id);
+  if (finalizingSessionKeys.has(sessionKey)) return;
+
+  const existingLocal = await idbGet<ExamResult>(STORES.RESULTS, session.resultId);
+  if (isExamResultFinalized(existingLocal)) return;
+
+  const isLocked = session.tabSwitchCount >= session.schedule.maxTabSwitches;
+  const snapshotRecord: ExamResult = {
+    id: session.resultId,
+    participantId: session.participant.id,
+    participantNumber: normParticipantNum,
+    studentName: session.participant.fullName,
+    className: session.participant.className,
+    examId: session.schedule.id,
+    examTitle: session.schedule.title,
+    subject: session.schedule.subject,
+    answers: { ...session.answers },
+    flaggedQuestions: [...session.flaggedQuestions],
+    questionIds:
+      existingLocal?.questionIds && existingLocal.questionIds.length > 0
+        ? existingLocal.questionIds
+        : session.questions.map((q) => q.id),
+    correctCount: existingLocal?.correctCount || 0,
+    totalQuestions: Math.max(existingLocal?.totalQuestions || 0, session.questions.length),
+    score: existingLocal?.score || 0,
+    tabSwitchCount: Math.max(existingLocal?.tabSwitchCount || 0, session.tabSwitchCount),
+    status: isLocked ? 'flagged' : 'in_progress',
+    startedAt: existingLocal?.startedAt || session.startedAt,
+    submittedAt: null,
+    syncStatus: 'pending',
+  };
+
+  await idbPut(STORES.RESULTS, snapshotRecord);
 }
 
 export async function getExamResults(): Promise<ExamResult[]> {
@@ -3467,18 +4827,74 @@ export async function checkStudentExamLock(
   await ensureInitialized();
   const normNum = participantNumber.trim().toUpperCase();
 
+  // Baca record lokal terlebih dahulu agar jawaban lokal yang belum tersinkron (syncStatus: 'pending')
+  // atau ujian yang sudah disubmit offline TIDAK PERNAH tertimpa oleh data cloud yang lebih lama.
+  const allLocalBefore = await idbGetAll<ExamResult>(STORES.RESULTS);
+  const localMatches = allLocalBefore.filter(
+    (r) => r.participantNumber.trim().toUpperCase() === normNum && r.examId === schedule.id
+  );
+  // Prioritaskan record lokal yang sudah final / pending / memiliki jawaban terbanyak
+  const localBest =
+    localMatches.sort((a, b) => {
+      const aFin = isExamResultFinalized(a) ? 2 : a.syncStatus === 'pending' ? 1 : 0;
+      const bFin = isExamResultFinalized(b) ? 2 : b.syncStatus === 'pending' ? 1 : 0;
+      if (bFin !== aFin) return bFin - aFin;
+      return Object.keys(b.answers || {}).length - Object.keys(a.answers || {}).length;
+    })[0] || null;
+
+  // Cek juga backup jawaban darurat sinkron (ACTIVE_ANSWERS_BACKUP_KEY) untuk sesi ini
+  let backupAnswers: Record<string, string> | null = null;
+  let backupFlagged: string[] | null = null;
+  let backupTabSwitches = 0;
+  try {
+    const rawBackup = localStorage.getItem(ACTIVE_ANSWERS_BACKUP_KEY);
+    if (rawBackup) {
+      const parsed = JSON.parse(rawBackup) as Partial<EmergencyAnswersBackup>;
+      if (
+        parsed &&
+        normalizeParticipantNumber(String(parsed.participantNumber || '')) === normNum &&
+        parsed.examId === schedule.id
+      ) {
+        if (parsed.answers && typeof parsed.answers === 'object') {
+          backupAnswers = parsed.answers;
+        }
+        if (Array.isArray(parsed.flaggedQuestions)) {
+          backupFlagged = parsed.flaggedQuestions;
+        }
+        if (typeof parsed.tabSwitchCount === 'number' && parsed.tabSwitchCount > 0) {
+          backupTabSwitches = parsed.tabSwitchCount;
+        }
+      }
+    }
+  } catch {
+    // Ignore localStorage parse errors
+  }
+
   let matched: ExamResult | null = null;
   let checkedRemote = false;
 
   if (isLiveSupabaseConfigured()) {
+    if (isBrowserExplicitlyOffline()) {
+      return {
+        locked: true,
+        reason: 'network_error',
+        result: null,
+        errorMessage:
+          'Perangkat sedang offline. Sambungkan internet untuk memverifikasi status ujian sebelum masuk ruang ujian.',
+      };
+    }
     await syncServerClock();
     try {
       const supabase = getSupabaseClient();
-      const { data: remoteMatch, error } = await fetchSingleExamResult(
-        supabase,
-        normNum,
-        schedule.id,
-        EXAM_RESULTS_ADMIN_COLUMNS
+      const { data: remoteMatch, error } = await retryTransientSupabaseCall(
+        () =>
+          fetchSingleExamResult(
+            supabase,
+            normNum,
+            schedule.id,
+            EXAM_RESULTS_ADMIN_COLUMNS
+          ),
+        { backoffsMs: [0, 300, 750, 1500, 2600, 4000], jitterMs: 1100 }
       );
 
       if (error) {
@@ -3492,8 +4908,148 @@ export async function checkStudentExamLock(
 
       checkedRemote = true;
       if (remoteMatch) {
-        matched = mapDbExamResultRow(remoteMatch);
-        await idbPut(STORES.RESULTS, matched);
+        const remoteMapped = mapDbExamResultRow(remoteMatch);
+        confirmedCloudSessionKeys.add(makeSessionSyncKey(normNum, schedule.id));
+
+        const localHasPending = Boolean(localBest && localBest.syncStatus === 'pending');
+        const localIsFinalizedPending = Boolean(localHasPending && isExamResultFinalized(localBest));
+
+        // KASUS 1 (KRITIS): Siswa sudah menyelesaikan ujian saat offline (status lokal submitted/flagged, pending),
+        // sementara server masih in_progress. JANGAN timpa lokal — segera kirim & kunci hasil final ke server!
+        if (localIsFinalizedPending && !isExamResultFinalized(remoteMapped) && localBest) {
+          const mergedAnswers = {
+            ...(remoteMapped.answers || {}),
+            ...(localBest.answers || {}),
+            ...(backupAnswers || {}),
+          };
+          const toFinalize: ExamResult = {
+            ...localBest,
+            id: remoteMapped.id || localBest.id,
+            answers: mergedAnswers,
+            flaggedQuestions: Array.from(
+              new Set([
+                ...(remoteMapped.flaggedQuestions || []),
+                ...(localBest.flaggedQuestions || []),
+                ...(backupFlagged || []),
+              ])
+            ),
+            questionIds:
+              remoteMapped.questionIds && remoteMapped.questionIds.length > 0
+                ? remoteMapped.questionIds
+                : localBest.questionIds,
+            tabSwitchCount: Math.max(
+              remoteMapped.tabSwitchCount || 0,
+              localBest.tabSwitchCount || 0,
+              backupTabSwitches
+            ),
+            startedAt: remoteMapped.startedAt || localBest.startedAt,
+            syncStatus: 'pending',
+          };
+          if (localBest.id !== toFinalize.id) {
+            await idbDelete(STORES.RESULTS, localBest.id);
+          }
+          const finalized = await finalizeExamResultRecord(toFinalize, {
+            maxTabSwitches: schedule.maxTabSwitches,
+            skipIfFinalized: false,
+            broadcast: true,
+          });
+          matched = finalized;
+        }
+        // KASUS 2 (KRITIS): Server masih in_progress, namun perangkat lokal memiliki jawaban pending / backup darurat
+        // yang belum sempat tersinkron. Gabungkan (merge) agar 0 jawaban lokal yang hilang!
+        else if (
+          !isExamResultFinalized(remoteMapped) &&
+          (localHasPending || (backupAnswers && Object.keys(backupAnswers).length > 0))
+        ) {
+          const mergedAnswers: Record<string, string> = {
+            ...(remoteMapped.answers || {}),
+            ...(localHasPending && localBest ? localBest.answers || {} : {}),
+            ...(backupAnswers || {}),
+          };
+          const mergedFlagged = Array.from(
+            new Set([
+              ...(remoteMapped.flaggedQuestions || []),
+              ...(localHasPending && localBest ? localBest.flaggedQuestions || [] : []),
+              ...(backupFlagged || []),
+            ])
+          );
+          const mergedTabSwitches = Math.max(
+            remoteMapped.tabSwitchCount || 0,
+            localHasPending && localBest ? localBest.tabSwitchCount || 0 : 0,
+            backupTabSwitches
+          );
+          const remoteAnsCount = Object.keys(remoteMapped.answers || {}).length;
+          const mergedAnsCount = Object.keys(mergedAnswers).length;
+          const hasLocalDiff =
+            mergedAnsCount > remoteAnsCount ||
+            mergedTabSwitches > (remoteMapped.tabSwitchCount || 0) ||
+            JSON.stringify(mergedAnswers) !== JSON.stringify(remoteMapped.answers || {});
+
+          matched = {
+            ...remoteMapped,
+            answers: mergedAnswers,
+            flaggedQuestions: mergedFlagged,
+            tabSwitchCount: mergedTabSwitches,
+            questionIds:
+              remoteMapped.questionIds && remoteMapped.questionIds.length > 0
+                ? remoteMapped.questionIds
+                : localBest?.questionIds,
+            syncStatus: hasLocalDiff ? 'pending' : 'synced',
+          };
+          if (localBest && localBest.id !== matched.id) {
+            await idbDelete(STORES.RESULTS, localBest.id);
+          }
+          await idbPut(STORES.RESULTS, matched);
+        }
+        // KASUS 3: Server sudah berstatus submitted (mis. auto-expired saat offline), namun lokal punya jawaban pending
+        // lebih lengkap — coba rekonsiliasi aman via submit_exam_and_score sebelum mengunci ke hasil server.
+        else if (
+          remoteMapped.status === 'submitted' &&
+          localHasPending &&
+          localBest &&
+          Object.keys({ ...(remoteMapped.answers || {}), ...(localBest.answers || {}) }).length >
+            Object.keys(remoteMapped.answers || {}).length
+        ) {
+          const reconciledCandidate: ExamResult = {
+            ...remoteMapped,
+            answers: {
+              ...(remoteMapped.answers || {}),
+              ...(localBest.answers || {}),
+              ...(backupAnswers || {}),
+            },
+            tabSwitchCount: Math.max(
+              remoteMapped.tabSwitchCount || 0,
+              localBest.tabSwitchCount || 0,
+              backupTabSwitches
+            ),
+            syncStatus: 'pending',
+          };
+          if (localBest.id !== reconciledCandidate.id) {
+            await idbDelete(STORES.RESULTS, localBest.id);
+          }
+          matched = await finalizeExamResultRecord(reconciledCandidate, {
+            maxTabSwitches: schedule.maxTabSwitches,
+            skipIfFinalized: false,
+            broadcast: true,
+          });
+        } else {
+          matched = remoteMapped;
+          if (localBest && localBest.id !== matched.id) {
+            await idbDelete(STORES.RESULTS, localBest.id);
+          }
+          await idbPut(STORES.RESULTS, matched);
+        }
+      } else if (localBest && localBest.syncStatus === 'pending') {
+        // Baris belum sempat tercipta di cloud (mis. mulai/submit saat jaringan putus), pertahankan lokal!
+        if (isExamResultFinalized(localBest)) {
+          matched = await finalizeExamResultRecord(localBest, {
+            maxTabSwitches: schedule.maxTabSwitches,
+            skipIfFinalized: false,
+            broadcast: true,
+          });
+        } else {
+          matched = localBest;
+        }
       }
     } catch {
       return {
@@ -3507,12 +5063,7 @@ export async function checkStudentExamLock(
   }
 
   if (!matched && !checkedRemote) {
-    const localList = await idbGetAll<ExamResult>(STORES.RESULTS);
-    matched =
-      localList.find(
-        (r) =>
-          r.participantNumber.trim().toUpperCase() === normNum && r.examId === schedule.id
-      ) || null;
+    matched = localBest;
   }
 
   if (!matched) {
@@ -3543,7 +5094,8 @@ export async function checkStudentExamLock(
 
 export async function verifyStudentCanStartExam(
   participantNumber: string,
-  scheduleId: string
+  scheduleId: string,
+  options?: { forceRefresh?: boolean }
 ): Promise<{
   ok: boolean;
   participant?: Participant;
@@ -3555,10 +5107,115 @@ export async function verifyStudentCanStartExam(
 
   if (isLiveSupabaseConfigured()) {
     try {
+      const now = Date.now();
+      const cachedPartEntry = !options?.forceRefresh
+        ? recentlyVerifiedParticipants.get(normNum)
+        : undefined;
+      const freshCachedParticipant =
+        cachedPartEntry &&
+        cachedPartEntry.participant.isActive &&
+        now - cachedPartEntry.verifiedAt < RECENT_PREFLIGHT_CACHE_TTL_MS
+          ? cachedPartEntry.participant
+          : null;
+
+      const cachedSchedEntry = !options?.forceRefresh
+        ? verifiedSchedulesCache.get(scheduleId)
+        : undefined;
+      const freshCachedSchedule =
+        cachedSchedEntry &&
+        cachedSchedEntry.schedule.isActive &&
+        now - cachedSchedEntry.verifiedAt < RECENT_PREFLIGHT_CACHE_TTL_MS
+          ? cachedSchedEntry.schedule
+          : null;
+
+      // Jika peserta baru saja diverifikasi saat login dan jadwal baru saja disinkronkan (< 60 detik),
+      // lewati preflight SELECT berulang ke tabel participants & exam_schedules.
+      if (freshCachedParticipant && freshCachedSchedule) {
+        if (!freshCachedSchedule.targetClasses.includes(freshCachedParticipant.className)) {
+          return {
+            ok: false,
+            message: `Kelas ${freshCachedParticipant.className} tidak terdaftar pada jadwal ujian ini.`,
+          };
+        }
+        return {
+          ok: true,
+          participant: freshCachedParticipant,
+          schedule: freshCachedSchedule,
+        };
+      }
+
       const supabase = getSupabaseClient();
+      if (isBrowserExplicitlyOffline()) {
+        return {
+          ok: false,
+          message:
+            'Perangkat sedang offline. Hubungkan internet lalu tekan Mulai Ujian kembali.',
+        };
+      }
+      const fetchParticipantForPreflight = async (): Promise<{
+        data: Record<string, unknown> | null;
+        error?: { message: string } | null;
+      }> => {
+        const rpcRes = await supabase.rpc('check_participant_active', {
+          p_participant_number: normNum,
+        });
+        if (!rpcRes.error) {
+          const row =
+            Array.isArray(rpcRes.data) && rpcRes.data[0]
+              ? (rpcRes.data[0] as Record<string, unknown>)
+              : null;
+          return { data: row, error: null };
+        }
+        if (isRpcSignatureMismatchError(rpcRes.error.message)) {
+          return fetchSingleParticipantByNumber(supabase, normNum, false);
+        }
+        return { data: null, error: rpcRes.error };
+      };
+
+      const fetchScheduleForPreflight = (): Promise<{
+        data: Record<string, unknown> | null;
+        error?: { message: string } | null;
+      }> => {
+        const existingFlight = inFlightSchedulePreflight.get(scheduleId);
+        if (existingFlight) return existingFlight;
+        const p = retryTransientSupabaseCall(
+          async () => {
+            const res = await supabase
+              .from('exam_schedules')
+              .select('*')
+              .eq('id', scheduleId)
+              .maybeSingle();
+            return {
+              data: (res.data as Record<string, unknown> | null) ?? null,
+              error: res.error,
+            };
+          },
+          { backoffsMs: [0, 300, 750, 1500, 2600, 4000], jitterMs: 1100 }
+        ).finally(() => {
+          if (inFlightSchedulePreflight.get(scheduleId) === p) {
+            inFlightSchedulePreflight.delete(scheduleId);
+          }
+        });
+        inFlightSchedulePreflight.set(scheduleId, p);
+        return p;
+      };
+
       const [pRes, sRes] = await Promise.all([
-        fetchSingleParticipantByNumber(supabase, normNum, false),
-        supabase.from('exam_schedules').select('*').eq('id', scheduleId).maybeSingle(),
+        freshCachedParticipant
+          ? Promise.resolve<{ data: Record<string, unknown> | null; error?: { message: string } | null }>({
+              data: null,
+              error: null,
+            })
+          : retryTransientSupabaseCall(() => fetchParticipantForPreflight(), {
+              backoffsMs: [0, 300, 750, 1500, 2600, 4000],
+              jitterMs: 1100,
+            }),
+        freshCachedSchedule
+          ? Promise.resolve<{ data: Record<string, unknown> | null; error?: { message: string } | null }>({
+              data: null,
+              error: null,
+            })
+          : fetchScheduleForPreflight(),
       ]);
 
       if (pRes.error || sRes.error) {
@@ -3567,40 +5224,62 @@ export async function verifyStudentCanStartExam(
           message: 'Gagal memverifikasi status peserta/jadwal ke server. Coba lagi.',
         };
       }
-      if (!pRes.data || !pRes.data.is_active) {
-        return {
-          ok: false,
-          message: 'Akun peserta Anda sedang dinonaktifkan atau dihapus oleh Panitia.',
+
+      let freshParticipant = freshCachedParticipant;
+      if (!freshParticipant) {
+        if (!pRes.data || !pRes.data.is_active) {
+          return {
+            ok: false,
+            message: 'Akun peserta Anda sedang dinonaktifkan atau dihapus oleh Panitia.',
+          };
+        }
+        const localPrevParticipant = (await idbGetAll<Participant>(STORES.PARTICIPANTS)).find(
+          (p) => normalizeParticipantNumber(p.participantNumber) === normNum
+        );
+        freshParticipant = {
+          id: String(pRes.data.id),
+          participantNumber: normalizeParticipantNumber(String(pRes.data.participant_number || normNum)),
+          token: String(pRes.data.token || localPrevParticipant?.token || ''),
+          fullName: String(pRes.data.full_name),
+          className: String(pRes.data.class_name),
+          isActive: Boolean(pRes.data.is_active),
+          createdAt: String(pRes.data.created_at),
         };
-      }
-      if (!sRes.data || !sRes.data.is_active) {
-        return {
-          ok: false,
-          message: 'Jadwal ujian ini sudah ditutup atau dinonaktifkan oleh Panitia.',
-        };
+        await idbPutParticipantsSafe([freshParticipant]);
+        recentlyVerifiedParticipants.set(freshParticipant.participantNumber, {
+          participant: freshParticipant,
+          verifiedAt: Date.now(),
+        });
       }
 
-      const freshParticipant: Participant = {
-        id: String(pRes.data.id),
-        participantNumber: String(pRes.data.participant_number),
-        token: String(pRes.data.token || 'CBT2026'),
-        fullName: String(pRes.data.full_name),
-        className: String(pRes.data.class_name),
-        isActive: Boolean(pRes.data.is_active),
-        createdAt: String(pRes.data.created_at),
-      };
-      const freshSchedule: ExamSchedule = {
-        id: sRes.data.id,
-        title: sRes.data.title,
-        subject: sRes.data.subject,
-        kkm: Number(sRes.data.kkm ?? 75),
-        durationMinutes: sRes.data.duration_minutes,
-        targetClasses: sRes.data.target_classes,
-        isActive: Boolean(sRes.data.is_active),
-        randomizeQuestions: Boolean(sRes.data.randomize_questions ?? false),
-        maxTabSwitches: sRes.data.max_tab_switches,
-        createdAt: sRes.data.created_at,
-      };
+      let freshSchedule = freshCachedSchedule;
+      if (!freshSchedule) {
+        if (!sRes.data || !sRes.data.is_active) {
+          return {
+            ok: false,
+            message: 'Jadwal ujian ini sudah ditutup atau dinonaktifkan oleh Panitia.',
+          };
+        }
+        freshSchedule = {
+          id: String(sRes.data.id),
+          title: String(sRes.data.title || ''),
+          subject: String(sRes.data.subject || ''),
+          kkm: Number(sRes.data.kkm ?? 75),
+          durationMinutes: Number(sRes.data.duration_minutes ?? 60),
+          targetClasses: Array.isArray(sRes.data.target_classes)
+            ? (sRes.data.target_classes as string[])
+            : [],
+          isActive: Boolean(sRes.data.is_active),
+          randomizeQuestions: Boolean(sRes.data.randomize_questions ?? false),
+          maxTabSwitches: Number(sRes.data.max_tab_switches ?? 3),
+          createdAt: String(sRes.data.created_at || new Date().toISOString()),
+        };
+        await idbPut(STORES.SCHEDULES, freshSchedule);
+        verifiedSchedulesCache.set(freshSchedule.id, {
+          schedule: freshSchedule,
+          verifiedAt: Date.now(),
+        });
+      }
 
       if (!freshSchedule.targetClasses.includes(freshParticipant.className)) {
         return {
@@ -3608,9 +5287,6 @@ export async function verifyStudentCanStartExam(
           message: `Kelas ${freshParticipant.className} tidak terdaftar pada jadwal ujian ini.`,
         };
       }
-
-      await idbPutParticipantsSafe([freshParticipant]);
-      await idbPut(STORES.SCHEDULES, freshSchedule);
 
       return { ok: true, participant: freshParticipant, schedule: freshSchedule };
     } catch {
@@ -3645,14 +5321,90 @@ export async function verifyStudentCanStartExam(
 
 export async function checkLiveSessionStatusFromCloud(
   participantNumber: string,
-  examId: string
+  examId: string,
+  options?: {
+    forceNetwork?: boolean;
+    activeAnswers?: Record<string, string>;
+    activeTabSwitchCount?: number;
+    maxTabSwitches?: number;
+  }
 ): Promise<{
-  status: 'ok' | 'finalized' | 'reset_deleted' | 'offline';
+  status: 'ok' | 'finalized' | 'reset_deleted' | 'unsynced_local' | 'offline';
   result?: ExamResult;
 }> {
-  if (!isLiveSupabaseConfigured()) {
+  if (!isLiveSupabaseConfigured() || isBrowserExplicitlyOffline()) {
     return { status: 'offline' };
   }
+  const sessionKey = makeSessionSyncKey(participantNumber, examId);
+
+  // Jangan pernah menimpa atau menginterupsi proses submit final yang sedang berjalan
+  if (finalizingSessionKeys.has(sessionKey)) {
+    return { status: 'ok' };
+  }
+
+  // Deduplikasi polling: jika autosave baru saja terkonfirmasi sukses di server (<25 detik)
+  // dan verifikasi penuh terakhir belum melewati batas 2 menit, lewati SELECT berulang untuk hemat DB read pada 800 peserta.
+  if (!options?.forceNetwork) {
+    const now = Date.now();
+    const lastProgressOk = lastCloudProgressConfirmedAt.get(sessionKey) || 0;
+    const lastFullCheck = lastLivePollCloudCheckAt.get(sessionKey) || 0;
+    if (
+      lastProgressOk > 0 &&
+      now - lastProgressOk < LIVE_POLL_RECENT_SYNC_SKIP_MS &&
+      lastFullCheck > 0 &&
+      now - lastFullCheck < LIVE_POLL_MAX_SKIP_WINDOW_MS
+    ) {
+      return { status: 'ok' };
+    }
+  }
+
+  const resolveFinalizedRowSafely = async (
+    mapped: ExamResult
+  ): Promise<{
+    status: 'ok' | 'finalized';
+    result?: ExamResult;
+  }> => {
+    if (finalizingSessionKeys.has(sessionKey)) {
+      return { status: 'ok' };
+    }
+    // Cek apakah lokal / sesi aktif memiliki jawaban lebih lengkap dibanding baris server
+    // (misalnya server melakukan auto_expired saat perangkat sempat offline).
+    if (mapped.status === 'submitted') {
+      const normNum = normalizeParticipantNumber(participantNumber);
+      const localList = await idbGetAll<ExamResult>(STORES.RESULTS);
+      const localMatch = localList.find(
+        (r) => normalizeParticipantNumber(r.participantNumber) === normNum && r.examId === examId
+      );
+      const localAnswers = localMatch?.answers || {};
+      const activeAnswers = options?.activeAnswers || {};
+      const mergedAnswers: Record<string, string> = {
+        ...(mapped.answers || {}),
+        ...localAnswers,
+        ...activeAnswers,
+      };
+      if (Object.keys(mergedAnswers).length > Object.keys(mapped.answers || {}).length) {
+        const reconciledCandidate: ExamResult = {
+          ...mapped,
+          answers: mergedAnswers,
+          tabSwitchCount: Math.max(
+            mapped.tabSwitchCount || 0,
+            localMatch?.tabSwitchCount || 0,
+            options?.activeTabSwitchCount || 0
+          ),
+          syncStatus: 'pending',
+        };
+        const reconciled = await finalizeExamResultRecord(reconciledCandidate, {
+          maxTabSwitches: options?.maxTabSwitches ?? 3,
+          skipIfFinalized: false,
+          broadcast: true,
+        });
+        return { status: 'finalized', result: reconciled };
+      }
+    }
+    await idbPut(STORES.RESULTS, mapped);
+    return { status: 'finalized', result: mapped };
+  };
+
   try {
     const supabase = getSupabaseClient();
     const { data: statusRow, error } = await fetchSingleExamResult(
@@ -3663,9 +5415,65 @@ export async function checkLiveSessionStatusFromCloud(
     );
 
     if (error) return { status: 'offline' };
+    if (finalizingSessionKeys.has(sessionKey)) {
+      return { status: 'ok' };
+    }
+
     if (!statusRow) {
+      // Guard anti-false-reset: jika sesi lokal belum pernah terkonfirmasi masuk ke cloud
+      // (misalnya saat awal mulai ujian jaringan padat sehingga upsert awal gagal),
+      // JANGAN hapus jawaban lokal siswa — minta sinkronisasi ulang antrean pending.
+      const localList = await idbGetAll<ExamResult>(STORES.RESULTS);
+      const normNum = participantNumber.trim().toUpperCase();
+      const localMatch = localList.find(
+        (r) => r.participantNumber.trim().toUpperCase() === normNum && r.examId === examId
+      );
+      const wasEverConfirmedOnCloud =
+        confirmedCloudSessionKeys.has(sessionKey) || localMatch?.syncStatus === 'synced';
+
+      if (!wasEverConfirmedOnCloud) {
+        return { status: 'unsynced_local' };
+      }
+
+      // Konfirmasi ulang sekali lagi setelah jeda singkat untuk mencegah false-reset akibat replika/jaringan
+      await new Promise((r) => setTimeout(r, 1200));
+      if (finalizingSessionKeys.has(sessionKey)) {
+        return { status: 'ok' };
+      }
+      const { data: confirmRow, error: confirmErr } = await fetchSingleExamResult(
+        supabase,
+        participantNumber,
+        examId,
+        EXAM_RESULTS_LIVE_STATUS_COLUMNS
+      );
+      if (confirmErr) return { status: 'offline' };
+      if (confirmRow) {
+        confirmedCloudSessionKeys.add(sessionKey);
+        lastLivePollCloudCheckAt.set(sessionKey, Date.now());
+        const confirmStatus = String(confirmRow.status || 'in_progress');
+        if (confirmStatus === 'submitted' || confirmStatus === 'flagged') {
+          const { data: fullRow, error: fullErr } = await supabase
+            .from('exam_results')
+            .select(EXAM_RESULTS_ADMIN_COLUMNS)
+            .eq('id', String(confirmRow.id))
+            .maybeSingle();
+          if (!fullErr && fullRow) {
+            const mapped = mapDbExamResultRow(fullRow as unknown as Record<string, unknown>);
+            return await resolveFinalizedRowSafely(mapped);
+          }
+          return { status: 'offline' };
+        }
+        return { status: 'ok' };
+      }
+
+      confirmedCloudSessionKeys.delete(sessionKey);
+      lastCloudProgressConfirmedAt.delete(sessionKey);
+      lastLivePollCloudCheckAt.delete(sessionKey);
       return { status: 'reset_deleted' };
     }
+
+    confirmedCloudSessionKeys.add(sessionKey);
+    lastLivePollCloudCheckAt.set(sessionKey, Date.now());
     const rowStatus = String(statusRow.status || 'in_progress');
     if (rowStatus === 'submitted' || rowStatus === 'flagged') {
       const { data: fullRow, error: fullErr } = await supabase
@@ -3676,8 +5484,7 @@ export async function checkLiveSessionStatusFromCloud(
 
       if (!fullErr && fullRow) {
         const mapped = mapDbExamResultRow(fullRow as unknown as Record<string, unknown>);
-        await idbPut(STORES.RESULTS, mapped);
-        return { status: 'finalized', result: mapped };
+        return await resolveFinalizedRowSafely(mapped);
       }
       return { status: 'offline' };
     }
@@ -3768,6 +5575,12 @@ export async function resetStudentExamResult(resultId: string): Promise<void> {
   await ensureInitialized();
   const existing = await idbGet<ExamResult>(STORES.RESULTS, resultId);
   const normNum = existing?.participantNumber.trim().toUpperCase() || '';
+  if (normNum && existing) {
+    const sKey = makeSessionSyncKey(normNum, existing.examId);
+    confirmedCloudSessionKeys.delete(sKey);
+    lastCloudProgressConfirmedAt.delete(sKey);
+    lastLivePollCloudCheckAt.delete(sKey);
+  }
   for (const key of confirmedQuestionIdsSyncSet) {
     if (
       key.startsWith(`${resultId}::`) ||
@@ -3796,31 +5609,33 @@ export async function resetStudentExamResult(resultId: string): Promise<void> {
       const adminClient = getSupabaseAdminClient();
       const supabase = getSupabaseClient();
       if (adminClient) {
-        await adminClient.from('exam_results').delete().eq('id', resultId);
+        await retryTransientSupabaseCall(
+          async () => await adminClient.from('exam_results').delete().eq('id', resultId),
+          { backoffsMs: [0, 350, 900], jitterMs: 400 }
+        );
         if (normNum && existing) {
-          await adminClient
-            .from('exam_results')
-            .delete()
-            .ilike('participant_number', escapeLikePattern(normNum))
-            .eq('exam_id', existing.examId);
+          await retryTransientSupabaseCall(
+            async () =>
+              await adminClient
+                .from('exam_results')
+                .delete()
+                .eq('participant_number', normNum)
+                .eq('exam_id', existing.examId),
+            { backoffsMs: [0, 350, 900], jitterMs: 400 }
+          );
         }
       } else {
-        const { error: rpcErr } = await supabase.rpc('staff_delete_exam_results', {
-          ...getStaffRpcAuthArgs(),
-          p_result_ids: [resultId],
-          p_participant_number: normNum || null,
-          p_exam_id: existing?.examId || null,
-        });
-        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-          await supabase.from('exam_results').delete().eq('id', resultId);
-          if (normNum && existing) {
-            await supabase
-              .from('exam_results')
-              .delete()
-              .eq('participant_number', normNum)
-              .eq('exam_id', existing.examId);
-          }
-        }
+        const authArgs = await resolveStaffRpcAuthArgs();
+        await retryTransientSupabaseCall(
+          async () =>
+            await supabase.rpc('staff_delete_exam_results', {
+              ...authArgs,
+              p_result_ids: [resultId],
+              p_participant_number: normNum || null,
+              p_exam_id: existing?.examId || null,
+            }),
+          { backoffsMs: [0, 350, 900], jitterMs: 400 }
+        );
       }
     } catch {
       // Local reset persists regardless
@@ -3838,6 +5653,12 @@ export async function deleteExamResultsBatch(resultIds: string[]): Promise<numbe
   const idSet = new Set(uniqueIds);
   const allResults = await idbGetAll<ExamResult>(STORES.RESULTS);
   const matched = allResults.filter((r) => idSet.has(r.id));
+  for (const m of matched) {
+    const sKey = makeSessionSyncKey(m.participantNumber, m.examId);
+    confirmedCloudSessionKeys.delete(sKey);
+    lastCloudProgressConfirmedAt.delete(sKey);
+    lastLivePollCloudCheckAt.delete(sKey);
+  }
   for (const key of confirmedQuestionIdsSyncSet) {
     const idPart = key.split('::')[0];
     if (idSet.has(idPart)) {
@@ -3862,8 +5683,8 @@ export async function deleteExamResultsBatch(resultIds: string[]): Promise<numbe
     (idSet.has(savedSession.resultId) ||
       matched.some(
         (existing) =>
-          savedSession.participant.participantNumber.trim().toUpperCase() ===
-            existing.participantNumber.trim().toUpperCase() &&
+          normalizeParticipantNumber(savedSession.participant.participantNumber) ===
+            normalizeParticipantNumber(existing.participantNumber) &&
           savedSession.schedule.id === existing.examId
       ))
   ) {
@@ -3876,21 +5697,48 @@ export async function deleteExamResultsBatch(resultIds: string[]): Promise<numbe
     try {
       const adminClient = getSupabaseAdminClient();
       const supabase = getSupabaseClient();
+      const authArgs = adminClient ? null : await resolveStaffRpcAuthArgs();
       const CHUNK = 50;
+      const runDeleteChunk = async (chunk: string[]): Promise<boolean> => {
+        try {
+          if (adminClient) {
+            const res = await retryTransientSupabaseCall(
+              async () => await adminClient.from('exam_results').delete().in('id', chunk),
+              { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+            );
+            return !res.error;
+          } else if (authArgs) {
+            const res = await retryTransientSupabaseCall(
+              async () =>
+                await supabase.rpc('staff_delete_exam_results', {
+                  ...authArgs,
+                  p_result_ids: chunk,
+                  p_participant_number: null,
+                  p_exam_id: null,
+                }),
+              { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+            );
+            return !res.error;
+          }
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      const failedChunks: string[][] = [];
       for (let i = 0; i < uniqueIds.length; i += CHUNK) {
         const chunk = uniqueIds.slice(i, i + CHUNK);
-        if (adminClient) {
-          await adminClient.from('exam_results').delete().in('id', chunk);
-        } else {
-          const { error: rpcErr } = await supabase.rpc('staff_delete_exam_results', {
-            ...getStaffRpcAuthArgs(),
-            p_result_ids: chunk,
-            p_participant_number: null,
-            p_exam_id: null,
-          });
-          if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-            await supabase.from('exam_results').delete().in('id', chunk);
-          }
+        const ok = await runDeleteChunk(chunk);
+        if (!ok) {
+          failedChunks.push(chunk);
+        }
+      }
+      // Putaran pemulihan kedua bila ada batch yang gagal sementara saat badai beban puncak
+      if (failedChunks.length > 0 && !isBrowserExplicitlyOffline()) {
+        await new Promise((r) => setTimeout(r, 800));
+        for (const chunk of failedChunks) {
+          await runDeleteChunk(chunk);
         }
       }
     } catch {
@@ -3908,6 +5756,9 @@ export async function clearAllExamResults(): Promise<number> {
   const allResults = await idbGetAll<ExamResult>(STORES.RESULTS);
   const count = allResults.length;
   confirmedQuestionIdsSyncSet.clear();
+  confirmedCloudSessionKeys.clear();
+  lastCloudProgressConfirmedAt.clear();
+  lastLivePollCloudCheckAt.clear();
 
   const db = await openDB();
   await new Promise<void>((resolve, reject) => {
@@ -3933,22 +5784,31 @@ export async function clearAllExamResults(): Promise<number> {
         'id'
       );
       if (!idRes.error && idRes.data.length > 0) {
+        const authArgs = adminClient ? null : await resolveStaffRpcAuthArgs();
         const CHUNK = 50;
         const ids = idRes.data.map((r) => String(r.id));
         for (let i = 0; i < ids.length; i += CHUNK) {
           const chunk = ids.slice(i, i + CHUNK);
-          if (adminClient) {
-            await adminClient.from('exam_results').delete().in('id', chunk);
-          } else {
-            const { error: rpcErr } = await supabase.rpc('staff_delete_exam_results', {
-              ...getStaffRpcAuthArgs(),
-              p_result_ids: chunk,
-              p_participant_number: null,
-              p_exam_id: null,
-            });
-            if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-              await supabase.from('exam_results').delete().in('id', chunk);
+          try {
+            if (adminClient) {
+              await retryTransientSupabaseCall(
+                async () => await adminClient.from('exam_results').delete().in('id', chunk),
+                { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+              );
+            } else if (authArgs) {
+              await retryTransientSupabaseCall(
+                async () =>
+                  await supabase.rpc('staff_delete_exam_results', {
+                    ...authArgs,
+                    p_result_ids: chunk,
+                    p_participant_number: null,
+                    p_exam_id: null,
+                  }),
+                { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+              );
             }
+          } catch {
+            // Continue clearing remaining chunks
           }
         }
       }
@@ -3969,13 +5829,14 @@ async function pushResultToSupabase(
   result: ExamResult,
   options?: { includeQuestionIds?: boolean }
 ): Promise<{ ok: boolean; finalizedFromServer?: ExamResult }> {
-  if (!isLiveSupabaseConfigured()) {
+  if (!isLiveSupabaseConfigured() || isBrowserExplicitlyOffline()) {
     return { ok: false };
   }
   try {
     const supabase = getSupabaseClient();
     const adminClient = getSupabaseAdminClient();
-    const normParticipant = result.participantNumber.trim().toUpperCase();
+    const normParticipant = normalizeParticipantNumber(result.participantNumber);
+    const sessionKey = makeSessionSyncKey(normParticipant, result.examId);
     const syncKey = `${result.id}::${normParticipant}::${result.examId}`;
     const hasQuestionIds = Boolean(result.questionIds && result.questionIds.length > 0);
     const shouldIncludeQuestionIds =
@@ -4002,6 +5863,8 @@ async function pushResultToSupabase(
 
       if (!rpcError && Array.isArray(rpcData) && rpcData[0]) {
         if (rpcData[0].applied === true) {
+          confirmedCloudSessionKeys.add(sessionKey);
+          lastCloudProgressConfirmedAt.set(sessionKey, Date.now());
           if (shouldIncludeQuestionIds) {
             confirmedQuestionIdsSyncSet.add(syncKey);
           }
@@ -4020,10 +5883,13 @@ async function pushResultToSupabase(
         return { ok: false };
       }
 
-      // Fallback when upsert_exam_progress RPC hasn't been deployed on Supabase yet
-      const writeClient = adminClient || supabase;
+      // Role anon tidak memiliki hak INSERT/UPDATE langsung ke exam_results; hanya adminClient (service_role) yang boleh direct write
+      if (!adminClient) {
+        return { ok: false };
+      }
+
       const { data: existingRow, error: checkErr } = await fetchSingleExamResult(
-        writeClient,
+        adminClient,
         normParticipant,
         result.examId,
         EXAM_RESULTS_ADMIN_COLUMNS
@@ -4054,7 +5920,7 @@ async function pushResultToSupabase(
           updatePayload.question_ids = result.questionIds;
         }
 
-        let { error: updErr } = await writeClient
+        let { error: updErr } = await adminClient
           .from('exam_results')
           .update(updatePayload)
           .eq('id', String(existingRow.id))
@@ -4063,7 +5929,7 @@ async function pushResultToSupabase(
 
         if (updErr && 'question_ids' in updatePayload && updErr.message.includes('question_ids')) {
           delete updatePayload.question_ids;
-          const retry = await writeClient
+          const retry = await adminClient
             .from('exam_results')
             .update(updatePayload)
             .eq('id', String(existingRow.id))
@@ -4102,10 +5968,10 @@ async function pushResultToSupabase(
         insertPayload.question_ids = result.questionIds;
       }
 
-      let { error: insErr } = await writeClient.from('exam_results').insert(insertPayload);
+      let { error: insErr } = await adminClient.from('exam_results').insert(insertPayload);
       if (insErr && 'question_ids' in insertPayload && insErr.message.includes('question_ids')) {
         delete insertPayload.question_ids;
-        const retry = await writeClient.from('exam_results').insert(insertPayload);
+        const retry = await adminClient.from('exam_results').insert(insertPayload);
         insErr = retry.error;
       }
       if (!insErr && hasQuestionIds) {
@@ -4157,139 +6023,301 @@ async function pushResultToSupabase(
     }
 
     if (activeStaffCredentials) {
+      const authArgs = await resolveStaffRpcAuthArgs();
       const { error: rpcErr } = await supabase.rpc('staff_upsert_exam_results_batch', {
-        ...getStaffRpcAuthArgs(),
+        ...authArgs,
         p_results: [basePayload],
       });
       if (!rpcErr) {
         if (hasQuestionIds) confirmedQuestionIdsSyncSet.add(syncKey);
         return { ok: true };
       }
-      if (!isRpcSignatureMismatchError(rpcErr.message)) {
-        return { ok: false };
-      }
-    } else {
-      // Pada perangkat siswa (role anon tanpa kredensial staf), gunakan submit_exam_and_score SECURITY DEFINER
-      const schedules = await getExamSchedules();
-      const matchedSched = findScheduleForExam(schedules, result.examId, result.subject);
-      const { data: scoreData, error: scoreErr } = await supabase.rpc('submit_exam_and_score', {
-        p_result_id: result.id,
-        p_participant_id: result.participantId,
-        p_participant_number: normParticipant,
-        p_student_name: result.studentName,
-        p_class_name: result.className,
-        p_exam_id: result.examId,
-        p_exam_title: result.examTitle,
-        p_subject: matchedSched?.subject || result.subject,
-        p_answers: result.answers,
-        p_flagged_questions: result.flaggedQuestions,
-        p_tab_switch_count: result.tabSwitchCount,
-        p_started_at: result.startedAt,
-        p_max_tab_switches: matchedSched?.maxTabSwitches ?? 3,
-        p_question_ids: hasQuestionIds ? result.questionIds! : null,
-      });
-      if (!scoreErr && Array.isArray(scoreData) && scoreData[0] && Number(scoreData[0].total_questions) > 0) {
-        if (hasQuestionIds) confirmedQuestionIdsSyncSet.add(syncKey);
-        return { ok: true };
-      }
+      return { ok: false };
     }
 
-    let { error } = await supabase
-      .from('exam_results')
-      .upsert(basePayload, { onConflict: 'participant_number,exam_id' });
-
-    if (error && 'question_ids' in basePayload && error.message.includes('question_ids')) {
-      delete basePayload.question_ids;
-      const retry = await supabase
-        .from('exam_results')
-        .upsert(basePayload, { onConflict: 'participant_number,exam_id' });
-      error = retry.error;
+    // Pada perangkat siswa (role anon tanpa kredensial staf), gunakan submit_exam_and_score SECURITY DEFINER
+    const schedules = await getExamSchedules();
+    const matchedSched = findScheduleForExam(schedules, result.examId, result.subject);
+    const { data: scoreData, error: scoreErr } = await supabase.rpc('submit_exam_and_score', {
+      p_result_id: result.id,
+      p_participant_id: result.participantId,
+      p_participant_number: normParticipant,
+      p_student_name: result.studentName,
+      p_class_name: result.className,
+      p_exam_id: result.examId,
+      p_exam_title: result.examTitle,
+      p_subject: matchedSched?.subject || result.subject,
+      p_answers: result.answers,
+      p_flagged_questions: result.flaggedQuestions,
+      p_tab_switch_count: result.tabSwitchCount,
+      p_started_at: result.startedAt,
+      p_max_tab_switches: matchedSched?.maxTabSwitches ?? 3,
+      p_question_ids: hasQuestionIds ? result.questionIds! : null,
+    });
+    if (!scoreErr && Array.isArray(scoreData) && scoreData[0] && Number(scoreData[0].total_questions) > 0) {
+      if (hasQuestionIds) confirmedQuestionIdsSyncSet.add(syncKey);
+      return { ok: true };
     }
-
-    if (!error && hasQuestionIds) {
-      confirmedQuestionIdsSyncSet.add(syncKey);
-    }
-    return { ok: !error };
+    return { ok: false };
   } catch {
     return { ok: false };
   }
 }
 
-const EXPIRY_GRACE_MS = 5000;
-const ADMIN_EXPIRY_GRACE_MS = 60_000;
+// Grace period finalisasi global dibuat lebih besar dari batas atas expiryJitter ExamRoom (30s) + submit deadline (35s)
+// dan ADMIN_EXPIRY_GRACE_MS = 5 menit agar auto-finalize Admin tidak mendahului siswa yang sedang retry/reconnect.
+const EXPIRY_GRACE_MS = 75_000;
+const ADMIN_EXPIRY_GRACE_MS = 300_000;
+const KEEPALIVE_SAFE_MAX_BYTES = 54 * 1024;
+const KEEPALIVE_HARD_MAX_BYTES = 60 * 1024;
+const KEEPALIVE_DEDUP_WINDOW_MS = 3_000;
 
-export function flushExamProgressKeepalive(session: ActiveExamSession): void {
+export interface KeepaliveFlushReport {
+  attempted: boolean;
+  skippedDuplicate: boolean;
+  usedKeepalive: boolean;
+  compacted: boolean;
+  byteLength: number;
+}
+
+const lastKeepaliveFlushMap = new Map<string, { fingerprint: string; ts: number }>();
+
+function measureUtf8ByteLength(text: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).length;
+  }
+  return text.length * 2;
+}
+
+/**
+ * Mengompresi jawaban JSON-stringified (soal Menjodohkan) menjadi objek JSON native agar tidak terkena
+ * double-escaping (`\"`), menghemat ~20-30% ukuran payload keepalive tanpa kehilangan 1 byte data pun.
+ * Baik RPC `submit_exam_and_score` maupun `mapDbExamResultRow` & `parseMatchingMap` mendukung objek native.
+ */
+function compactAnswersForKeepalive(
+  answers: Record<string, string>
+): { compacted: Record<string, unknown>; changed: boolean } {
+  const out: Record<string, unknown> = {};
+  let changed = false;
+  for (const [qId, rawVal] of Object.entries(answers || {})) {
+    if (typeof rawVal === 'string') {
+      const trimmed = rawVal.trim();
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            out[qId] = parsed;
+            changed = true;
+            continue;
+          }
+        } catch {
+          // Keep original string if not valid JSON object
+        }
+      }
+    }
+    out[qId] = rawVal;
+  }
+  return { compacted: out, changed };
+}
+
+function buildKeepaliveStateFingerprint(session: ActiveExamSession): string {
+  const keys = Object.keys(session.answers || {}).sort();
+  let sig = `${session.tabSwitchCount}|${session.flaggedQuestions.join(',')}|`;
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    sig += `${k}:${session.answers[k]};`;
+  }
+  return sig;
+}
+
+export function flushExamProgressKeepalive(session: ActiveExamSession): KeepaliveFlushReport {
+  const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
+  const sessionKey = makeSessionSyncKey(normParticipantNum, session.schedule.id);
   const isLocked = session.tabSwitchCount >= session.schedule.maxTabSwitches;
   if (!isLocked) {
     saveActiveSessionLocal(session);
+    void saveLocalResultProgressSnapshot(session).catch(() => {});
   }
-  if (!isLiveSupabaseConfigured()) return;
+  if (!isLiveSupabaseConfigured() || finalizingSessionKeys.has(sessionKey)) {
+    return {
+      attempted: false,
+      skippedDuplicate: false,
+      usedKeepalive: false,
+      compacted: false,
+      byteLength: 0,
+    };
+  }
+
+  // Deduplikasi panggilan beruntun identik (mis. `beforeunload` diikuti langsung `pagehide`):
+  // mencegah pengiriman ganda yang menggandakan kuota 64 KiB bersama (shared keepalive budget) browser.
+  const now = Date.now();
+  const stateFingerprint = buildKeepaliveStateFingerprint(session);
+  const prevFlush = lastKeepaliveFlushMap.get(sessionKey);
+  if (
+    prevFlush &&
+    prevFlush.fingerprint === stateFingerprint &&
+    now - prevFlush.ts < KEEPALIVE_DEDUP_WINDOW_MS
+  ) {
+    return {
+      attempted: false,
+      skippedDuplicate: true,
+      usedKeepalive: false,
+      compacted: false,
+      byteLength: 0,
+    };
+  }
 
   try {
     const { url, anonKey } = getSupabaseConfig();
-    if (!url || !anonKey) return;
+    if (!url || !anonKey) {
+      return {
+        attempted: false,
+        skippedDuplicate: false,
+        usedKeepalive: false,
+        compacted: false,
+        byteLength: 0,
+      };
+    }
     const cleanUrl = url.replace(/\/+$/, '');
 
-    const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
-    const questionIds = session.questions.map((q) => q.id);
+    const { compacted: compactedAnswers, changed: answersCompacted } = compactAnswersForKeepalive(
+      session.answers
+    );
+    let wasCompacted = answersCompacted;
+
+    // Jangan kirim p_question_ids penuh pada keepalive (browser membatasi body keepalive <= 64 KiB).
+    // RPC upsert_exam_progress mempertahankan question_ids yang sudah tersimpan di DB via COALESCE.
+    const payload: Record<string, unknown> = {
+      p_result_id: session.resultId,
+      p_participant_id: session.participant.id,
+      p_participant_number: normParticipantNum,
+      p_student_name: session.participant.fullName,
+      p_class_name: session.participant.className,
+      p_exam_id: session.schedule.id,
+      p_exam_title: session.schedule.title,
+      p_subject: session.schedule.subject,
+      p_answers: compactedAnswers,
+      p_flagged_questions: session.flaggedQuestions,
+      p_total_questions: session.questions.length,
+      p_tab_switch_count: session.tabSwitchCount,
+      p_started_at: session.startedAt,
+      p_question_ids: null,
+    };
+
+    let body = JSON.stringify(payload);
+    let byteLen = measureUtf8ByteLength(body);
+
+    // Tahap 1: Jika payload mendekati batas aman keepalive, ringkaskan field non-kritis agar jawaban tetap terkirim.
+    if (byteLen > KEEPALIVE_SAFE_MAX_BYTES && session.flaggedQuestions.length > 0) {
+      payload.p_flagged_questions = [];
+      wasCompacted = true;
+      body = JSON.stringify(payload);
+      byteLen = measureUtf8ByteLength(body);
+    }
+
+    // Tahap 2: Jika baris sesi sudah ada di cloud, ON CONFLICT DO UPDATE tidak menimpa nama/judul/mapel,
+    // sehingga metadata teks panjang aman dipangkas untuk memberi ruang ekstra bagi p_answers.
+    if (byteLen > KEEPALIVE_SAFE_MAX_BYTES && confirmedCloudSessionKeys.has(sessionKey)) {
+      payload.p_student_name = '';
+      payload.p_exam_title = '';
+      payload.p_subject = '';
+      wasCompacted = true;
+      body = JSON.stringify(payload);
+      byteLen = measureUtf8ByteLength(body);
+    }
+
+    const canUseKeepalive = byteLen <= KEEPALIVE_HARD_MAX_BYTES;
+    lastKeepaliveFlushMap.set(sessionKey, { fingerprint: stateFingerprint, ts: now });
 
     // Gunakan RPC upsert_exam_progress (POST + keepalive) agar aman RLS dan menangani baris yang belum dibuat
     void fetch(`${cleanUrl}/rest/v1/rpc/upsert_exam_progress`, {
       method: 'POST',
-      keepalive: true,
+      keepalive: canUseKeepalive,
       headers: {
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
-      body: JSON.stringify({
-        p_result_id: session.resultId,
-        p_participant_id: session.participant.id,
-        p_participant_number: normParticipantNum,
-        p_student_name: session.participant.fullName,
-        p_class_name: session.participant.className,
-        p_exam_id: session.schedule.id,
-        p_exam_title: session.schedule.title,
-        p_subject: session.schedule.subject,
-        p_answers: session.answers,
-        p_flagged_questions: session.flaggedQuestions,
-        p_total_questions: session.questions.length,
-        p_tab_switch_count: session.tabSwitchCount,
-        p_started_at: session.startedAt,
-        p_question_ids: questionIds.length > 0 ? questionIds : null,
-      }),
+      body,
     }).catch(() => {
-      // Silent fail on network/unload
+      // Silent fail on network/unload; local backup + pending IDB record will auto-sync next online cycle
     });
+
+    return {
+      attempted: true,
+      skippedDuplicate: false,
+      usedKeepalive: canUseKeepalive,
+      compacted: wasCompacted,
+      byteLength: byteLen,
+    };
   } catch {
     // Ignore keepalive network issues on unload
+    return {
+      attempted: false,
+      skippedDuplicate: false,
+      usedKeepalive: false,
+      compacted: false,
+      byteLength: 0,
+    };
   }
 }
 
-export async function upsertExamProgress(
+interface ProgressWriteQueueState {
+  inFlight: boolean;
+  pendingSession: ActiveExamSession | null;
+  pendingIncludeQuestionIds: boolean;
+  waiters: Array<(res: ExamResult) => void>;
+}
+
+const progressWriteQueues = new Map<string, ProgressWriteQueueState>();
+
+async function executeUpsertExamProgressSingle(
   session: ActiveExamSession,
   options?: { includeQuestionIds?: boolean }
 ): Promise<ExamResult> {
   await ensureInitialized();
+  const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
+  const sessionKey = makeSessionSyncKey(normParticipantNum, session.schedule.id);
+
+  // Guard: jangan pernah menimpa hasil lokal yang sedang atau sudah difinalisasi (submitted/flagged)
+  const existingLocal = await idbGet<ExamResult>(STORES.RESULTS, session.resultId);
+  if (isExamResultFinalized(existingLocal)) {
+    clearActiveSessionLocal();
+    return existingLocal!;
+  }
+  if (finalizingSessionKeys.has(sessionKey)) {
+    return (
+      existingLocal || {
+        id: session.resultId,
+        participantId: session.participant.id,
+        participantNumber: normParticipantNum,
+        studentName: session.participant.fullName,
+        className: session.participant.className,
+        examId: session.schedule.id,
+        examTitle: session.schedule.title,
+        subject: session.schedule.subject,
+        answers: { ...session.answers },
+        flaggedQuestions: [...session.flaggedQuestions],
+        questionIds: session.questions.map((q) => q.id),
+        correctCount: 0,
+        totalQuestions: session.questions.length,
+        score: 0,
+        tabSwitchCount: session.tabSwitchCount,
+        status: 'in_progress',
+        startedAt: session.startedAt,
+        submittedAt: null,
+        syncStatus: 'pending',
+      }
+    );
+  }
+
   const isLocked = session.tabSwitchCount >= session.schedule.maxTabSwitches;
   if (!isLocked) {
     saveActiveSessionLocal(session);
   }
 
-  // Guard: jangan pernah menimpa hasil lokal yang sudah submitted/flagged
-  const existingLocal = await idbGet<ExamResult>(STORES.RESULTS, session.resultId);
-  if (
-    existingLocal &&
-    (existingLocal.status === 'submitted' ||
-      (existingLocal.status === 'flagged' && existingLocal.submittedAt !== null))
-  ) {
-    clearActiveSessionLocal();
-    return existingLocal;
-  }
-
   const questionIds = session.questions.map((q) => q.id);
-  const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
 
   const progressRecord: ExamResult = {
     id: session.resultId,
@@ -4300,15 +6328,15 @@ export async function upsertExamProgress(
     examId: session.schedule.id,
     examTitle: session.schedule.title,
     subject: session.schedule.subject,
-    answers: session.answers,
-    flaggedQuestions: session.flaggedQuestions,
+    answers: { ...session.answers },
+    flaggedQuestions: [...session.flaggedQuestions],
     questionIds,
     correctCount: 0,
     totalQuestions: session.questions.length,
     score: 0,
-    tabSwitchCount: session.tabSwitchCount,
+    tabSwitchCount: Math.max(existingLocal?.tabSwitchCount || 0, session.tabSwitchCount),
     status: isLocked ? 'flagged' : 'in_progress',
-    startedAt: session.startedAt,
+    startedAt: existingLocal?.startedAt || session.startedAt,
     submittedAt: null,
     syncStatus: 'pending',
   };
@@ -4319,20 +6347,143 @@ export async function upsertExamProgress(
     const pushRes = await pushResultToSupabase(progressRecord, {
       includeQuestionIds: options?.includeQuestionIds,
     });
+    // Periksa ulang kondisi lokal setelah network selesai agar autosave in-flight yang terlambat
+    // TIDAK pernah menimpa snapshot final `submitted` atau jawaban yang lebih baru.
+    const latestLocalAfterPush = await idbGet<ExamResult>(STORES.RESULTS, session.resultId);
+    if (finalizingSessionKeys.has(sessionKey) || isExamResultFinalized(latestLocalAfterPush)) {
+      if (latestLocalAfterPush) {
+        return latestLocalAfterPush;
+      }
+    }
     if (pushRes.finalizedFromServer) {
-      await idbPut(STORES.RESULTS, pushRes.finalizedFromServer);
+      confirmedCloudSessionKeys.add(sessionKey);
+      const serverFinal = pushRes.finalizedFromServer;
+      const mergedAnswers: Record<string, string> = {
+        ...(serverFinal.answers || {}),
+        ...(progressRecord.answers || {}),
+      };
+      // Jika server sudah memfinalisasi (mis. auto_expired) saat siswa sempat offline,
+      // namun jawaban lokal lebih lengkap, coba rekonsiliasi aman satu kali ke server sebelum mengunci hasil.
+      if (
+        serverFinal.status === 'submitted' &&
+        Object.keys(mergedAnswers).length > Object.keys(serverFinal.answers || {}).length
+      ) {
+        const reconciled = await finalizeExamResultRecord(
+          {
+            ...serverFinal,
+            answers: mergedAnswers,
+            tabSwitchCount: Math.max(
+              serverFinal.tabSwitchCount || 0,
+              progressRecord.tabSwitchCount || 0
+            ),
+            syncStatus: 'pending',
+          },
+          {
+            maxTabSwitches: session.schedule.maxTabSwitches,
+            skipIfFinalized: false,
+            broadcast: true,
+          }
+        );
+        clearActiveSessionLocal();
+        return reconciled;
+      }
+      await idbPut(STORES.RESULTS, serverFinal);
       clearActiveSessionLocal();
       broadcastDataChange('results');
-      return pushRes.finalizedFromServer;
+      return serverFinal;
     }
     if (pushRes.ok) {
-      progressRecord.syncStatus = 'synced';
-      await idbPut(STORES.RESULTS, progressRecord);
+      confirmedCloudSessionKeys.add(sessionKey);
+      lastCloudProgressConfirmedAt.set(sessionKey, Date.now());
+      const localUnchanged =
+        !latestLocalAfterPush ||
+        buildResultFingerprint(latestLocalAfterPush) === buildResultFingerprint(progressRecord);
+      if (localUnchanged) {
+        progressRecord.syncStatus = 'synced';
+        await idbPut(STORES.RESULTS, progressRecord);
+      } else if (latestLocalAfterPush) {
+        return latestLocalAfterPush;
+      }
     }
   }
 
   broadcastDataChange('results');
   return progressRecord;
+}
+
+/**
+ * Serialized & coalesced progress writer per (participantNumber, examId).
+ * Mencegah request jaringan yang datang tidak berurutan (out-of-order) menimpa jawaban siswa terbaru.
+ */
+export async function upsertExamProgress(
+  session: ActiveExamSession,
+  options?: { includeQuestionIds?: boolean }
+): Promise<ExamResult> {
+  const sessionKey = makeSessionSyncKey(
+    session.participant.participantNumber,
+    session.schedule.id
+  );
+  const snapshot: ActiveExamSession = {
+    ...session,
+    answers: { ...session.answers },
+    flaggedQuestions: [...session.flaggedQuestions],
+  };
+
+  let queue = progressWriteQueues.get(sessionKey);
+  if (!queue) {
+    queue = {
+      inFlight: false,
+      pendingSession: null,
+      pendingIncludeQuestionIds: false,
+      waiters: [],
+    };
+    progressWriteQueues.set(sessionKey, queue);
+  }
+
+  if (queue.inFlight) {
+    queue.pendingSession = snapshot;
+    queue.pendingIncludeQuestionIds =
+      queue.pendingIncludeQuestionIds || Boolean(options?.includeQuestionIds);
+    return new Promise<ExamResult>((resolve) => {
+      queue!.waiters.push(resolve);
+    });
+  }
+
+  queue.inFlight = true;
+  try {
+    let currentSession: ActiveExamSession | null = snapshot;
+    let currentIncludeQIds = Boolean(options?.includeQuestionIds);
+    let lastResult!: ExamResult;
+
+    while (currentSession) {
+      const batchWaiters = queue.waiters.splice(0, queue.waiters.length);
+      lastResult = await executeUpsertExamProgressSingle(currentSession, {
+        includeQuestionIds: currentIncludeQIds,
+      });
+
+      if (queue.pendingSession) {
+        currentSession = queue.pendingSession;
+        currentIncludeQIds = queue.pendingIncludeQuestionIds;
+        queue.pendingSession = null;
+        queue.pendingIncludeQuestionIds = false;
+        // Resolve waiters from the completed pass only when no newer pass replaces their result,
+        // or keep them to resolve with latest authoritative result.
+        queue.waiters.unshift(...batchWaiters);
+      } else {
+        for (const resolve of batchWaiters) {
+          resolve(lastResult);
+        }
+        currentSession = null;
+      }
+    }
+
+    return lastResult;
+  } finally {
+    queue.inFlight = false;
+    if (!queue.pendingSession && queue.waiters.length === 0) {
+      progressWriteQueues.delete(sessionKey);
+    }
+  }
 }
 
 function clearLocalSessionIfMatches(result: ExamResult): void {
@@ -4356,6 +6507,10 @@ async function finalizeExamResultRecord(
     skipIfFinalized?: boolean;
     keepInProgressIfUnscored?: boolean;
     broadcast?: boolean;
+    maxAttempts?: number;
+    deadlineMs?: number;
+    initialJitterMs?: number;
+    onProgress?: (statusText: string) => void;
   }
 ): Promise<ExamResult> {
   if (
@@ -4366,6 +6521,8 @@ async function finalizeExamResultRecord(
     return rawResult;
   }
 
+  const startedSubmitMs = Date.now();
+  const deadlineMs = options?.deadlineMs ?? 35_000;
   const nowIso = new Date(getServerNowMs()).toISOString();
   const normParticipantNum = rawResult.participantNumber.trim().toUpperCase();
   const answers = rawResult.answers || {};
@@ -4395,15 +6552,42 @@ async function finalizeExamResultRecord(
   let score = 0;
   let synced = false;
 
-  if (isLiveSupabaseConfigured()) {
-    const supabase = getSupabaseClient();
-    const retryBackoffs = [0, 600, 1800, 3500];
+  const isBrowserOffline =
+    typeof navigator !== 'undefined' && navigator.onLine === false;
 
-    for (let attempt = 0; attempt < retryBackoffs.length; attempt++) {
-      if (retryBackoffs[attempt] > 0) {
-        const jitter = Math.floor(Math.random() * 400);
-        await new Promise((r) => setTimeout(r, retryBackoffs[attempt] + jitter));
+  if (isLiveSupabaseConfigured() && !isBrowserOffline) {
+    const supabase = getSupabaseClient();
+    const allBackoffs = [0, 1100, 2500, 4500, 7000];
+    const maxAttempts = Math.max(1, Math.min(options?.maxAttempts ?? 5, allBackoffs.length));
+
+    if (options?.initialJitterMs && options.initialJitterMs > 0) {
+      await new Promise((r) => setTimeout(r, options.initialJitterMs));
+    }
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        break;
       }
+      if (attempt > 0 && Date.now() - startedSubmitMs >= deadlineMs) {
+        break;
+      }
+      if (allBackoffs[attempt] > 0) {
+        const jitter = Math.floor(Math.random() * 1100);
+        const remainingBudget = deadlineMs - (Date.now() - startedSubmitMs);
+        if (remainingBudget <= 1500) break;
+        const waitMs = Math.min(allBackoffs[attempt] + jitter, Math.max(200, remainingBudget - 1500));
+        options?.onProgress?.(
+          `Server sedang padat, mencoba ulang (${attempt + 1}/${maxAttempts})...`
+        );
+        await new Promise((r) => setTimeout(r, waitMs));
+      } else {
+        options?.onProgress?.(
+          maxAttempts > 1
+            ? `Mengirim & menilai jawaban di server (1/${maxAttempts})...`
+            : 'Mengirim ulang jawaban ke server...'
+        );
+      }
+
       try {
         let rpcResult = await supabase.rpc('submit_exam_and_score', {
           p_result_id: rawResult.id,
@@ -4422,8 +6606,8 @@ async function finalizeExamResultRecord(
           p_question_ids: questionIds && questionIds.length > 0 ? questionIds : null,
         });
 
-        // Graceful fallback ke signature 12 argumen jika SQL DB belum di-upgrade
-        if (rpcResult.error && rpcResult.error.message.toLowerCase().includes('function')) {
+        // Graceful fallback ke signature 12 argumen HANYA jika fungsi 14 argumen belum di-upgrade di SQL DB
+        if (rpcResult.error && isRpcSignatureMismatchError(rpcResult.error.message)) {
           rpcResult = await supabase.rpc('submit_exam_and_score', {
             p_result_id: rawResult.id,
             p_participant_id: rawResult.participantId,
@@ -4440,20 +6624,20 @@ async function finalizeExamResultRecord(
           });
         }
 
-        if (
-          !rpcResult.error &&
-          Array.isArray(rpcResult.data) &&
-          rpcResult.data[0] &&
-          Number(rpcResult.data[0].total_questions) > 0
-        ) {
-          correctCount = rpcResult.data[0].correct_count;
-          totalQuestions = rpcResult.data[0].total_questions;
-          score = Number(rpcResult.data[0].score);
-          synced = true;
+        if (!rpcResult.error && Array.isArray(rpcResult.data) && rpcResult.data[0]) {
+          const serverTotalQ = Number(rpcResult.data[0].total_questions);
+          if (serverTotalQ > 0) {
+            correctCount = rpcResult.data[0].correct_count;
+            totalQuestions = serverTotalQ;
+            score = Number(rpcResult.data[0].score);
+            synced = true;
+            break;
+          }
+          // Jika DB mengembalikan total_questions = 0, jangan ulangi 3x karena bukan gangguan sementara
           break;
         }
       } catch {
-        // Retry with backoff
+        // Retry with bounded backoff until deadlineMs
       }
     }
   }
@@ -4491,10 +6675,13 @@ async function finalizeExamResultRecord(
         totalQuestions > 0 ||
         Boolean(questionIds && questionIds.length > 0) ||
         Object.keys(answers).length > 0;
-      // Pada browser siswa/admin tanpa cache soal lengkap, jangan simpan score=0 permanen bila diminta keepInProgressIfUnscored
+      // Pada browser siswa/admin tanpa cache soal lengkap, tandai needsServerScoring agar segera dinilai
+      // ulang oleh antrean background (tanpa memblokir UI dengan request tambahan saat submit gagal).
       if (hasEvidenceOfExam && isLiveSupabaseConfigured()) {
         needsServerScoring = true;
-        if (options?.keepInProgressIfUnscored) {
+        const wasStillInProgress =
+          rawResult.status === 'in_progress' && rawResult.submittedAt === null;
+        if (options?.keepInProgressIfUnscored && wasStillInProgress) {
           const deferredRecord: ExamResult = {
             ...rawResult,
             participantNumber: normParticipantNum,
@@ -4511,24 +6698,6 @@ async function finalizeExamResultRecord(
           await idbPut(STORES.RESULTS, deferredRecord);
           return deferredRecord;
         }
-        try {
-          await pushResultToSupabase(
-            {
-              ...rawResult,
-              participantNumber: normParticipantNum,
-              subject: resolvedSubject,
-              answers,
-              flaggedQuestions,
-              questionIds,
-              totalQuestions: totalQuestions || questionIds?.length || 0,
-              status: 'in_progress',
-              submittedAt: null,
-            },
-            { includeQuestionIds: Boolean(questionIds && questionIds.length > 0) }
-          );
-        } catch {
-          // Best-effort snapshot
-        }
       }
     }
   }
@@ -4544,10 +6713,13 @@ async function finalizeExamResultRecord(
     totalQuestions,
     score,
     status: computedStatus,
-    submittedAt: nowIso,
+    submittedAt: rawResult.submittedAt || nowIso,
     syncStatus: synced ? 'synced' : 'pending',
     needsServerScoring: synced ? undefined : needsServerScoring || undefined,
   };
+  if (synced) {
+    confirmedCloudSessionKeys.add(makeSessionSyncKey(normParticipantNum, rawResult.examId));
+  }
 
   if (!synced && !needsServerScoring) {
     const pushRes = await pushResultToSupabase(finalResult);
@@ -4566,39 +6738,98 @@ async function finalizeExamResultRecord(
   return finalResult;
 }
 
-export async function submitFinalExam(session: ActiveExamSession): Promise<ExamResult> {
+export async function submitFinalExam(
+  session: ActiveExamSession,
+  options?: {
+    onProgress?: (statusText: string) => void;
+    skipInitialJitter?: boolean;
+  }
+): Promise<ExamResult> {
   await ensureInitialized();
 
-  const baseResult: ExamResult = {
-    id: session.resultId,
-    participantId: session.participant.id,
-    participantNumber: session.participant.participantNumber.trim().toUpperCase(),
-    studentName: session.participant.fullName,
-    className: session.participant.className,
-    examId: session.schedule.id,
-    examTitle: session.schedule.title,
-    subject: session.schedule.subject,
-    answers: session.answers,
-    flaggedQuestions: session.flaggedQuestions,
-    questionIds: session.questions.map((q) => q.id),
-    correctCount: 0,
-    totalQuestions: session.questions.length,
-    score: 0,
-    tabSwitchCount: session.tabSwitchCount,
-    status: 'in_progress',
-    startedAt: session.startedAt,
-    submittedAt: null,
-    syncStatus: 'pending',
-  };
+  const normParticipantNum = session.participant.participantNumber.trim().toUpperCase();
+  const sessionKey = makeSessionSyncKey(normParticipantNum, session.schedule.id);
 
-  const finalResult = await finalizeExamResultRecord(baseResult, {
-    maxTabSwitches: session.schedule.maxTabSwitches,
-    totalQuestionsFallback: session.questions.length,
-    broadcast: true,
-  });
+  // Deduplikasi submit paralel pada sesi yang sama agar tidak menembakkan RPC ganda
+  const existingSubmit = finalizingSessionPromises.get(sessionKey);
+  if (existingSubmit) {
+    return existingSubmit;
+  }
 
-  clearActiveSessionLocal();
-  return finalResult;
+  // Batalkan antrean penulisan autosave in_progress yang masih tertunda agar tidak menimpa jawaban final
+  const queuedProgress = progressWriteQueues.get(sessionKey);
+  if (queuedProgress) {
+    queuedProgress.pendingSession = null;
+    queuedProgress.pendingIncludeQuestionIds = false;
+  }
+
+  finalizingSessionKeys.add(sessionKey);
+
+  const submitPromise = (async () => {
+    try {
+      const questionIds = session.questions.map((q) => q.id);
+      const nowIso = new Date(getServerNowMs()).toISOString();
+      const existingLocal = await idbGet<ExamResult>(STORES.RESULTS, session.resultId);
+      const effectiveTabSwitches = Math.max(
+        existingLocal?.tabSwitchCount || 0,
+        session.tabSwitchCount
+      );
+      const computedStatus: ExamResult['status'] =
+        effectiveTabSwitches >= session.schedule.maxTabSwitches ? 'flagged' : 'submitted';
+
+      const baseResult: ExamResult = {
+        id: session.resultId,
+        participantId: session.participant.id,
+        participantNumber: normParticipantNum,
+        studentName: session.participant.fullName,
+        className: session.participant.className,
+        examId: session.schedule.id,
+        examTitle: session.schedule.title,
+        subject: session.schedule.subject,
+        answers: { ...session.answers },
+        flaggedQuestions: [...session.flaggedQuestions],
+        questionIds,
+        correctCount: 0,
+        totalQuestions: session.questions.length,
+        score: 0,
+        tabSwitchCount: effectiveTabSwitches,
+        status: computedStatus,
+        startedAt: existingLocal?.startedAt || session.startedAt,
+        submittedAt: nowIso,
+        syncStatus: 'pending',
+        needsServerScoring: isLiveSupabaseConfigured() ? true : undefined,
+      };
+
+      // Simpan snapshot final ke IndexedDB TERLEBIH DAHULU sebelum menyentuh jaringan
+      // agar jawaban akhir 100% aman meskipun browser ditutup/refresh di tengah pengiriman.
+      options?.onProgress?.('Menyimpan jawaban lokal...');
+      await idbPut(STORES.RESULTS, baseResult);
+
+      // Sebarkan klik "Akhiri Ujian" manual sedikit (150-850ms) agar gelombang ratusan siswa tidak menabrak 1 ms yang sama
+      const initialJitterMs = options?.skipInitialJitter
+        ? 0
+        : 150 + Math.floor(Math.random() * 700);
+
+      const finalResult = await finalizeExamResultRecord(baseResult, {
+        maxTabSwitches: session.schedule.maxTabSwitches,
+        totalQuestionsFallback: session.questions.length,
+        broadcast: true,
+        maxAttempts: 5,
+        deadlineMs: 35_000,
+        initialJitterMs,
+        onProgress: options?.onProgress,
+      });
+
+      clearActiveSessionLocal();
+      return finalResult;
+    } finally {
+      finalizingSessionKeys.delete(sessionKey);
+      finalizingSessionPromises.delete(sessionKey);
+    }
+  })();
+
+  finalizingSessionPromises.set(sessionKey, submitPromise);
+  return submitPromise;
 }
 
 export async function lockoutExamSession(session: ActiveExamSession): Promise<ExamResult> {
@@ -4627,47 +6858,57 @@ export async function forceFinishExamResults(
 
   const finalized: ExamResult[] = [];
   const finalizedIdSet = new Set<string>();
+  const serverEvaluatedIdSet = new Set<string>();
   const RPC_BATCH_SIZE = 50;
 
   if (isLiveSupabaseConfigured()) {
     const supabase = getSupabaseClient();
     const readClient = getSupabaseAdminClient() || supabase;
+    const authArgs = await resolveStaffRpcAuthArgs();
 
     for (let i = 0; i < targets.length; i += RPC_BATCH_SIZE) {
       const batchTargets = targets.slice(i, i + RPC_BATCH_SIZE);
       const batchIds = batchTargets.map((t) => t.id);
 
       try {
-        let { error: rpcErr } = await supabase.rpc('force_finish_exam_results', {
-          p_result_ids: batchIds,
-          p_limit: RPC_BATCH_SIZE,
-          ...getStaffRpcAuthArgs(),
-        });
-        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-          const legacy = await supabase.rpc('force_finish_exam_results', {
-            p_result_ids: batchIds,
-            p_limit: RPC_BATCH_SIZE,
-          });
-          rpcErr = legacy.error;
-        }
+        const { error: rpcErr } = await retryTransientSupabaseCall(
+          async () =>
+            await supabase.rpc('force_finish_exam_results', {
+              p_result_ids: batchIds,
+              p_limit: RPC_BATCH_SIZE,
+              ...authArgs,
+            }),
+          { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+        );
 
         if (!rpcErr) {
-          let { data: fetchedRows, error: fetchErr } = await readClient
-            .from('exam_results')
-            .select(EXAM_RESULTS_ADMIN_COLUMNS)
-            .in('id', batchIds);
+          let { data: fetchedRows, error: fetchErr } = await retryTransientSupabaseCall(
+            async () =>
+              await readClient
+                .from('exam_results')
+                .select(EXAM_RESULTS_ADMIN_COLUMNS)
+                .in('id', batchIds),
+            { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+          );
 
           if (fetchErr && fetchErr.message.includes('question_ids')) {
-            const legacyRes = await readClient
-              .from('exam_results')
-              .select(EXAM_RESULTS_ADMIN_COLUMNS_LEGACY)
-              .in('id', batchIds);
+            const legacyRes = await retryTransientSupabaseCall(
+              async () =>
+                await readClient
+                  .from('exam_results')
+                  .select(EXAM_RESULTS_ADMIN_COLUMNS_LEGACY)
+                  .in('id', batchIds),
+              { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+            );
             fetchedRows = legacyRes.data as typeof fetchedRows;
             fetchErr = legacyRes.error;
           }
 
           if (!fetchErr && Array.isArray(fetchedRows)) {
             const serverFinished: ExamResult[] = [];
+            for (const id of batchIds) {
+              serverEvaluatedIdSet.add(id);
+            }
             for (const row of fetchedRows as unknown as Record<string, unknown>[]) {
               const mapped = mapDbExamResultRow(row);
               if (
@@ -4691,7 +6932,9 @@ export async function forceFinishExamResults(
     }
   }
 
-  const remainingTargets = targets.filter((t) => !finalizedIdSet.has(t.id));
+  const remainingTargets = targets.filter(
+    (t) => !finalizedIdSet.has(t.id) && !serverEvaluatedIdSet.has(t.id)
+  );
   if (remainingTargets.length > 0) {
     const FALLBACK_CHUNK = 10;
     for (let i = 0; i < remainingTargets.length; i += FALLBACK_CHUNK) {
@@ -4702,11 +6945,16 @@ export async function forceFinishExamResults(
           return finalizeExamResultRecord(item, {
             maxTabSwitches: sched?.maxTabSwitches ?? 3,
             skipIfFinalized: true,
+            keepInProgressIfUnscored: true,
             broadcast: false,
           });
         })
       );
-      finalized.push(...chunkDone);
+      for (const done of chunkDone) {
+        if (done.status !== 'in_progress') {
+          finalized.push(done);
+        }
+      }
     }
   }
 
@@ -4727,9 +6975,8 @@ export async function autoFinalizeExpiredExams(options?: {
       await ensureInitialized();
       const savedSession = getSavedActiveSession();
       const targetParticipant =
-        options?.currentParticipantNumber?.trim().toUpperCase() ||
-        savedSession?.participant.participantNumber.trim().toUpperCase() ||
-        '';
+        normalizeParticipantNumber(options?.currentParticipantNumber) ||
+        normalizeParticipantNumber(savedSession?.participant.participantNumber);
 
       // Hanya panel Admin/Proktor yang boleh mem-finalisasi peserta lain secara massal.
       // Peramban siswa hanya mem-finalisasi sesi miliknya sendiri agar tidak menghitung skor 0 dari vault kosong.
@@ -4747,7 +6994,11 @@ export async function autoFinalizeExpiredExams(options?: {
 
       for (const res of allResults) {
         if (res.status !== 'in_progress') continue;
-        if (!options?.isAdmin && res.participantNumber.trim().toUpperCase() !== targetParticipant) {
+        const normResPart = normalizeParticipantNumber(res.participantNumber);
+        const resSessionKey = makeSessionSyncKey(normResPart, res.examId);
+        // Lewati sesi yang sedang dalam proses submit final aktif oleh ExamRoom
+        if (finalizingSessionKeys.has(resSessionKey)) continue;
+        if (!options?.isAdmin && normResPart !== targetParticipant) {
           continue;
         }
         const sched = findScheduleForExam(schedules, res.examId, res.subject);
@@ -4759,8 +7010,39 @@ export async function autoFinalizeExpiredExams(options?: {
         const graceMs = options?.isAdmin ? ADMIN_EXPIRY_GRACE_MS : EXPIRY_GRACE_MS;
         const durationMs = Math.max(1, sched.durationMinutes) * 60 * 1000;
         if (nowMs >= startedMs + durationMs + graceMs) {
+          // Pada perangkat siswa, gabungkan snapshot jawaban terbaru dari memori/active_session
+          // agar finalisasi otomatis tidak pernah mengunci data jawaban lama (stale) dari IndexedDB results.
+          let effectiveResult = res;
+          if (
+            !options?.isAdmin &&
+            savedSession &&
+            (savedSession.resultId === res.id ||
+              (normalizeParticipantNumber(savedSession.participant.participantNumber) === normResPart &&
+                savedSession.schedule.id === res.examId))
+          ) {
+            const savedAnsCount = Object.keys(savedSession.answers || {}).length;
+            const resAnsCount = Object.keys(res.answers || {}).length;
+            const freshestAnswers =
+              savedAnsCount > 0 || resAnsCount === 0
+                ? { ...(savedSession.answers || {}) }
+                : { ...(res.answers || {}) };
+            const sessionQIds =
+              savedSession.questions.length > 0
+                ? savedSession.questions.map((q) => q.id)
+                : undefined;
+            effectiveResult = {
+              ...res,
+              answers: freshestAnswers,
+              flaggedQuestions: [...savedSession.flaggedQuestions],
+              questionIds:
+                res.questionIds && res.questionIds.length > 0 ? res.questionIds : sessionQIds,
+              totalQuestions: Math.max(res.totalQuestions || 0, savedSession.questions.length || 0),
+              tabSwitchCount: Math.max(res.tabSwitchCount || 0, savedSession.tabSwitchCount || 0),
+            };
+          }
+
           expiredItems.push({
-            result: res,
+            result: effectiveResult,
             maxTabSwitches: sched.maxTabSwitches,
             durationMinutes: Math.max(1, sched.durationMinutes),
           });
@@ -4772,6 +7054,7 @@ export async function autoFinalizeExpiredExams(options?: {
       // Pada Portal Admin dengan Supabase Live, eksekusi penilaian batch bertahap (LIMIT 50) di server via RPC auto_finalize_expired_results
       if (options?.isAdmin && isLiveSupabaseConfigured()) {
         const supabase = getSupabaseClient();
+        const authArgs = await resolveStaffRpcAuthArgs();
         const examGroups = new Map<
           string,
           { cutoffIso: string; maxTabSwitches: number; items: Array<{ result: ExamResult; maxTabSwitches: number }> }
@@ -4800,51 +7083,19 @@ export async function autoFinalizeExpiredExams(options?: {
 
         for (const [examId, group] of examGroups.entries()) {
           try {
-            let signatureMode: 'with_staff' | 'four_args' | 'three_args' = 'with_staff';
             let groupFailed = false;
             for (let round = 0; round < MAX_ROUNDS; round++) {
-              const callRpc = async (mode: 'with_staff' | 'four_args' | 'three_args') => {
-                if (mode === 'with_staff') {
-                  return supabase.rpc('auto_finalize_expired_results', {
+              const rpcRes = await retryTransientSupabaseCall(
+                async () =>
+                  await supabase.rpc('auto_finalize_expired_results', {
                     p_exam_id: examId,
                     p_cutoff: group.cutoffIso,
                     p_max_tab_switches: group.maxTabSwitches,
                     p_limit: RPC_LIMIT,
-                    ...getStaffRpcAuthArgs(),
-                  });
-                }
-                if (mode === 'four_args') {
-                  return supabase.rpc('auto_finalize_expired_results', {
-                    p_exam_id: examId,
-                    p_cutoff: group.cutoffIso,
-                    p_max_tab_switches: group.maxTabSwitches,
-                    p_limit: RPC_LIMIT,
-                  });
-                }
-                return supabase.rpc('auto_finalize_expired_results', {
-                  p_exam_id: examId,
-                  p_cutoff: group.cutoffIso,
-                  p_max_tab_switches: group.maxTabSwitches,
-                });
-              };
-
-              let rpcRes = await callRpc(signatureMode);
-              if (
-                signatureMode === 'with_staff' &&
-                rpcRes.error &&
-                isRpcSignatureMismatchError(rpcRes.error.message)
-              ) {
-                signatureMode = 'four_args';
-                rpcRes = await callRpc(signatureMode);
-              }
-              if (
-                signatureMode === 'four_args' &&
-                rpcRes.error &&
-                isRpcSignatureMismatchError(rpcRes.error.message)
-              ) {
-                signatureMode = 'three_args';
-                rpcRes = await callRpc(signatureMode);
-              }
+                    ...authArgs,
+                  }),
+                { backoffsMs: [0, 300, 750, 1500, 2600], jitterMs: 400 }
+              );
 
               if (rpcRes.error) {
                 groupFailed = true;
@@ -4854,7 +7105,7 @@ export async function autoFinalizeExpiredExams(options?: {
               rpcAnySuccess = true;
               const batchCount = Number(rpcRes.data || 0);
               serverRpcFinalizedTotal += batchCount;
-              if (signatureMode === 'three_args' || batchCount < RPC_LIMIT) {
+              if (batchCount < RPC_LIMIT) {
                 break;
               }
             }
@@ -4868,6 +7119,7 @@ export async function autoFinalizeExpiredExams(options?: {
 
         if (rpcAnySuccess && serverRpcFinalizedTotal > 0) {
           const readClient = getSupabaseAdminClient() || supabase;
+          let syncedViaDelta = false;
           if (lastAdminResultsDeltaIso) {
             const deltaRes = await fetchExamResultsDelta(readClient, lastAdminResultsDeltaIso);
             if (!deltaRes.error && deltaRes.data.length > 0) {
@@ -4875,6 +7127,49 @@ export async function autoFinalizeExpiredExams(options?: {
               await mergeResultsStoreDelta(
                 deltaRes.data.map((r) => mapDbExamResultRow(r))
               );
+              syncedViaDelta = true;
+            }
+          }
+          // Cold-start guard: bila kursor delta belum terinisialisasi (atau delta kosong akibat selisih jam),
+          // tarik langsung baris yang baru difinalisasi berdasarkan ID agar Dashboard Admin langsung terbarui.
+          if (!syncedViaDelta) {
+            const expiredIds = Array.from(new Set(expiredItems.map((e) => e.result.id)));
+            const FETCH_CHUNK = 100;
+            const fetchedMapped: ExamResult[] = [];
+            for (let i = 0; i < expiredIds.length; i += FETCH_CHUNK) {
+              const chunkIds = expiredIds.slice(i, i + FETCH_CHUNK);
+              try {
+                let { data: rows, error: fErr } = await retryTransientSupabaseCall(
+                  async () =>
+                    await readClient
+                      .from('exam_results')
+                      .select(EXAM_RESULTS_ADMIN_COLUMNS)
+                      .in('id', chunkIds),
+                  { backoffsMs: [0, 350, 900], jitterMs: 400 }
+                );
+                if (fErr && fErr.message.includes('question_ids')) {
+                  const leg = await retryTransientSupabaseCall(
+                    async () =>
+                      await readClient
+                        .from('exam_results')
+                        .select(EXAM_RESULTS_ADMIN_COLUMNS_LEGACY)
+                        .in('id', chunkIds),
+                    { backoffsMs: [0, 350, 900], jitterMs: 400 }
+                  );
+                  rows = leg.data as typeof rows;
+                  fErr = leg.error;
+                }
+                if (!fErr && Array.isArray(rows)) {
+                  for (const row of rows as unknown as Record<string, unknown>[]) {
+                    fetchedMapped.push(mapDbExamResultRow(row));
+                  }
+                }
+              } catch {
+                // Keep merging other chunks
+              }
+            }
+            if (fetchedMapped.length > 0) {
+              await mergeResultsStoreDelta(fetchedMapped);
             }
           }
         }
@@ -4935,67 +7230,225 @@ export async function autoFinalizeExpiredExams(options?: {
 }
 
 let flushPendingInFlight: Promise<number> | null = null;
+const TAB_INSTANCE_ID = `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 function shouldRetryServerScoring(item: ExamResult): boolean {
   return Boolean(
     item.needsServerScoring ||
-      ((item.status === 'submitted' ||
-        (item.status === 'flagged' && item.submittedAt !== null)) &&
-        item.score === 0 &&
-        item.correctCount === 0)
+      item.status === 'submitted' ||
+      (item.status === 'flagged' && item.submittedAt !== null)
   );
+}
+
+/**
+ * Mengoordinasikan antrean sync lintas-tab di browser yang sama (Web Locks API + fallback lease localStorage)
+ * agar ketika banyak tab terbuka lalu koneksi offline -> online bersamaan, hanya 1 tab yang melakukan flush
+ * tanpa request ganda atau race condition pada IndexedDB.
+ */
+async function runWithCrossTabLock<T>(
+  lockName: string,
+  storageKey: string,
+  leaseMs: number,
+  work: () => Promise<T>,
+  skippedValue: T
+): Promise<T> {
+  const navLocks =
+    typeof navigator !== 'undefined'
+      ? (
+          navigator as Navigator & {
+            locks?: {
+              request: <R>(
+                name: string,
+                options: { ifAvailable?: boolean },
+                callback: (lock: unknown | null) => Promise<R>
+              ) => Promise<R>;
+            };
+          }
+        ).locks
+      : undefined;
+
+  if (navLocks && typeof navLocks.request === 'function') {
+    try {
+      return await navLocks.request(lockName, { ifAvailable: true }, async (lock) => {
+        if (!lock) return skippedValue;
+        return work();
+      });
+    } catch {
+      // Fallback to localStorage lease below
+    }
+  }
+
+  let acquiredLease = false;
+  const now = Date.now();
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { owner?: string; expiresAt?: number };
+      if (parsed.owner && parsed.owner !== TAB_INSTANCE_ID && (parsed.expiresAt || 0) > now) {
+        return skippedValue;
+      }
+    }
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify({ owner: TAB_INSTANCE_ID, expiresAt: now + leaseMs })
+    );
+    acquiredLease = true;
+  } catch {
+    // Proceed without cross-tab lock if localStorage is blocked
+  }
+
+  try {
+    return await work();
+  } finally {
+    if (acquiredLease) {
+      try {
+        const raw = localStorage.getItem(storageKey);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { owner?: string };
+          if (parsed.owner === TAB_INSTANCE_ID) {
+            localStorage.removeItem(storageKey);
+          }
+        }
+      } catch {
+        // Ignore storage release errors
+      }
+    }
+  }
 }
 
 export async function flushPendingSyncQueue(): Promise<number> {
   if (!isLiveSupabaseConfigured()) return 0;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return 0;
   if (flushPendingInFlight) return flushPendingInFlight;
 
-  flushPendingInFlight = (async () => {
-    try {
+  flushPendingInFlight = runWithCrossTabLock(
+    'nusantara_cbt_flush_pending_queue',
+    FLUSH_QUEUE_LOCK_KEY,
+    30_000,
+    async () => {
       const results = await idbGetAll<ExamResult>(STORES.RESULTS);
       const pending = results.filter((r) => r.syncStatus === 'pending');
       if (pending.length === 0) return 0;
 
+      const activeSaved = getSavedActiveSession();
       let syncedCount = 0;
-      const CHUNK = 8;
+      let consecutiveFailures = 0;
+      const MAX_CONSECUTIVE_FAILURES = 3;
+      const CHUNK = 4;
 
       for (let i = 0; i < pending.length; i += CHUNK) {
+        if (
+          consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ||
+          (typeof navigator !== 'undefined' && navigator.onLine === false)
+        ) {
+          break;
+        }
+        if (i > 0) {
+          // Jeda ringan antar batch agar pemulihan koneksi massal tidak memicu lonjakan timeout/503
+          await new Promise((r) => setTimeout(r, 150 + Math.floor(Math.random() * 200)));
+        }
         const chunk = pending.slice(i, i + CHUNK);
-        await Promise.all(
-          chunk.map(async (item) => {
+        const chunkOutcomes = await Promise.all(
+          chunk.map(async (rawItem): Promise<'synced' | 'skipped' | 'failed'> => {
+            const normPartNum = rawItem.participantNumber.trim().toUpperCase();
+            const itemSessionKey = makeSessionSyncKey(normPartNum, rawItem.examId);
+            if (finalizingSessionKeys.has(itemSessionKey)) {
+              return 'skipped';
+            }
+
+            // Jika item `in_progress` cocok dengan sesi aktif, gabungkan jawaban terbaru dari activeSession/backup
+            // agar flush tidak pernah menimpa server dengan jawaban lama.
+            let item = rawItem;
+            if (
+              !isExamResultFinalized(rawItem) &&
+              activeSaved &&
+              (activeSaved.resultId === rawItem.id ||
+                (activeSaved.participant.participantNumber.trim().toUpperCase() === normPartNum &&
+                  activeSaved.schedule.id === rawItem.examId))
+            ) {
+              const activeAnsCount = Object.keys(activeSaved.answers || {}).length;
+              const rawAnsCount = Object.keys(rawItem.answers || {}).length;
+              if (activeAnsCount >= rawAnsCount && activeAnsCount > 0) {
+                item = {
+                  ...rawItem,
+                  answers: { ...activeSaved.answers },
+                  flaggedQuestions: [...activeSaved.flaggedQuestions],
+                  tabSwitchCount: Math.max(
+                    rawItem.tabSwitchCount || 0,
+                    activeSaved.tabSwitchCount || 0
+                  ),
+                };
+              }
+            }
+
+            const itemFingerprintBefore = buildResultFingerprint(rawItem);
+
             if (shouldRetryServerScoring(item)) {
               const finalized = await finalizeExamResultRecord(item, {
                 skipIfFinalized: false,
-                keepInProgressIfUnscored: true,
+                keepInProgressIfUnscored:
+                  item.status === 'in_progress' && item.submittedAt === null,
                 broadcast: false,
+                maxAttempts: 1,
+                deadlineMs: 12_000,
               });
               if (finalized.syncStatus === 'synced') {
                 syncedCount += 1;
+                return 'synced';
               }
-              return;
+              return 'failed';
             }
 
             const pushRes = await pushResultToSupabase(item);
+            if (finalizingSessionKeys.has(itemSessionKey)) {
+              return 'skipped';
+            }
+            const latestLocal = await idbGet<ExamResult>(STORES.RESULTS, item.id);
             if (pushRes.finalizedFromServer) {
               await idbPut(STORES.RESULTS, pushRes.finalizedFromServer);
               syncedCount += 1;
-            } else if (pushRes.ok) {
-              item.syncStatus = 'synced';
-              await idbPut(STORES.RESULTS, item);
-              syncedCount += 1;
+              return 'synced';
             }
+            if (pushRes.ok) {
+              // Hanya tandai synced bila record lokal belum diperbarui dengan jawaban/status baru selama flush berjalan,
+              // serta izinkan item yang memang sudah finalized (`submitted`/`flagged`) ditandai synced.
+              const itemWasFinalized = isExamResultFinalized(item);
+              const latestIsFinalized = isExamResultFinalized(latestLocal);
+              const statusCompatible = itemWasFinalized || !latestIsFinalized;
+              const stillMatches =
+                !latestLocal ||
+                (statusCompatible &&
+                  (buildResultFingerprint(latestLocal) === itemFingerprintBefore ||
+                    buildResultFingerprint(latestLocal) === buildResultFingerprint(item)));
+              if (stillMatches) {
+                item.syncStatus = 'synced';
+                await idbPut(STORES.RESULTS, item);
+                syncedCount += 1;
+              }
+              return 'synced';
+            }
+            return 'failed';
           })
         );
+
+        for (const outcome of chunkOutcomes) {
+          if (outcome === 'failed') {
+            consecutiveFailures += 1;
+          } else if (outcome === 'synced') {
+            consecutiveFailures = 0;
+          }
+        }
       }
 
       if (syncedCount > 0) {
         broadcastDataChange('sync_flushed');
       }
       return syncedCount;
-    } finally {
-      flushPendingInFlight = null;
-    }
-  })();
+    },
+    0
+  ).finally(() => {
+    flushPendingInFlight = null;
+  });
 
   return flushPendingInFlight;
 }
@@ -5221,7 +7674,7 @@ export async function getSyncDiagnostics(): Promise<{
               }
               return;
             }
-            const meta = await fetchQuestionsCloudMeta(supabase);
+            const meta = await fetchQuestionsCloudMeta(supabase, false);
             if (meta) {
               entry.cloudCount = meta.totalCount;
               entry.note = 'Diproteksi RLS (terhitung via RPC staf)';
@@ -5242,15 +7695,8 @@ export async function getSyncDiagnostics(): Promise<{
               if (error) entry.note = error.message;
               else entry.cloudCount = count ?? 0;
             } else {
-              let { data, error } = await supabase.rpc('staff_list_accounts', getStaffRpcAuthArgs());
-              if (error && isRpcSignatureMismatchError(error.message)) {
-                const legacy = await supabase
-                  .from('staff_accounts')
-                  .select('id', { count: 'exact', head: true });
-                if (legacy.error) entry.note = legacy.error.message;
-                else entry.cloudCount = legacy.count ?? 0;
-                return;
-              }
+              const authArgs = await resolveStaffRpcAuthArgs();
+              const { data, error } = await supabase.rpc('staff_list_accounts', authArgs);
               if (error) {
                 entry.note = 'Diproteksi RLS (login Admin atau isi Service Role Key)';
               } else if (Array.isArray(data)) {
@@ -5258,6 +7704,20 @@ export async function getSyncDiagnostics(): Promise<{
               }
             }
             return;
+          }
+
+          if (entry.table === 'participants' && !adminClient) {
+            const authArgs = await resolveStaffRpcAuthArgs();
+            const { data, error } = await supabase.rpc('staff_list_participants', authArgs);
+            if (!error && Array.isArray(data)) {
+              entry.cloudCount = data.length;
+              entry.note = 'Diproteksi RLS (terhitung via RPC staf)';
+              return;
+            }
+            if (error && !isRpcSignatureMismatchError(error.message)) {
+              entry.note = 'Diproteksi RLS (login Admin atau isi Service Role Key)';
+              return;
+            }
           }
 
           const readClient = adminClient || supabase;
@@ -5320,24 +7780,36 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
       if (adminClient) {
         return fetchAllRowsByIdPaginated(adminClient, 'staff_accounts');
       }
-      const rpcRes = await supabase.rpc('staff_list_accounts', getStaffRpcAuthArgs());
+      const authArgs = await resolveStaffRpcAuthArgs();
+      const rpcRes = await supabase.rpc('staff_list_accounts', authArgs);
+      if (!rpcRes.error && Array.isArray(rpcRes.data)) {
+        return { data: rpcRes.data as Record<string, unknown>[] };
+      }
+      return { data: [], error: rpcRes.error?.message };
+    };
+
+    const fetchParticipantsDetailed = async (): Promise<{
+      data: Record<string, unknown>[];
+      error?: string;
+    }> => {
+      if (adminClient) {
+        return fetchAllRowsByIdPaginated(adminClient, 'participants');
+      }
+      const authArgs = await resolveStaffRpcAuthArgs();
+      const rpcRes = await supabase.rpc('staff_list_participants', authArgs);
       if (!rpcRes.error && Array.isArray(rpcRes.data)) {
         return { data: rpcRes.data as Record<string, unknown>[] };
       }
       if (rpcRes.error && isRpcSignatureMismatchError(rpcRes.error.message)) {
-        return fetchAllRowsByIdPaginated(supabase, 'staff_accounts');
+        return fetchAllRowsByIdPaginated(readClient, 'participants');
       }
       return { data: [], error: rpcRes.error?.message };
     };
 
     const [profRes, schedRes, partRes, resRes, staffRes] = await Promise.all([
-      readClient
-        .from('school_profile')
-        .select(adminClient ? ADMIN_SCHOOL_PROFILE_COLUMNS : PUBLIC_SCHOOL_PROFILE_COLUMNS)
-        .eq('id', 'default')
-        .maybeSingle(),
+      fetchSchoolProfileRow(readClient, Boolean(adminClient)),
       fetchAllRowsByIdPaginated(readClient, 'exam_schedules'),
-      fetchAllRowsByIdPaginated(readClient, 'participants'),
+      fetchParticipantsDetailed(),
       fetchAllRowsByIdPaginated(readClient, 'exam_results', EXAM_RESULTS_ADMIN_COLUMNS, 100_000),
       fetchStaffDetailed(),
     ]);
@@ -5347,8 +7819,16 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
     if (profRes.error) {
       errors.push(`school_profile: ${profRes.error.message}`);
     } else if (profRes.data) {
-      const existingProf = await idbGet<SchoolProfile>(STORES.META, 'default');
-      const profRow = profRes.data as unknown as Record<string, unknown>;
+      const existingProfile = await idbGet<SchoolProfile>(STORES.META, 'default');
+      const profRow = profRes.data;
+      const cloudAdminPwd =
+        typeof profRow.admin_password === 'string' && profRow.admin_password.trim()
+          ? profRow.admin_password.trim()
+          : '';
+      const verifiedActiveAdminPwd =
+        activeStaffCredentials?.userId.toLowerCase() === 'admin'
+          ? activeStaffCredentials.passwordHash
+          : '';
       await idbPut(STORES.META, {
         id: 'default',
         schoolName: String(profRow.school_name || ''),
@@ -5358,10 +7838,8 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
         committeeChairName: String(profRow.committee_chair_name || ''),
         examTitle: String(profRow.exam_title || ''),
         logoDataUrl: String(profRow.logo_data_url || '') || SEED_SCHOOL_PROFILE.logoDataUrl,
-        adminPassword:
-          (typeof profRow.admin_password === 'string' && profRow.admin_password) ||
-          existingProf?.adminPassword ||
-          'admin123',
+        kemenagLogoDataUrl: resolveCloudKemenagLogo(profRow, existingProfile),
+        adminPassword: cloudAdminPwd || verifiedActiveAdminPwd || '__CLOUD_MANAGED__',
         updatedAt: String(profRow.updated_at || timestamp),
       } satisfies SchoolProfile);
       details.school_profile = 1;
@@ -5398,12 +7876,12 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
         await idbPutParticipantsSafe(
           partRes.data.map((r) => ({
             id: String(r.id),
-            participantNumber: String(r.participant_number || '').trim().toUpperCase(),
-            token: r.token || 'CBT2026',
-            fullName: r.full_name,
-            className: r.class_name,
-            isActive: r.is_active,
-            createdAt: r.created_at,
+            participantNumber: normalizeParticipantNumber(String(r.participant_number || '')),
+            token: String(r.token || 'CBT2026'),
+            fullName: String(r.full_name || ''),
+            className: String(r.class_name || ''),
+            isActive: Boolean(r.is_active ?? true),
+            createdAt: String(r.created_at || ''),
           })),
           true
         );
@@ -5433,18 +7911,21 @@ export async function pullAllFromSupabaseDetailed(): Promise<SyncOperationReport
       details.staff_accounts = staffRes.data.length;
       if (staffRes.data.length > 0) {
         const existingStaff = await idbGetAll<StaffAccount>(STORES.STAFF_ACCOUNTS);
-        const existingByUser = new Map(
-          existingStaff.map((e) => [e.userId.trim().toLowerCase(), e])
-        );
+        const activeUserLower = activeStaffCredentials?.userId.trim().toLowerCase() || '';
         const mappedStaff: StaffAccount[] = staffRes.data.map((s) => {
           const userId = String(s.user_id || '');
-          const localPrev = existingByUser.get(userId.trim().toLowerCase());
-          const rawPwd = typeof s.password_hash === 'string' ? s.password_hash : '';
+          const normUser = userId.trim().toLowerCase();
+          const rawPwd = typeof s.password_hash === 'string' ? s.password_hash.trim() : '';
+          const resolvedPwd =
+            rawPwd ||
+            (normUser && normUser === activeUserLower && activeStaffCredentials?.passwordHash
+              ? activeStaffCredentials.passwordHash
+              : '__CLOUD_MANAGED__');
           return {
             id: String(s.id),
             userId,
             name: String(s.name || ''),
-            password: rawPwd || localPrev?.password || '__CLOUD_MANAGED__',
+            password: resolvedPwd,
             roleType: s.role_type as StaffAccount['roleType'],
             roleLabel: String(s.role_label || 'Staff'),
             allowedTabs: Array.isArray(s.allowed_tabs)
@@ -5536,6 +8017,7 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
   await ensureInitialized();
   const supabase = getSupabaseClient();
   const adminClient = getSupabaseAdminClient();
+  const staffAuthArgs = adminClient ? null : await resolveStaffRpcAuthArgs();
   const errors: string[] = [];
   const details: Record<string, number> = {
     school_profile: 0,
@@ -5569,17 +8051,18 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
           committee_chair_name: profile.committeeChairName,
           exam_title: profile.examTitle,
           logo_data_url: profile.logoDataUrl,
+          kemenag_logo_data_url: profile.kemenagLogoDataUrl || '',
           updated_at: profile.updatedAt || timestamp,
         };
         if (hashedAdminPwd) {
           row.admin_password = hashedAdminPwd;
         }
-        const { error } = await adminClient.from('school_profile').upsert(row);
+        const { error } = await upsertSchoolProfileRowDirect(adminClient, row);
         if (error) errors.push(`school_profile: ${error.message}`);
         else details.school_profile = 1;
       } else {
-        const { error: rpcErr } = await supabase.rpc('staff_upsert_school_profile', {
-          ...getStaffRpcAuthArgs(),
+        const { error: rpcErr } = await callStaffUpsertSchoolProfileRpc(supabase, {
+          ...(staffAuthArgs || {}),
           p_school_name: profile.schoolName,
           p_address: profile.address,
           p_academic_year: profile.academicYear,
@@ -5587,26 +8070,12 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
           p_committee_chair_name: profile.committeeChairName,
           p_exam_title: profile.examTitle,
           p_logo_data_url: profile.logoDataUrl,
+          p_kemenag_logo_data_url: profile.kemenagLogoDataUrl ?? '',
           p_admin_password_hash: hashedAdminPwd,
           p_updated_at: profile.updatedAt || timestamp,
         });
         if (!rpcErr) {
           details.school_profile = 1;
-        } else if (isRpcSignatureMismatchError(rpcErr.message)) {
-          const { error } = await supabase.from('school_profile').upsert({
-            id: 'default',
-            school_name: profile.schoolName,
-            address: profile.address,
-            academic_year: profile.academicYear,
-            principal_name: profile.principalName,
-            committee_chair_name: profile.committeeChairName,
-            exam_title: profile.examTitle,
-            logo_data_url: profile.logoDataUrl,
-            admin_password: hashedAdminPwd || (await hashPassword('admin123')),
-            updated_at: profile.updatedAt || timestamp,
-          });
-          if (error) errors.push(`school_profile: ${error.message}`);
-          else details.school_profile = 1;
         } else {
           errors.push(`school_profile: ${rpcErr.message}`);
         }
@@ -5614,21 +8083,35 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
     }
 
     if (schedules.length > 0) {
-      const { error } = await supabase.from('exam_schedules').upsert(
-        schedules.map((s) => ({
-          id: s.id,
-          title: s.title,
-          subject: s.subject,
-          kkm: s.kkm,
-          duration_minutes: s.durationMinutes,
-          target_classes: s.targetClasses,
-          is_active: s.isActive,
-          randomize_questions: Boolean(s.randomizeQuestions ?? false),
-          max_tab_switches: s.maxTabSwitches,
-          created_at: s.createdAt,
-        }))
-      );
-      if (error) errors.push(`exam_schedules: ${error.message}`);
+      const schedRows = schedules.map((s) => ({
+        id: s.id,
+        title: s.title,
+        subject: s.subject,
+        kkm: s.kkm,
+        duration_minutes: s.durationMinutes,
+        target_classes: s.targetClasses,
+        is_active: s.isActive,
+        randomize_questions: Boolean(s.randomizeQuestions ?? false),
+        max_tab_switches: s.maxTabSwitches,
+        created_at: s.createdAt,
+      }));
+      let schedErr: string | undefined;
+      if (adminClient) {
+        const { error } = await adminClient.from('exam_schedules').upsert(schedRows);
+        schedErr = error?.message;
+      } else {
+        const { error: rpcErr } = await supabase.rpc('staff_upsert_exam_schedules_batch', {
+          ...(staffAuthArgs || {}),
+          p_schedules: schedRows,
+        });
+        if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
+          const { error } = await supabase.from('exam_schedules').upsert(schedRows);
+          schedErr = error?.message;
+        } else {
+          schedErr = rpcErr?.message;
+        }
+      }
+      if (schedErr) errors.push(`exam_schedules: ${schedErr}`);
       else details.exam_schedules = schedules.length;
     }
 
@@ -5637,20 +8120,37 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
       let pushedParts = 0;
       for (let i = 0; i < participants.length; i += CHUNK) {
         const chunk = participants.slice(i, i + CHUNK);
-        const { error } = await supabase.from('participants').upsert(
-          chunk.map((p) => ({
-            id: p.id,
-            participant_number: p.participantNumber.trim().toUpperCase(),
-            token: p.token,
-            full_name: p.fullName,
-            class_name: p.className,
-            is_active: p.isActive,
-            created_at: p.createdAt,
-          })),
-          { onConflict: 'participant_number' }
-        );
-        if (error) {
-          errors.push(`participants (batch ${i / CHUNK + 1}): ${error.message}`);
+        const partRows = chunk.map((p) => ({
+          id: p.id,
+          participant_number: normalizeParticipantNumber(p.participantNumber),
+          token: p.token,
+          full_name: p.fullName,
+          class_name: p.className,
+          is_active: p.isActive,
+          created_at: p.createdAt,
+        }));
+        let partErr: string | undefined;
+        if (adminClient) {
+          const { error } = await adminClient
+            .from('participants')
+            .upsert(partRows, { onConflict: 'participant_number' });
+          partErr = error?.message;
+        } else {
+          const { error: rpcErr } = await supabase.rpc('staff_upsert_participants_batch', {
+            ...(staffAuthArgs || {}),
+            p_participants: partRows,
+          });
+          if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
+            const { error } = await supabase
+              .from('participants')
+              .upsert(partRows, { onConflict: 'participant_number' });
+            partErr = error?.message;
+          } else {
+            partErr = rpcErr?.message;
+          }
+        }
+        if (partErr) {
+          errors.push(`participants (batch ${i / CHUNK + 1}): ${partErr}`);
         } else {
           pushedParts += chunk.length;
         }
@@ -5715,12 +8215,11 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
         details.staff_accounts = staffSuccess;
       } else {
         let staffSuccess = 0;
-        let usedLegacy = false;
         for (const s of staffAccounts) {
           const isPlaceholder = !s.password || s.password === '__CLOUD_MANAGED__';
-          const pwdHash = isPlaceholder ? '__CLOUD_MANAGED__' : await hashPassword(s.password);
+          const pwdHash = isPlaceholder ? '' : await hashPassword(s.password);
           const { error: rpcErr } = await supabase.rpc('staff_upsert_account', {
-            ...getStaffRpcAuthArgs(),
+            ...(staffAuthArgs || {}),
             p_id: s.id,
             p_target_user_id: s.userId,
             p_name: s.name,
@@ -5735,36 +8234,9 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
           });
           if (!rpcErr) {
             staffSuccess += 1;
-          } else if (isRpcSignatureMismatchError(rpcErr.message)) {
-            usedLegacy = true;
-            break;
           } else {
             errors.push(`staff_accounts (${s.userId}): ${rpcErr.message}`);
           }
-        }
-        if (usedLegacy) {
-          const hashedPayload = await Promise.all(
-            staffAccounts
-              .filter((s) => s.password && s.password !== '__CLOUD_MANAGED__')
-              .map(async (s) => ({
-                id: s.id,
-                user_id: s.userId,
-                name: s.name,
-                password_hash: await hashPassword(s.password),
-                role_type: s.roleType,
-                role_label: s.roleLabel,
-                allowed_tabs: s.allowedTabs,
-                assigned_subjects: s.assignedSubjects,
-                restrict_to_assigned_subjects: s.restrictToAssignedSubjects,
-                is_active: s.isActive,
-                created_at: s.createdAt,
-              }))
-          );
-          const { error: staffErr } = await supabase
-            .from('staff_accounts')
-            .upsert(hashedPayload, { onConflict: 'user_id' });
-          if (staffErr) errors.push(`staff_accounts: ${staffErr.message}`);
-          else staffSuccess = hashedPayload.length;
         }
         details.staff_accounts = staffSuccess;
       }
@@ -5796,25 +8268,14 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
         } else {
           let { error: rpcError } = await supabase.rpc('upsert_questions_batch', {
             p_questions: extendedPayload,
-            ...getStaffRpcAuthArgs(),
+            ...(staffAuthArgs || {}),
           });
-          if (rpcError && isRpcSignatureMismatchError(rpcError.message)) {
-            const legacyCall = await supabase.rpc('upsert_questions_batch', {
-              p_questions: extendedPayload,
-            });
-            rpcError = legacyCall.error;
-          }
           if (rpcError && isMissingQuestionColumnsError(rpcError.message)) {
             const legacyPayload = chunk.map((q) => buildQuestionDbRow(q, false));
-            let retry = await supabase.rpc('upsert_questions_batch', {
+            const retry = await supabase.rpc('upsert_questions_batch', {
               p_questions: legacyPayload,
-              ...getStaffRpcAuthArgs(),
+              ...(staffAuthArgs || {}),
             });
-            if (retry.error && isRpcSignatureMismatchError(retry.error.message)) {
-              retry = await supabase.rpc('upsert_questions_batch', {
-                p_questions: legacyPayload,
-              });
-            }
             rpcError = retry.error;
           }
           if (rpcError) {
@@ -5837,7 +8298,7 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
           const row: Record<string, unknown> = {
             id: r.id,
             participant_id: r.participantId,
-            participant_number: r.participantNumber.trim().toUpperCase(),
+            participant_number: normalizeParticipantNumber(r.participantNumber),
             student_name: r.studentName,
             class_name: r.className,
             exam_id: r.examId,
@@ -5879,27 +8340,10 @@ export async function pushAllToSupabase(): Promise<SyncOperationReport> {
           writeErrMessage = error?.message;
         } else {
           const { error: rpcErr } = await supabase.rpc('staff_upsert_exam_results_batch', {
-            ...getStaffRpcAuthArgs(),
+            ...(staffAuthArgs || {}),
             p_results: chunk.map((r) => buildRow(r, true)),
           });
-          if (rpcErr && isRpcSignatureMismatchError(rpcErr.message)) {
-            let { error } = await supabase
-              .from('exam_results')
-              .upsert(chunk.map((r) => buildRow(r, true)), {
-                onConflict: 'participant_number,exam_id',
-              });
-            if (error && error.message.includes('question_ids')) {
-              const retry = await supabase
-                .from('exam_results')
-                .upsert(chunk.map((r) => buildRow(r, false)), {
-                  onConflict: 'participant_number,exam_id',
-                });
-              error = retry.error;
-            }
-            writeErrMessage = error?.message;
-          } else {
-            writeErrMessage = rpcErr?.message;
-          }
+          writeErrMessage = rpcErr?.message;
         }
 
         if (writeErrMessage) {
@@ -6126,7 +8570,12 @@ export async function restoreLocalBackupSnapshot(
     };
   }
 
-  await idbPut(STORES.META, { ...snap.profile, id: 'default' });
+  await idbPut(STORES.META, {
+    ...snap.profile,
+    id: 'default',
+    kemenagLogoDataUrl:
+      snap.profile.kemenagLogoDataUrl || SEED_SCHOOL_PROFILE.kemenagLogoDataUrl,
+  });
   await idbPutParticipantsSafe(snap.participants, true);
   await idbPutMany(STORES.SCHEDULES, snap.schedules, true);
   await idbPutMany(STORES.QUESTIONS, snap.questions, true);
@@ -6136,6 +8585,9 @@ export async function restoreLocalBackupSnapshot(
   }
   clearActiveSessionLocal();
   confirmedQuestionIdsSyncSet.clear();
+  confirmedCloudSessionKeys.clear();
+  lastCloudProgressConfirmedAt.clear();
+  lastLivePollCloudCheckAt.clear();
   lastAdminResultsDeltaIso = null;
   invalidateStoreCache();
   broadcastDataChange('backup_restored');

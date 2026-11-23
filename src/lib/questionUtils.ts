@@ -435,6 +435,32 @@ export function isQuestionAnswered(
   return Boolean(rawAnswer.trim());
 }
 
+export function countAnsweredEntries(
+  answers: Record<string, string> | undefined | null
+): number {
+  if (!answers) return 0;
+  let count = 0;
+  for (const rawVal of Object.values(answers)) {
+    if (rawVal === null || rawVal === undefined) continue;
+    if (typeof rawVal === 'string') {
+      const trimmed = rawVal.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith('{')) {
+        if (Object.keys(parseMatchingMap(trimmed)).length > 0) {
+          count += 1;
+        }
+      } else {
+        count += 1;
+      }
+    } else if (typeof rawVal === 'object') {
+      if (Object.keys(parseMatchingMap(rawVal)).length > 0) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
 export const TRUE_FALSE_DEFAULT_OPTIONS: QuestionOption[] = [
   { key: 'A' as OptionKey, text: 'Benar' },
   { key: 'B' as OptionKey, text: 'Salah' },
