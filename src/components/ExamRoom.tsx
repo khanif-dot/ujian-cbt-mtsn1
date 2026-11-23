@@ -84,6 +84,8 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const [isFinalizingLockout, setIsFinalizingLockout] = useState(false);
   const [lockedResult, setLockedResult] = useState<ExamResult | undefined>(undefined);
   const [cheatWarningOpen, setCheatWarningOpen] = useState(false);
+  const [violationReason, setViolationReason] = useState<'tab_switch' | 'screenshot'>('tab_switch');
+  const [isScreenBlurred, setIsScreenBlurred] = useState(false);
   const [isViolationLocked, setIsViolationLocked] = useState<boolean>(
     () => initialSession.tabSwitchCount >= initialSession.schedule.maxTabSwitches
   );
@@ -406,9 +408,9 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     };
   }, []);
 
-  // Anti-Cheating: Page Visibility API + Window Blur + Keyboard Shortcut Block
+  // Anti-Cheating: Page Visibility API + Instant Focus-Loss Obscure + Window Blur + Screenshot & Shortcut Block
   useEffect(() => {
-    const recordViolation = () => {
+    const recordViolation = (reason: 'tab_switch' | 'screenshot' = 'tab_switch') => {
       if (isUnloadingRef.current || submittingRef.current || lockedRef.current) return;
       const now = Date.now();
       if (now - lastViolationTsRef.current < 1500) return;
@@ -424,19 +426,58 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           lockedRef.current = true;
           setIsViolationLocked(true);
           setCheatWarningOpen(false);
+          setIsScreenBlurred(false);
           void triggerLockoutFinalize(updated);
         } else {
           saveActiveSessionLocal(updated);
           clearPendingProgressTimer();
           void upsertExamProgress(updated, { includeQuestionIds: false });
+          setViolationReason(reason);
           setCheatWarningOpen(true);
         }
         return updated;
       });
     };
 
+    const isScreenshotShortcut = (e: KeyboardEvent): boolean => {
+      const key = e.key.toLowerCase();
+      const code = e.code;
+      // PrintScreen (Windows / Linux / ChromeOS)
+      if (key === 'printscreen' || code === 'PrintScreen') {
+        return true;
+      }
+      // Win + Shift + S (Windows Snipping Tool)
+      if (e.metaKey && e.shiftKey && (key === 's' || code === 'KeyS')) {
+        return true;
+      }
+      // Cmd + Shift + 3 / 4 / 5 (macOS Screenshot & Screen Recording; Shift produces #, $, %)
+      if (
+        e.metaKey &&
+        e.shiftKey &&
+        (['3', '4', '5', '#', '$', '%'].includes(e.key) ||
+          ['Digit3', 'Digit4', 'Digit5'].includes(code))
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    const handleScreenshotAttempt = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isUnloadingRef.current || submittingRef.current || lockedRef.current) return;
+      setIsScreenBlurred(true);
+      if (navigator.clipboard?.writeText) {
+        void navigator.clipboard.writeText('').catch(() => {});
+      }
+      recordViolation('screenshot');
+    };
+
     const onVisibilityChange = () => {
       if (document.hidden && !isUnloadingRef.current) {
+        if (!submittingRef.current) {
+          setIsScreenBlurred(true);
+        }
         // Jika ada jawaban baru yang masih menunggu debounce 10-14 detik saat tab disembunyikan/berpindah aplikasi,
         // segera kirim via keepalive agar tetap tersimpan meskipun browser mobile menghentikan proses tab.
         if (!submittingRef.current && !lockedRef.current && progressTimerRef.current !== null) {
@@ -444,9 +485,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         }
         window.setTimeout(() => {
           if (document.hidden && !isUnloadingRef.current) {
-            recordViolation();
+            recordViolation('tab_switch');
           }
         }, 150);
+      } else if (!document.hidden && document.hasFocus()) {
+        setIsScreenBlurred(false);
       }
     };
 
@@ -456,6 +499,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
 
     const onBlur = () => {
       if (isUnloadingRef.current) return;
+      // Pengaburan instan (0ms) saat jendela kehilangan fokus (mis. overlay Snipping Tool / menu sistem)
+      if (!submittingRef.current) {
+        setIsScreenBlurred(true);
+      }
       if (blurTimerRef.current) {
         window.clearTimeout(blurTimerRef.current);
       }
@@ -467,7 +514,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           !document.hasFocus() &&
           (!recentMobileResize || document.hidden)
         ) {
-          recordViolation();
+          recordViolation('tab_switch');
         }
       }, 1200);
     };
@@ -477,6 +524,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         window.clearTimeout(blurTimerRef.current);
         blurTimerRef.current = null;
       }
+      setIsScreenBlurred(false);
     };
 
     const onFullscreenChange = () => {
@@ -484,6 +532,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isScreenshotShortcut(e)) {
+        handleScreenshotAttempt(e);
+        return;
+      }
       const key = e.key.toLowerCase();
       if (
         e.key === 'F12' ||
@@ -494,10 +546,17 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       }
     };
 
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (isScreenshotShortcut(e)) {
+        handleScreenshotAttempt(e);
+      }
+    };
+
     document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('blur', onBlur);
     window.addEventListener('focus', onFocus);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
     document.addEventListener('fullscreenchange', onFullscreenChange);
     window.visualViewport?.addEventListener('resize', onViewportResize);
 
@@ -510,6 +569,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       window.visualViewport?.removeEventListener('resize', onViewportResize);
     };
@@ -724,7 +784,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const selectedAnswer = session.answers[currentQuestion.id];
   const isFlagged = flaggedQuestionSet.has(currentQuestion.id);
   const isTimeCritical = remainingSeconds <= 300;
-  const isContentObscured = cheatWarningOpen || isViolationLocked;
+  const isContentObscured = cheatWarningOpen || isViolationLocked || isScreenBlurred;
 
   return (
     <div
@@ -820,10 +880,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         </div>
       </div>
 
-      {/* Main Content Split: Question Stage + Question Palette (blurred behind cheat modals) */}
+      {/* Main Content Split: Question Stage + Question Palette (instantly obscured on focus loss / cheat modals) */}
       <main
-        className={`flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start transition-all ${
-          isContentObscured ? 'blur-md pointer-events-none select-none opacity-40' : ''
+        className={`flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start ${
+          isContentObscured ? 'transition-none blur-xl pointer-events-none select-none opacity-0' : ''
         }`}
       >
         {/* Question Canvas */}
@@ -1358,9 +1418,30 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         </div>
       )}
 
-      {/* Anti-Cheat Tab Switch Warning Modal */}
+      {/* Instant Focus-Loss Privacy Shield Overlay (0ms anti-screenshot / system overlay guard) */}
+      {isScreenBlurred && !cheatWarningOpen && !isViolationLocked && (
+        <div
+          onClick={() => setIsScreenBlurred(false)}
+          className="fixed inset-0 z-40 bg-slate-950/95 backdrop-blur-md flex items-center justify-center p-6 select-none"
+        >
+          <div className="max-w-sm w-full bg-slate-900/95 border border-slate-700/80 rounded-2xl p-6 text-center space-y-3 shadow-2xl">
+            <div className="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center mx-auto">
+              <ShieldAlert className="w-6 h-6" />
+            </div>
+            <h3 className="font-display font-bold text-white text-base">
+              Layar Soal Disembunyikan
+            </h3>
+            <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+              Jendela ujian sedang tidak aktif atau tertutup overlay sistem. Kembali ke jendela
+              ujian untuk melanjutkan pengerjaan.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Anti-Cheat Tab Switch / Screenshot Warning Modal */}
       {cheatWarningOpen && !isViolationLocked && (
-        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="w-full max-w-md bg-white rounded-2xl border border-red-200 p-6 space-y-4 shadow-2xl">
             <div className="flex items-start gap-3">
               <div className="w-11 h-11 rounded-xl bg-red-100 text-red-700 flex items-center justify-center shrink-0">
@@ -1368,10 +1449,14 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
               </div>
               <div>
                 <h3 className="font-display font-bold text-slate-900 text-lg">
-                  Perpindahan Tab / Layar Terdeteksi
+                  {violationReason === 'screenshot'
+                    ? 'Upaya Tangkapan Layar Terdeteksi'
+                    : 'Perpindahan Tab / Layar Terdeteksi'}
                 </h3>
                 <p className="text-sm text-slate-600 mt-1 leading-relaxed">
-                  Aktivitas keluar dari jendela ujian dicatat otomatis oleh sistem pengawas.
+                  {violationReason === 'screenshot'
+                    ? 'Penggunaan tombol PrintScreen atau pintasan tangkapan layar dilarang dan dicatat otomatis oleh sistem pengawas.'
+                    : 'Aktivitas keluar dari jendela ujian dicatat otomatis oleh sistem pengawas.'}{' '}
                   Pelanggaran tercatat:{' '}
                   <span className="font-mono font-bold text-red-700">
                     {session.tabSwitchCount} / {session.schedule.maxTabSwitches} kali
@@ -1384,6 +1469,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
               type="button"
               onClick={() => {
                 setCheatWarningOpen(false);
+                setIsScreenBlurred(false);
                 void handleEnterFullscreen();
               }}
               className="w-full py-3 rounded-xl bg-[#064e3b] hover:bg-[#043927] text-white font-semibold text-sm cursor-pointer"
@@ -1407,7 +1493,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
                   Akses Ujian Terkunci
                 </h3>
                 <p className="text-sm text-slate-600 mt-1 leading-relaxed">
-                  Anda telah mencapai batas maksimal pelanggaran perpindahan tab/layar (
+                  Anda telah mencapai batas maksimal pelanggaran perpindahan tab/layar atau tangkapan layar (
                   <span className="font-mono font-bold text-red-700">
                     {session.tabSwitchCount}/{session.schedule.maxTabSwitches}
                   </span>
