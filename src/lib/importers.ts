@@ -21,6 +21,10 @@ import autoTable from 'jspdf-autotable';
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
 import {
+  buildMatchingQuestionData,
+  TRUE_FALSE_DEFAULT_OPTIONS,
+} from '@/src/lib/questionUtils';
+import {
   KEMENAG_HEADER_TITLE,
   KEMENAG_LOGO_DATA_URL,
 } from '@/src/lib/seedData';
@@ -28,10 +32,12 @@ import {
   ALL_CLASSES,
   type ExamResult,
   type ExamSchedule,
+  type MatchingPair,
   type OptionKey,
   type Participant,
   type Question,
   type QuestionOption,
+  type QuestionType,
   type RecapEntry,
   type SchoolProfile,
 } from '@/src/types/cbt';
@@ -276,8 +282,132 @@ export async function parseParticipantsExcel(file: File): Promise<{
   return { participants, errors };
 }
 
+function normalizeImportedQuestionType(raw: string): QuestionType | null {
+  const v = (raw || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!v) return null;
+  if (
+    v === 'multiple_choice' ||
+    v === 'pilihan ganda' ||
+    v === 'pg' ||
+    v === 'mc' ||
+    v === 'pilgan'
+  ) {
+    return 'multiple_choice';
+  }
+  if (
+    v === 'true_false' ||
+    v === 'benar salah' ||
+    v === 'benar/salah' ||
+    v === 'benar / salah' ||
+    v === 'bs' ||
+    v === 'b/s' ||
+    v === 'tf'
+  ) {
+    return 'true_false';
+  }
+  if (
+    v === 'matching' ||
+    v === 'menjodohkan' ||
+    v === 'jodohkan' ||
+    v === 'pasangan' ||
+    v === 'pencocokan' ||
+    v === 'mj'
+  ) {
+    return 'matching';
+  }
+  return null;
+}
+
+function parseSingleMatchingPair(rawSegment: string, index: number): MatchingPair | null {
+  const cleaned = (rawSegment || '')
+    .trim()
+    .replace(/^(?:pasangan(?:\s*\d+)?|pair(?:\s*\d+)?)\s*[:=]\s*/i, '')
+    .replace(/^(?:[-•*]|\d+[\.\)]|[A-Za-z][\.\)])\s*/, '')
+    .trim();
+  if (!cleaned) return null;
+
+  const strongSeparators = ['=>', '->', '↔', '::', '=='];
+  for (const sep of strongSeparators) {
+    const idx = cleaned.indexOf(sep);
+    if (idx !== -1) {
+      const leftText = cleaned.slice(0, idx).trim();
+      const rightText = cleaned.slice(idx + sep.length).trim();
+      if (leftText && rightText) {
+        return { id: `pair-${index + 1}`, leftText, rightText };
+      }
+    }
+  }
+
+  // Fallback: single '=' outside $...$ LaTeX expressions
+  let inMath = false;
+  let eqIdx = -1;
+  for (let i = 0; i < cleaned.length; i++) {
+    if (cleaned[i] === '$') {
+      inMath = !inMath;
+    } else if (cleaned[i] === '=' && !inMath) {
+      eqIdx = i;
+      break;
+    }
+  }
+  if (eqIdx !== -1) {
+    const leftText = cleaned.slice(0, eqIdx).trim();
+    const rightText = cleaned.slice(eqIdx + 1).trim();
+    if (leftText && rightText) {
+      return { id: `pair-${index + 1}`, leftText, rightText };
+    }
+  }
+
+  return null;
+}
+
+function parseMatchingPairsList(rawValue: string): MatchingPair[] {
+  if (!rawValue || !rawValue.trim()) return [];
+  const segments = rawValue
+    .split(/\r?\n|\||;/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const pairs: MatchingPair[] = [];
+  segments.forEach((seg) => {
+    const parsed = parseSingleMatchingPair(seg, pairs.length);
+    if (parsed) pairs.push(parsed);
+  });
+  return pairs;
+}
+
+function resolveTrueFalseAnswerKey(
+  rawKey: string,
+  optA = '',
+  optB = ''
+): OptionKey | null {
+  const key = rawKey.trim().toUpperCase();
+  if (!key) return null;
+  if (key === 'BENAR' || key === 'TRUE' || key === 'T' || key === 'A') {
+    return 'A';
+  }
+  if (key === 'SALAH' || key === 'FALSE' || key === 'F' || key === 'S') {
+    return 'B';
+  }
+  if (key === 'B') {
+    if (optB.trim().toUpperCase() === 'SALAH' || optA.trim().toUpperCase() === 'BENAR') {
+      return 'B';
+    }
+    return 'A';
+  }
+  return null;
+}
+
+function triggerWorkbookDownload(wb: XLSX.WorkBook, filename: string): void {
+  const wbArray = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([wbArray], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  triggerBlobDownload(blob, filename);
+}
+
 /**
- * Import Questions from Excel (.xlsx / .xls / .csv) with optional Gambar URL & LaTeX
+ * Import Questions from Excel (.xlsx / .xls / .csv) supporting all 3 question types:
+ * Pilihan Ganda (multiple_choice), Benar / Salah (true_false), Menjodohkan (matching),
+ * plus optional Gambar URL, Gambar Opsi A–D, & LaTeX ($...$)
  */
 export async function parseQuestionsExcel(file: File): Promise<{
   questions: Question[];
@@ -285,7 +415,10 @@ export async function parseQuestionsExcel(file: File): Promise<{
 }> {
   const buffer = await file.arrayBuffer();
   const workbook = XLSX.read(buffer, { type: 'array' });
-  const sheetName = workbook.SheetNames[0];
+  const sheetName =
+    workbook.SheetNames.find(
+      (name) => !['panduan', 'petunjuk', 'guide', 'instruksi'].includes(name.trim().toLowerCase())
+    ) || workbook.SheetNames[0];
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[sheetName], {
     defval: '',
   });
@@ -296,9 +429,14 @@ export async function parseQuestionsExcel(file: File): Promise<{
 
   rows.forEach((row, idx) => {
     const map: Record<string, string> = {};
+    let hasAnyValue = false;
     Object.keys(row).forEach((k) => {
-      map[k.trim().toLowerCase()] = String(row[k] ?? '').trim();
+      const val = String(row[k] ?? '').trim();
+      if (val) hasAnyValue = true;
+      map[k.trim().toLowerCase()] = val;
     });
+
+    if (!hasAnyValue) return;
 
     const subject = map['mata pelajaran'] || map['mapel'] || map['subject'] || 'Matematika';
     const rawTarget = map['target kelas'] || map['kelas'] || map['target_classes'] || '7A-9I';
@@ -314,6 +452,13 @@ export async function parseQuestionsExcel(file: File): Promise<{
     const imgB = map['gambar opsi b'] || map['gambar b'] || map['opsi b gambar'] || '';
     const imgC = map['gambar opsi c'] || map['gambar c'] || map['opsi c gambar'] || '';
     const imgD = map['gambar opsi d'] || map['gambar d'] || map['opsi d gambar'] || '';
+    const rawMatching =
+      map['pasangan menjodohkan'] ||
+      map['pasangan'] ||
+      map['matching'] ||
+      map['matching_pairs'] ||
+      map['jodohkan'] ||
+      '';
     const rawKey = (
       map['kunci jawaban'] ||
       map['kunci'] ||
@@ -325,21 +470,29 @@ export async function parseQuestionsExcel(file: File): Promise<{
     const rawPoints = Number(map['bobot'] || map['poin'] || map['points'] || 10);
     const points = Number.isFinite(rawPoints) && rawPoints > 0 ? rawPoints : 10;
 
-    const rawType = (
+    const rawType =
       map['jenis soal'] ||
       map['tipe soal'] ||
       map['question_type'] ||
       map['jenis'] ||
-      ''
-    )
-      .trim()
-      .toLowerCase();
-    const isTrueFalse =
-      rawType === 'true_false' ||
-      rawType === 'benar salah' ||
-      rawType === 'benar/salah' ||
-      rawType === 'benar / salah' ||
-      rawType === 'bs';
+      map['tipe'] ||
+      '';
+    let resolvedType = normalizeImportedQuestionType(rawType);
+    if (!resolvedType) {
+      if (rawMatching) {
+        resolvedType = 'matching';
+      } else if (
+        ['BENAR', 'SALAH', 'TRUE', 'FALSE'].includes(rawKey) &&
+        !optC &&
+        !optD &&
+        !imgC &&
+        !imgD
+      ) {
+        resolvedType = 'true_false';
+      } else {
+        resolvedType = 'multiple_choice';
+      }
+    }
 
     const subjKey = subject.trim().toLowerCase();
     const resolvedClasses = targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES];
@@ -347,18 +500,55 @@ export async function parseQuestionsExcel(file: File): Promise<{
     const nextOrder = (subjectOrderCounter.get(groupOrderKey) ?? 0) + 1;
     subjectOrderCounter.set(groupOrderKey, nextOrder);
 
-    if (isTrueFalse) {
+    if (resolvedType === 'matching') {
       if (!questionText && !questionImageUrl) {
-        errors.push(`Baris ${idx + 2}: Teks/gambar pernyataan Benar Salah belum diisi.`);
+        errors.push(`Baris ${idx + 2}: Teks/gambar instruksi soal Menjodohkan belum diisi.`);
         return;
       }
-      let tfCorrect: OptionKey | null = null;
-      if (rawKey === 'BENAR' || rawKey === 'A' || rawKey === 'TRUE' || rawKey === 'B') {
-        tfCorrect = rawKey === 'B' && optB.toUpperCase() === 'SALAH' ? 'B' : 'A';
+      let pairs = parseMatchingPairsList(rawMatching);
+      if (pairs.length < 2) {
+        // Fallback: baca pasangan "Kiri => Kanan" dari kolom Opsi A–D bila kolom Pasangan kosong
+        const fallbackSegments = [optA, optB, optC, optD].filter(Boolean);
+        const fallbackPairs: MatchingPair[] = [];
+        fallbackSegments.forEach((seg) => {
+          const parsed = parseSingleMatchingPair(seg, fallbackPairs.length);
+          if (parsed) fallbackPairs.push(parsed);
+        });
+        if (fallbackPairs.length >= 2) {
+          pairs = fallbackPairs;
+        }
       }
-      if (rawKey === 'SALAH' || rawKey === 'S' || rawKey === 'FALSE') {
-        tfCorrect = 'B';
+      if (pairs.length < 2) {
+        errors.push(
+          `Baris ${idx + 2}: Soal Menjodohkan membutuhkan minimal 2 pasangan (format: Kiri 1 => Kanan 1 | Kiri 2 => Kanan 2).`
+        );
+        return;
       }
+
+      const built = buildMatchingQuestionData(pairs);
+      questions.push({
+        id: `q-imp-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+        subject,
+        targetClasses: resolvedClasses,
+        questionType: 'matching',
+        questionText,
+        questionImageUrl: questionImageUrl || undefined,
+        options: [],
+        matchingPairs: built.matchingPairs,
+        matchingData: built.matchingData,
+        correctAnswer: built.correctAnswer,
+        points,
+        orderIndex: nextOrder,
+      });
+      return;
+    }
+
+    if (resolvedType === 'true_false') {
+      if (!questionText && !questionImageUrl) {
+        errors.push(`Baris ${idx + 2}: Teks/gambar pernyataan Benar/Salah belum diisi.`);
+        return;
+      }
+      const tfCorrect = resolveTrueFalseAnswerKey(rawKey, optA, optB);
       if (!tfCorrect) {
         errors.push(
           `Baris ${idx + 2}: Kunci jawaban Benar/Salah "${rawKey || '(kosong)'}" tidak valid (gunakan BENAR atau SALAH).`
@@ -369,14 +559,11 @@ export async function parseQuestionsExcel(file: File): Promise<{
       questions.push({
         id: `q-imp-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
         subject,
-        targetClasses: targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES],
+        targetClasses: resolvedClasses,
         questionType: 'true_false',
         questionText,
         questionImageUrl: questionImageUrl || undefined,
-        options: [
-          { key: 'A', text: 'Benar' },
-          { key: 'B', text: 'Salah' },
-        ],
+        options: TRUE_FALSE_DEFAULT_OPTIONS.map((o) => ({ ...o })),
         correctAnswer: tfCorrect,
         points,
         orderIndex: nextOrder,
@@ -416,7 +603,7 @@ export async function parseQuestionsExcel(file: File): Promise<{
     questions.push({
       id: `q-imp-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
       subject,
-      targetClasses: targetClasses.length > 0 ? targetClasses : [...ALL_CLASSES],
+      targetClasses: resolvedClasses,
       questionType: 'multiple_choice',
       questionText,
       questionImageUrl: questionImageUrl || undefined,
@@ -431,8 +618,9 @@ export async function parseQuestionsExcel(file: File): Promise<{
 }
 
 /**
- * Import Questions from Word (.docx) supporting embedded Word images, LaTeX ($...$),
- * Gambar: <url>, Mapel:, Kelas:, Bobot:/Poin:
+ * Import Questions from Word (.docx) supporting all 3 question types:
+ * Pilihan Ganda (multiple_choice), Benar / Salah (true_false), Menjodohkan (matching),
+ * embedded Word images, LaTeX ($...$), Gambar: <url>, Mapel:, Kelas:, Jenis:, Pasangan:, Bobot:/Poin:
  */
 export async function parseQuestionsDocx(
   file: File,
@@ -496,11 +684,14 @@ export async function parseQuestionsDocx(
   const subjectOrderCounter = new Map<string, number>();
 
   let activeQ: {
+    questionType?: QuestionType;
     questionText: string;
     questionImageUrl?: string;
     options: Partial<Record<OptionKey, string>>;
     optionImages: Partial<Record<OptionKey, string>>;
+    matchingPairs: MatchingPair[];
     lastOptionKey: OptionKey | null;
+    rawKey: string;
     correctAnswer: OptionKey | null;
     points: number;
   } | null = null;
@@ -508,10 +699,96 @@ export async function parseQuestionsDocx(
   const flushQuestion = () => {
     if (!activeQ) return;
     const hasPrompt = Boolean(activeQ.questionText.trim() || activeQ.questionImageUrl);
+    if (!hasPrompt) {
+      activeQ = null;
+      return;
+    }
+
+    const optKeys = Object.keys(activeQ.options);
+    const looksLikeTrueFalseOptions =
+      optKeys.length === 2 &&
+      (activeQ.options.A || '').trim().toLowerCase() === 'benar' &&
+      (activeQ.options.B || '').trim().toLowerCase() === 'salah';
+
+    let effectiveType: QuestionType = activeQ.questionType || 'multiple_choice';
+    if (!activeQ.questionType) {
+      if (activeQ.matchingPairs.length > 0) {
+        effectiveType = 'matching';
+      } else if (
+        looksLikeTrueFalseOptions ||
+        ['BENAR', 'SALAH', 'TRUE', 'FALSE'].includes(activeQ.rawKey)
+      ) {
+        effectiveType = 'true_false';
+      }
+    }
+
+    const subjKey = currentSubject.trim().toLowerCase();
+    const groupOrderKey = `${subjKey}::${[...currentClasses].sort().join(',')}`;
+
+    if (effectiveType === 'matching') {
+      if (activeQ.matchingPairs.length < 2) {
+        errors.push(
+          `Soal Menjodohkan "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." dilewati karena membutuhkan minimal 2 baris "Pasangan: Kiri => Kanan".`
+        );
+        activeQ = null;
+        return;
+      }
+      const nextOrder = (subjectOrderCounter.get(groupOrderKey) ?? 0) + 1;
+      subjectOrderCounter.set(groupOrderKey, nextOrder);
+      const built = buildMatchingQuestionData(activeQ.matchingPairs);
+      questions.push({
+        id: `q-docx-${Date.now()}-${questions.length + 1}-${Math.random().toString(36).slice(2, 5)}`,
+        subject: currentSubject,
+        targetClasses: [...currentClasses],
+        questionType: 'matching',
+        questionText: activeQ.questionText.trim(),
+        questionImageUrl: activeQ.questionImageUrl,
+        options: [],
+        matchingPairs: built.matchingPairs,
+        matchingData: built.matchingData,
+        correctAnswer: built.correctAnswer,
+        points: activeQ.points,
+        orderIndex: nextOrder,
+      });
+      activeQ = null;
+      return;
+    }
+
+    if (effectiveType === 'true_false') {
+      const tfCorrect = resolveTrueFalseAnswerKey(
+        activeQ.rawKey || activeQ.correctAnswer || '',
+        activeQ.options.A || '',
+        activeQ.options.B || ''
+      );
+      if (!tfCorrect) {
+        errors.push(
+          `Soal Benar/Salah "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." tidak memiliki baris "Kunci: BENAR" atau "Kunci: SALAH" yang valid.`
+        );
+        activeQ = null;
+        return;
+      }
+      const nextOrder = (subjectOrderCounter.get(groupOrderKey) ?? 0) + 1;
+      subjectOrderCounter.set(groupOrderKey, nextOrder);
+      questions.push({
+        id: `q-docx-${Date.now()}-${questions.length + 1}-${Math.random().toString(36).slice(2, 5)}`,
+        subject: currentSubject,
+        targetClasses: [...currentClasses],
+        questionType: 'true_false',
+        questionText: activeQ.questionText.trim(),
+        questionImageUrl: activeQ.questionImageUrl,
+        options: TRUE_FALSE_DEFAULT_OPTIONS.map((o) => ({ ...o })),
+        correctAnswer: tfCorrect,
+        points: activeQ.points,
+        orderIndex: nextOrder,
+      });
+      activeQ = null;
+      return;
+    }
+
     const hasOptA = Boolean(activeQ.options.A?.trim() || activeQ.optionImages.A);
     const hasOptB = Boolean(activeQ.options.B?.trim() || activeQ.optionImages.B);
 
-    if (hasPrompt && hasOptA && hasOptB) {
+    if (hasOptA && hasOptB) {
       if (!activeQ.correctAnswer) {
         errors.push(
           `Soal "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." tidak memiliki baris "Kunci: A/B/C/D" yang valid.`
@@ -537,8 +814,6 @@ export async function parseQuestionsDocx(
         return;
       }
 
-      const subjKey = currentSubject.trim().toLowerCase();
-      const groupOrderKey = `${subjKey}::${[...currentClasses].sort().join(',')}`;
       const nextOrder = (subjectOrderCounter.get(groupOrderKey) ?? 0) + 1;
       subjectOrderCounter.set(groupOrderKey, nextOrder);
 
@@ -546,6 +821,7 @@ export async function parseQuestionsDocx(
         id: `q-docx-${Date.now()}-${questions.length + 1}-${Math.random().toString(36).slice(2, 5)}`,
         subject: currentSubject,
         targetClasses: [...currentClasses],
+        questionType: 'multiple_choice',
         questionText: activeQ.questionText.trim(),
         questionImageUrl: activeQ.questionImageUrl,
         options: docxOptions,
@@ -553,7 +829,7 @@ export async function parseQuestionsDocx(
         points: activeQ.points,
         orderIndex: nextOrder,
       });
-    } else if (hasPrompt) {
+    } else {
       errors.push(
         `Soal "${(activeQ.questionText || 'Bergambar').slice(0, 35)}..." dilewati karena opsi A/B kurang.`
       );
@@ -577,6 +853,11 @@ export async function parseQuestionsDocx(
 
     const line = token.value;
 
+    // Abaikan baris komentar / pemisah bagian template (# ..., --- ..., === ...)
+    if (/^(?:#|={3,}|-{3,}|\[.+\]$)/.test(line)) {
+      continue;
+    }
+
     const subjectMatch = line.match(/^(?:mapel|mata pelajaran)\s*[:=]\s*(.+)$/i);
     if (subjectMatch) {
       flushQuestion();
@@ -587,6 +868,7 @@ export async function parseQuestionsDocx(
 
     const classMatch = line.match(/^(?:kelas|target kelas)\s*[:=]\s*(.+)$/i);
     if (classMatch) {
+      flushQuestion();
       const parsed = parseTargetClassesInput(classMatch[1]);
       if (parsed.length > 0) currentClasses = parsed;
       continue;
@@ -596,12 +878,17 @@ export async function parseQuestionsDocx(
     if (qStart) {
       const numVal = Number(qStart[1]);
       const optCount = activeQ ? Object.keys(activeQ.options).length : 0;
-      // Hindari salah deteksi tahun/angka di tengah teks soal (mis. "2026. ..." atau sebelum opsi dimulai)
+      const hasFinishedPrevious =
+        !activeQ ||
+        optCount >= 2 ||
+        Boolean(activeQ.correctAnswer) ||
+        activeQ.matchingPairs.length >= 2;
+      // Hindari salah deteksi tahun/angka di tengah teks soal (mis. "2026. ...")
       const isLikelyQuestionStart =
         !activeQ ||
         (numVal > 0 &&
           numVal <= 300 &&
-          (numVal === expectedNum || optCount >= 2 || Boolean(activeQ.correctAnswer)));
+          (numVal === expectedNum || hasFinishedPrevious));
 
       if (isLikelyQuestionStart) {
         flushQuestion();
@@ -610,12 +897,38 @@ export async function parseQuestionsDocx(
           questionText: qStart[2].trim(),
           options: {},
           optionImages: {},
+          matchingPairs: [],
           lastOptionKey: null,
+          rawKey: '',
           correctAnswer: null,
           points: 10,
         };
         continue;
       }
+    }
+
+    const typeMatch = line.match(/^(?:jenis(?:\s+soal)?|tipe(?:\s+soal)?)\s*[:=]\s*(.+)$/i);
+    if (typeMatch && activeQ) {
+      const parsedType = normalizeImportedQuestionType(typeMatch[1]);
+      if (parsedType) {
+        activeQ.questionType = parsedType;
+        activeQ.lastOptionKey = null;
+      }
+      continue;
+    }
+
+    const pairMatch = line.match(/^(?:pasangan(?:\s*\d+)?|pair(?:\s*\d+)?)\s*[:=]\s*(.+)$/i);
+    if (pairMatch && activeQ) {
+      if (!activeQ.questionType) activeQ.questionType = 'matching';
+      const parsedPairs = parseMatchingPairsList(pairMatch[1]);
+      parsedPairs.forEach((p) => {
+        activeQ!.matchingPairs.push({
+          ...p,
+          id: `pair-${activeQ!.matchingPairs.length + 1}`,
+        });
+      });
+      activeQ.lastOptionKey = null;
+      continue;
     }
 
     const imgMatch = line.match(/^(?:gambar|image)\s*[:=]\s*((?:https?:\/\/|data:image\/)\S+)$/i);
@@ -631,6 +944,21 @@ export async function parseQuestionsDocx(
       continue;
     }
 
+    // Jika soal bertipe Menjodohkan dan baris berisi pemisah pasangan (=>, ->, ↔, ::) tanpa prefix "Pasangan:"
+    if (activeQ && activeQ.questionType === 'matching' && /(?:=>|->|↔|::)/.test(line)) {
+      const parsedPairs = parseMatchingPairsList(line);
+      if (parsedPairs.length > 0) {
+        parsedPairs.forEach((p) => {
+          activeQ!.matchingPairs.push({
+            ...p,
+            id: `pair-${activeQ!.matchingPairs.length + 1}`,
+          });
+        });
+        activeQ.lastOptionKey = null;
+        continue;
+      }
+    }
+
     const optMatch = line.match(/^([A-Da-d])[\.\)]\s*(.*)$/);
     if (optMatch && activeQ) {
       const key = optMatch[1].toUpperCase() as OptionKey;
@@ -639,11 +967,30 @@ export async function parseQuestionsDocx(
       continue;
     }
 
-    const keyMatch = line.match(/^(?:kunci(?:\s+jawaban)?|jawaban)\s*[:=]\s*([A-Da-d])\b/i);
+    const keyMatch = line.match(/^(?:kunci(?:\s+jawaban)?|jawaban)\s*[:=]\s*(.+)$/i);
     if (keyMatch && activeQ) {
-      activeQ.correctAnswer = keyMatch[1].toUpperCase() as OptionKey;
-      activeQ.lastOptionKey = null;
-      continue;
+      const rawAns = keyMatch[1].trim().toUpperCase();
+      if (rawAns === 'BENAR' || rawAns === 'TRUE') {
+        activeQ.rawKey = 'BENAR';
+        activeQ.correctAnswer = 'A';
+        if (!activeQ.questionType) activeQ.questionType = 'true_false';
+        activeQ.lastOptionKey = null;
+        continue;
+      }
+      if (rawAns === 'SALAH' || rawAns === 'FALSE' || rawAns === 'S') {
+        activeQ.rawKey = 'SALAH';
+        activeQ.correctAnswer = 'B';
+        if (!activeQ.questionType) activeQ.questionType = 'true_false';
+        activeQ.lastOptionKey = null;
+        continue;
+      }
+      const singleLetter = rawAns.match(/^([A-D])\b/);
+      if (singleLetter) {
+        activeQ.rawKey = singleLetter[1];
+        activeQ.correctAnswer = singleLetter[1] as OptionKey;
+        activeQ.lastOptionKey = null;
+        continue;
+      }
     }
 
     if (activeQ) {
@@ -681,9 +1028,10 @@ export function downloadParticipantsTemplate(): void {
     },
   ];
   const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [{ wch: 18 }, { wch: 12 }, { wch: 24 }, { wch: 10 }];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Peserta');
-  XLSX.writeFile(wb, 'Template_Import_Peserta_Token_CBT.xlsx');
+  triggerWorkbookDownload(wb, 'Template_Import_Peserta_Token_CBT.xlsx');
 }
 
 export function downloadQuestionsTemplate(): void {
@@ -691,6 +1039,7 @@ export function downloadQuestionsTemplate(): void {
     {
       'Mata Pelajaran': 'Matematika',
       'Target Kelas': '7A-7I',
+      'Jenis Soal': 'Pilihan Ganda',
       Pertanyaan: 'Jika $\\frac{2x + 4}{3} = 6$, maka nilai $x$ adalah...',
       'Gambar URL': '',
       'Opsi A': '$5$',
@@ -698,11 +1047,13 @@ export function downloadQuestionsTemplate(): void {
       'Opsi C': '$9$',
       'Opsi D': '$11$',
       'Kunci Jawaban': 'B',
-      Bobot: 25,
+      'Pasangan Menjodohkan': '',
+      Bobot: 20,
     },
     {
       'Mata Pelajaran': 'Ilmu Pengetahuan Alam',
       'Target Kelas': '8A, 8B, 8C',
+      'Jenis Soal': 'Pilihan Ganda',
       Pertanyaan: 'Rumus Hukum II Newton dinyatakan sebagai $F = m \\times a$. Satuan SI untuk gaya adalah...',
       'Gambar URL': '',
       'Opsi A': 'Joule',
@@ -710,42 +1061,196 @@ export function downloadQuestionsTemplate(): void {
       'Opsi C': 'Newton',
       'Opsi D': 'Pascal',
       'Kunci Jawaban': 'C',
-      Bobot: 25,
+      'Pasangan Menjodohkan': '',
+      Bobot: 20,
+    },
+    {
+      'Mata Pelajaran': 'Matematika',
+      'Target Kelas': '7A-7I',
+      'Jenis Soal': 'Benar / Salah',
+      Pertanyaan: 'Hasil dari $\\sqrt{144} + 5$ adalah $17$.',
+      'Gambar URL': '',
+      'Opsi A': 'Benar',
+      'Opsi B': 'Salah',
+      'Opsi C': '',
+      'Opsi D': '',
+      'Kunci Jawaban': 'BENAR',
+      'Pasangan Menjodohkan': '',
+      Bobot: 15,
+    },
+    {
+      'Mata Pelajaran': 'Ilmu Pengetahuan Alam',
+      'Target Kelas': '8A-8I',
+      'Jenis Soal': 'Benar / Salah',
+      Pertanyaan: 'Air murni mendidih pada suhu $50^\\circ\\text{C}$ pada tekanan udara $1\\text{ atm}$.',
+      'Gambar URL': '',
+      'Opsi A': 'Benar',
+      'Opsi B': 'Salah',
+      'Opsi C': '',
+      'Opsi D': '',
+      'Kunci Jawaban': 'SALAH',
+      'Pasangan Menjodohkan': '',
+      Bobot: 15,
+    },
+    {
+      'Mata Pelajaran': 'Matematika',
+      'Target Kelas': '7A-7I',
+      'Jenis Soal': 'Menjodohkan',
+      Pertanyaan: 'Pasangkan persamaan aljabar di sebelah kiri dengan nilai $x$ yang tepat di sebelah kanan!',
+      'Gambar URL': '',
+      'Opsi A': '',
+      'Opsi B': '',
+      'Opsi C': '',
+      'Opsi D': '',
+      'Kunci Jawaban': '',
+      'Pasangan Menjodohkan': '$2x = 10$ => $x = 5$ | $3x = 21$ => $x = 7$ | $4x = 36$ => $x = 9$',
+      Bobot: 30,
+    },
+    {
+      'Mata Pelajaran': 'Ilmu Pengetahuan Alam',
+      'Target Kelas': '8A-8I',
+      'Jenis Soal': 'Menjodohkan',
+      Pertanyaan: 'Pasangkan besaran fisika berikut dengan satuan SI yang sesuai!',
+      'Gambar URL': '',
+      'Opsi A': '',
+      'Opsi B': '',
+      'Opsi C': '',
+      'Opsi D': '',
+      'Kunci Jawaban': '',
+      'Pasangan Menjodohkan': 'Panjang => Meter (m) | Massa => Kilogram (kg) | Waktu => Sekon (s)',
+      Bobot: 30,
     },
   ];
+
+  const guideRows = [
+    {
+      'Jenis Soal': 'Pilihan Ganda',
+      'Nilai Kolom Jenis Soal': 'Pilihan Ganda (atau PG)',
+      'Kolom Wajib': 'Pertanyaan, Opsi A, Opsi B (C & D opsional), Kunci Jawaban (A/B/C/D)',
+      'Contoh Format Khusus': 'Mendukung rumus LaTeX ($...$), Gambar URL, serta kolom opsional Gambar Opsi A s/d Gambar Opsi D',
+    },
+    {
+      'Jenis Soal': 'Benar / Salah',
+      'Nilai Kolom Jenis Soal': 'Benar / Salah (atau Benar/Salah / BS)',
+      'Kolom Wajib': 'Pertanyaan, Kunci Jawaban (BENAR atau SALAH)',
+      'Contoh Format Khusus': 'Opsi A–D boleh dikosongkan atau diisi Benar & Salah',
+    },
+    {
+      'Jenis Soal': 'Menjodohkan',
+      'Nilai Kolom Jenis Soal': 'Menjodohkan (atau Matching)',
+      'Kolom Wajib': 'Pertanyaan, Pasangan Menjodohkan (minimal 2 pasangan)',
+      'Contoh Format Khusus': 'Pisahkan sisi kiri & kanan dengan "=>" dan antar pasangan dengan "|", contoh: $2x = 10$ => $x = 5$ | $3x = 21$ => $x = 7$',
+    },
+  ];
+
   const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [
+    { wch: 24 },
+    { wch: 15 },
+    { wch: 16 },
+    { wch: 52 },
+    { wch: 16 },
+    { wch: 16 },
+    { wch: 16 },
+    { wch: 16 },
+    { wch: 16 },
+    { wch: 15 },
+    { wch: 56 },
+    { wch: 10 },
+  ];
+
+  const guideWs = XLSX.utils.json_to_sheet(guideRows);
+  guideWs['!cols'] = [{ wch: 18 }, { wch: 34 }, { wch: 54 }, { wch: 68 }];
+
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'BankSoal');
-  XLSX.writeFile(wb, 'Template_Import_Bank_Soal_LaTeX_CBT.xlsx');
+  XLSX.utils.book_append_sheet(wb, guideWs, 'Panduan');
+  triggerWorkbookDownload(wb, 'Template_Import_Bank_Soal_Semua_Jenis_CBT.xlsx');
 }
 
 export async function downloadQuestionsWordTemplate(): Promise<void> {
-  const lines = [
-    'Mapel: Matematika',
-    'Kelas: 7A-7I',
-    '',
-    '1. Tentukan nilai $x$ yang memenuhi persamaan $\\frac{3x - 3}{2} = 6$!',
-    'A. $3$',
-    'B. $5$',
-    'C. $7$',
-    'D. $9$',
-    'Kunci: B',
-    '',
-    '2. Sebuah persegi memiliki luas $144\\text{ cm}^2$. Berapakah keliling persegi tersebut?',
-    'A. $24\\text{ cm}$',
-    'B. $36\\text{ cm}$',
-    'C. $48\\text{ cm}$',
-    'D. $72\\text{ cm}$',
-    'Kunci: C',
+  const docLines: Array<{ text: string; bold?: boolean; color?: string; spacingAfter?: number }> = [
+    {
+      text: '# TEMPLATE IMPOR BANK SOAL WORD (.DOCX) — SEMUA JENIS SOAL CBT',
+      bold: true,
+      color: '064E3B',
+      spacingAfter: 80,
+    },
+    {
+      text: '# Mendukung: Pilihan Ganda, Benar / Salah, Menjodohkan, rumus LaTeX ($...$), dan gambar tertanam di Word.',
+      color: '475569',
+    },
+    {
+      text: '# Baris yang diawali tanda "#" bersifat catatan panduan dan diabaikan otomatis saat impor.',
+      color: '475569',
+      spacingAfter: 160,
+    },
+    { text: 'Mapel: Matematika', bold: true },
+    { text: 'Kelas: 7A-7I', bold: true, spacingAfter: 140 },
+
+    { text: '# === CONTOH SOAL PILIHAN GANDA ===', bold: true, color: '0F766E' },
+    { text: '1. Tentukan nilai $x$ yang memenuhi persamaan $\\frac{3x - 3}{2} = 6$!' },
+    { text: 'Jenis: Pilihan Ganda' },
+    { text: 'A. $3$' },
+    { text: 'B. $5$' },
+    { text: 'C. $7$' },
+    { text: 'D. $9$' },
+    { text: 'Kunci: B' },
+    { text: 'Bobot: 20', spacingAfter: 140 },
+
+    { text: '2. Sebuah persegi memiliki luas $144\\text{ cm}^2$. Berapakah keliling persegi tersebut?' },
+    { text: 'Jenis: Pilihan Ganda' },
+    { text: 'A. $24\\text{ cm}$' },
+    { text: 'B. $36\\text{ cm}$' },
+    { text: 'C. $48\\text{ cm}$' },
+    { text: 'D. $72\\text{ cm}$' },
+    { text: 'Kunci: C' },
+    { text: 'Bobot: 20', spacingAfter: 160 },
+
+    { text: '# === CONTOH SOAL BENAR / SALAH ===', bold: true, color: '0369A1' },
+    { text: '3. Hasil dari $\\sqrt{144} + 5$ adalah $17$.' },
+    { text: 'Jenis: Benar/Salah' },
+    { text: 'Kunci: BENAR' },
+    { text: 'Bobot: 15', spacingAfter: 140 },
+
+    { text: '4. Bilangan $9$ termasuk bilangan prima karena hanya habis dibagi $1$ dan dirinya sendiri.' },
+    { text: 'Jenis: Benar/Salah' },
+    { text: 'Kunci: SALAH' },
+    { text: 'Bobot: 15', spacingAfter: 160 },
+
+    { text: '# === CONTOH SOAL MENJODOHKAN ===', bold: true, color: 'B45309' },
+    { text: '# Gunakan format "Pasangan: Sisi Kiri => Sisi Kanan" (minimal 2 pasangan per soal).' },
+    { text: '5. Pasangkan persamaan di sebelah kiri dengan nilai $x$ yang tepat di sebelah kanan!' },
+    { text: 'Jenis: Menjodohkan' },
+    { text: 'Pasangan: $2x = 10$ => $x = 5$' },
+    { text: 'Pasangan: $3x = 21$ => $x = 7$' },
+    { text: 'Pasangan: $4x = 36$ => $x = 9$' },
+    { text: 'Bobot: 30', spacingAfter: 140 },
+
+    { text: '6. Pasangkan bangun datar berikut dengan rumus luas yang sesuai!' },
+    { text: 'Jenis: Menjodohkan' },
+    { text: 'Pasangan: Persegi => $s \\times s$' },
+    { text: 'Pasangan: Persegi Panjang => $p \\times l$' },
+    { text: 'Pasangan: Segitiga => $\\frac{1}{2} \\times a \\times t$' },
+    { text: 'Bobot: 30' },
   ];
 
   const doc = new Document({
     sections: [
       {
-        children: lines.map(
-          (line) =>
+        children: docLines.map(
+          (item) =>
             new Paragraph({
-              children: [new TextRun({ text: line, size: 22 })],
+              spacing: { after: item.spacingAfter ?? 60 },
+              children: [
+                new TextRun({
+                  text: item.text,
+                  size: 22,
+                  bold: item.bold,
+                  color: item.color,
+                  font: 'Calibri',
+                }),
+              ],
             })
         ),
       },
@@ -753,14 +1258,7 @@ export async function downloadQuestionsWordTemplate(): Promise<void> {
   });
 
   const blob = await Packer.toBlob(doc);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'Template_Import_Soal_Word_CBT.docx';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  triggerBlobDownload(blob, 'Template_Import_Soal_Word_Semua_Jenis_CBT.docx');
 }
 
 export const PDF_RECAP_MAX_ROWS = 1500;
@@ -1406,10 +1904,15 @@ function triggerBlobDownload(blob: Blob, filename: string): void {
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
+  a.style.display = 'none';
   document.body.appendChild(a);
   a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => {
+    if (a.parentNode) {
+      a.parentNode.removeChild(a);
+    }
+    URL.revokeObjectURL(url);
+  }, 1500);
 }
 
 function sanitizeFilenamePart(value: string, fallback = 'Dokumen'): string {

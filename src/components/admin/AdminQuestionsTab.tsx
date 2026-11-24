@@ -828,17 +828,28 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           );
           let matchingPairs = q.matchingPairs;
           let matchingData = q.matchingData;
+          let correctAnswer = q.correctAnswer;
           if (Array.isArray(q.matchingPairs) && q.matchingPairs.length > 0) {
+            let pairImagesChanged = false;
             matchingPairs = await Promise.all(
-              q.matchingPairs.map(async (pair) => ({
-                ...pair,
-                leftImageUrl: await processUrl(pair.leftImageUrl, 420, 320, 'match-l'),
-                rightImageUrl: await processUrl(pair.rightImageUrl, 420, 320, 'match-r'),
-              }))
+              q.matchingPairs.map(async (pair) => {
+                const nextLeftImg = await processUrl(pair.leftImageUrl, 420, 320, 'match-l');
+                const nextRightImg = await processUrl(pair.rightImageUrl, 420, 320, 'match-r');
+                if (nextLeftImg !== pair.leftImageUrl || nextRightImg !== pair.rightImageUrl) {
+                  pairImagesChanged = true;
+                  return {
+                    ...pair,
+                    leftImageUrl: nextLeftImg,
+                    rightImageUrl: nextRightImg,
+                  };
+                }
+                return pair;
+              })
             );
-            if (matchingPairs.some((p, idx) => p !== q.matchingPairs?.[idx])) {
+            if (pairImagesChanged || !matchingData) {
               const built = buildMatchingQuestionData(matchingPairs);
               matchingData = built.matchingData;
+              correctAnswer = built.correctAnswer;
             }
           }
           return {
@@ -847,12 +858,37 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
             options: optImgs,
             matchingPairs,
             matchingData,
+            correctAnswer,
           };
         })
       );
       result.push(...processedChunk);
     }
     return result;
+  };
+
+  const handleDownloadExcelTemplate = () => {
+    setFeedback('');
+    try {
+      downloadQuestionsTemplate();
+      setFeedback(
+        'Template Excel (.xlsx) untuk seluruh jenis soal (Pilihan Ganda, Benar/Salah, Menjodohkan) berhasil diunduh.'
+      );
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'Gagal mengunduh template Excel soal.');
+    }
+  };
+
+  const handleDownloadWordTemplate = async () => {
+    setFeedback('');
+    try {
+      await downloadQuestionsWordTemplate();
+      setFeedback(
+        'Template Word (.docx) untuk seluruh jenis soal (Pilihan Ganda, Benar/Salah, Menjodohkan) berhasil diunduh.'
+      );
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'Gagal mengunduh template Word (.docx).');
+    }
   };
 
   const handleImportExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1761,7 +1797,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
             <span>Impor Bank Soal Excel (.xlsx / .csv)</span>
           </div>
           <p className="text-xs text-slate-600 leading-relaxed">
-            Mendukung rumus LaTeX (<code className="font-mono">$...$</code>), <code className="font-mono">Gambar URL</code>, serta kolom opsional <code className="font-mono">Gambar Opsi A–D</code>. Kolom <code className="font-mono">Target Kelas</code> mendukung format spesifik seperti <code className="font-mono">7A</code> atau <code className="font-mono">VII A, VII B</code>.
+            Mendukung semua jenis soal (<strong>Pilihan Ganda</strong>, <strong>Benar / Salah</strong>, dan <strong>Menjodohkan</strong>), rumus LaTeX (<code className="font-mono">$...$</code>), <code className="font-mono">Gambar URL</code>, serta kolom opsional <code className="font-mono">Gambar Opsi A–D</code>. Kolom <code className="font-mono">Target Kelas</code> mendukung format seperti <code className="font-mono">7A</code> atau <code className="font-mono">VII A, VII B</code>.
           </p>
 
           <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
@@ -1785,7 +1821,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           <div className="flex flex-wrap items-center gap-2.5 pt-1">
             <button
               type="button"
-              onClick={downloadQuestionsTemplate}
+              onClick={handleDownloadExcelTemplate}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
@@ -1811,7 +1847,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
             <span>Impor Bank Soal Word (.docx)</span>
           </div>
           <p className="text-xs text-slate-600 leading-relaxed">
-            Unduh template Word (.docx) agar struktur nomor soal, LaTeX, opsi A–D, dan Kunci jawaban terbaca otomatis. Atur target kelas spesifik sebelum mengunggah.
+            Unduh template Word (.docx) yang mencakup semua jenis soal (<strong>Pilihan Ganda</strong>, <strong>Benar / Salah</strong>, dan <strong>Menjodohkan</strong>), rumus LaTeX (<code className="font-mono">$...$</code>), serta gambar tertanam agar terbaca otomatis. Atur target kelas spesifik sebelum mengunggah.
           </p>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -1857,7 +1893,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
-              onClick={() => void downloadQuestionsWordTemplate()}
+              onClick={() => void handleDownloadWordTemplate()}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer"
             >
               <FileText className="w-3.5 h-3.5 text-emerald-700" />
