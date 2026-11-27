@@ -126,7 +126,44 @@ export async function compressLogoImage(file: File, maxSize = 240): Promise<stri
 }
 
 export async function compressQuestionImage(file: File, maxWidth = 820): Promise<string> {
-  return compressImageFile(file, maxWidth, 620, 0.82);
+  if (file.size > 12 * 1024 * 1024) {
+    throw new Error('Ukuran file gambar terlalu besar (maksimal 12 MB sebelum kompresi).');
+  }
+  return compressImageFile(file, maxWidth, 620, 0.8);
+}
+
+function encodeCanvasCompact(
+  canvas: HTMLCanvasElement,
+  img: HTMLImageElement,
+  quality: number,
+  preferAlpha: boolean
+): string {
+  const webp = canvas.toDataURL('image/webp', quality);
+  if (webp.startsWith('data:image/webp') && webp.length < 450_000) {
+    return webp;
+  }
+  if (webp.startsWith('data:image/webp')) {
+    const webpLighter = canvas.toDataURL('image/webp', Math.max(0.55, quality - 0.16));
+    if (webpLighter.startsWith('data:image/webp')) {
+      return webpLighter;
+    }
+  }
+  if (preferAlpha) {
+    const png = canvas.toDataURL('image/png');
+    if (png.length < 550_000) return png;
+  }
+  // Isi latar belakang putih sebelum konversi JPEG agar gambar transparan tidak menjadi hitam
+  const jpegCanvas = document.createElement('canvas');
+  jpegCanvas.width = canvas.width;
+  jpegCanvas.height = canvas.height;
+  const jctx = jpegCanvas.getContext('2d');
+  if (jctx) {
+    jctx.fillStyle = '#ffffff';
+    jctx.fillRect(0, 0, jpegCanvas.width, jpegCanvas.height);
+    jctx.drawImage(img, 0, 0, jpegCanvas.width, jpegCanvas.height);
+    return jpegCanvas.toDataURL('image/jpeg', Math.min(0.82, quality));
+  }
+  return canvas.toDataURL('image/jpeg', Math.min(0.82, quality));
 }
 
 async function compressImageFile(
@@ -135,36 +172,82 @@ async function compressImageFile(
   maxHeight: number,
   quality: number
 ): Promise<string> {
+  const preferAlpha = /image\/(png|webp|svg)/i.test(file.type || '');
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
+    const objectUrl =
+      typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+        ? URL.createObjectURL(file)
+        : null;
+
+    const cleanup = () => {
+      if (objectUrl) {
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {
+          // Ignore revoke error
+        }
+      }
+    };
+
+    const loadIntoImage = (src: string, fallbackToFileReader: boolean) => {
       const img = new Image();
       img.onload = () => {
-        const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
-        const width = Math.max(1, Math.round(img.width * scale));
-        const height = Math.max(1, Math.round(img.height * scale));
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('Canvas context unavailable'));
+        try {
+          const naturalW = img.naturalWidth || img.width || maxWidth;
+          const naturalH = img.naturalHeight || img.height || maxHeight;
+          const scale = Math.min(1, maxWidth / naturalW, maxHeight / naturalH);
+          const width = Math.max(1, Math.round(naturalW * scale));
+          const height = Math.max(1, Math.round(naturalH * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            cleanup();
+            reject(new Error('Canvas context tidak tersedia pada browser ini.'));
+            return;
+          }
+          ctx.clearRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          const encoded = encodeCanvasCompact(canvas, img, quality, preferAlpha);
+          cleanup();
+          resolve(encoded);
+        } catch (err) {
+          cleanup();
+          reject(
+            err instanceof Error
+              ? err
+              : new Error('Gagal mengompresi gambar soal.')
+          );
+        }
+      };
+      img.onerror = () => {
+        if (fallbackToFileReader) {
+          cleanup();
+          const reader = new FileReader();
+          reader.onload = () => loadIntoImage(String(reader.result || ''), false);
+          reader.onerror = () => reject(new Error('Gagal membaca file gambar.'));
+          reader.readAsDataURL(file);
           return;
         }
-        ctx.clearRect(0, 0, width, height);
-        ctx.drawImage(img, 0, 0, width, height);
-        const compressed = canvas.toDataURL('image/webp', quality);
-        resolve(
-          compressed.startsWith('data:image/webp')
-            ? compressed
-            : canvas.toDataURL('image/png')
+        cleanup();
+        reject(
+          new Error(
+            'Format gambar tidak dapat dibaca browser. Gunakan file JPG, PNG, WEBP, atau GIF.'
+          )
         );
       };
-      img.onerror = () => reject(new Error('Format gambar tidak dapat dibaca.'));
-      img.src = String(reader.result);
+      img.src = src;
     };
-    reader.onerror = () => reject(new Error('Gagal membaca file gambar.'));
-    reader.readAsDataURL(file);
+
+    if (objectUrl) {
+      loadIntoImage(objectUrl, true);
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => loadIntoImage(String(reader.result || ''), false);
+      reader.onerror = () => reject(new Error('Gagal membaca file gambar.'));
+      reader.readAsDataURL(file);
+    }
   });
 }
 
@@ -172,33 +255,37 @@ export async function compressDataUrlImage(
   dataUrl: string,
   maxWidth = 820,
   maxHeight = 620,
-  quality = 0.82
+  quality = 0.8
 ): Promise<string> {
   const trimmed = (dataUrl || '').trim();
   if (!trimmed.startsWith('data:image/') || typeof document === 'undefined') {
     return trimmed;
   }
+  const preferAlpha = /^data:image\/(png|webp)/i.test(trimmed);
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
-      const width = Math.max(1, Math.round(img.width * scale));
-      const height = Math.max(1, Math.round(img.height * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
+      try {
+        const naturalW = img.naturalWidth || img.width || maxWidth;
+        const naturalH = img.naturalHeight || img.height || maxHeight;
+        const scale = Math.min(1, maxWidth / naturalW, maxHeight / naturalH);
+        const width = Math.max(1, Math.round(naturalW * scale));
+        const height = Math.max(1, Math.round(naturalH * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(trimmed);
+          return;
+        }
+        ctx.clearRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        const candidate = encodeCanvasCompact(canvas, img, quality, preferAlpha);
+        resolve(candidate.length < trimmed.length ? candidate : trimmed);
+      } catch {
         resolve(trimmed);
-        return;
       }
-      ctx.clearRect(0, 0, width, height);
-      ctx.drawImage(img, 0, 0, width, height);
-      const compressed = canvas.toDataURL('image/webp', quality);
-      const candidate = compressed.startsWith('data:image/webp')
-        ? compressed
-        : canvas.toDataURL('image/png');
-      resolve(candidate.length < trimmed.length ? candidate : trimmed);
     };
     img.onerror = () => resolve(trimmed);
     img.src = trimmed;

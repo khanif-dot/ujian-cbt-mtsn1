@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { MathText } from '@/src/components/MathText';
+import { QuestionImage } from '@/src/components/QuestionImage';
 import {
   clearActiveSessionLocal,
   flushExamProgressKeepalive,
@@ -971,10 +972,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           <div className="p-5 sm:p-8 space-y-6">
             {currentQuestion.questionImageUrl && (
               <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 flex justify-center">
-                <img
+                <QuestionImage
                   src={currentQuestion.questionImageUrl}
                   alt={`Ilustrasi Soal ${session.currentIndex + 1}`}
-                  referrerPolicy="no-referrer"
+                  lazy={false}
                   className="max-h-72 w-auto object-contain rounded-lg"
                 />
               </div>
@@ -1079,10 +1080,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
                                     </div>
                                   )}
                                   {left.imageUrl && (
-                                    <img
+                                    <QuestionImage
                                       src={left.imageUrl}
                                       alt={`Soal Pasangan ${idx + 1}`}
-                                      referrerPolicy="no-referrer"
+                                      compact
                                       className="max-h-32 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
                                     />
                                   )}
@@ -1171,10 +1172,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
                                   </div>
                                 )}
                                 {right.imageUrl && (
-                                  <img
+                                  <QuestionImage
                                     src={right.imageUrl}
                                     alt={`Pilihan Jawaban ${letter}`}
-                                    referrerPolicy="no-referrer"
+                                    compact
                                     className="max-h-32 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
                                   />
                                 )}
@@ -1264,10 +1265,9 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
                           </div>
                         )}
                         {opt.imageUrl && (
-                          <img
+                          <QuestionImage
                             src={opt.imageUrl}
                             alt={`Gambar Opsi ${opt.key}`}
-                            referrerPolicy="no-referrer"
                             className="max-h-40 w-auto object-contain rounded-lg border border-slate-200 bg-white p-1"
                           />
                         )}

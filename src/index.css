@@ -4,6 +4,7 @@
   --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-arabic: "Noto Naskh Arabic", "Amiri", "Traditional Arabic", "Geeza Pro", serif;
 }
 
 @layer base {
@@ -13,6 +14,13 @@
 
   h1, h2, h3, h4, .font-display {
     font-family: var(--font-display);
+  }
+
+  .font-arabic {
+    font-family: var(--font-arabic);
+    line-height: 2;
+    letter-spacing: 0;
+    font-feature-settings: "liga" 1, "calt" 1, "mark" 1, "mkmk" 1;
   }
 
   .tabular-nums {

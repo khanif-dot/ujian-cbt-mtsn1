@@ -11,6 +11,7 @@ import {
   hasSupabaseServiceRoleKey,
   isLiveSupabaseConfigured,
   questionContainsBase64Image,
+  registerQuestionImageTicketRequester,
   validateServiceRoleKey,
 } from '@/src/lib/supabase';
 import {
@@ -286,6 +287,34 @@ function isRpcSignatureMismatchError(msg: string): boolean {
     lower.includes('pgrst202')
   );
 }
+
+// Daftarkan penerbit tiket upload gambar soal terverifikasi agar upload Storage bekerja untuk semua staf Bank Soal
+registerQuestionImageTicketRequester(async (prefix: string, ext: string) => {
+  try {
+    if (!isLiveSupabaseConfigured()) return { path: null };
+    const supabase = getSupabaseClient();
+    const authArgs = await resolveStaffRpcAuthArgs();
+    const { data, error } = await supabase.rpc('staff_issue_image_upload_ticket', {
+      ...authArgs,
+      p_prefix: prefix,
+      p_ext: ext,
+    });
+    if (error) {
+      return {
+        path: null,
+        error: error.message,
+        rpcMissing: isRpcSignatureMismatchError(error.message),
+      };
+    }
+    const issuedPath = typeof data === 'string' ? data.trim() : '';
+    return issuedPath ? { path: issuedPath } : { path: null, error: 'Tiket path upload kosong.' };
+  } catch (err) {
+    return {
+      path: null,
+      error: err instanceof Error ? err.message : 'Gagal meminta tiket upload gambar.',
+    };
+  }
+});
 
 function isDigestRpcBugError(
   err: { code?: string; message?: string } | null | undefined

@@ -378,6 +378,45 @@ export function hasSupabaseServiceRoleKey(): boolean {
 
 export const QUESTION_IMAGES_BUCKET = 'question-images';
 
+type QuestionImageTicketRequester = (
+  prefix: string,
+  ext: string
+) => Promise<{ path: string | null; error?: string; rpcMissing?: boolean }>;
+
+let registeredTicketRequester: QuestionImageTicketRequester | null = null;
+
+export function registerQuestionImageTicketRequester(
+  fn: QuestionImageTicketRequester
+): void {
+  registeredTicketRequester = fn;
+}
+
+/**
+ * Menormalisasi URL gambar soal yang ditempel manual (termasuk tautan Google Drive share link)
+ * agar langsung dapat dirender oleh tag <img> pada browser peserta maupun admin.
+ */
+export function normalizeQuestionImageUrl(rawUrl: string | undefined | null): string {
+  const trimmed = String(rawUrl ?? '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('data:image/')) return trimmed;
+
+  // Konversi tautan Google Drive (file/d/<ID>/view, open?id=<ID>, uc?id=<ID>) menjadi URL gambar langsung
+  const driveFileMatch = trimmed.match(
+    /^https?:\/\/(?:drive|docs)\.google\.com\/file\/d\/([a-zA-Z0-9_-]{10,})/i
+  );
+  if (driveFileMatch?.[1]) {
+    return `https://lh3.googleusercontent.com/d/${driveFileMatch[1]}=w1200`;
+  }
+  const driveQueryMatch = trimmed.match(
+    /^https?:\/\/drive\.google\.com\/(?:open|uc|thumbnail)\?[^#]*\bid=([a-zA-Z0-9_-]{10,})/i
+  );
+  if (driveQueryMatch?.[1]) {
+    return `https://lh3.googleusercontent.com/d/${driveQueryMatch[1]}=w1200`;
+  }
+
+  return trimmed;
+}
+
 function dataUrlToBlob(dataUrl: string): { blob: Blob; ext: string; mime: string } | null {
   try {
     const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
@@ -396,7 +435,10 @@ function dataUrlToBlob(dataUrl: string): { blob: Blob; ext: string; mime: string
           ? 'png'
           : mime === 'image/jpeg' || mime === 'image/jpg'
             ? 'jpg'
-            : 'bin';
+            : mime === 'image/gif'
+              ? 'gif'
+              : 'bin';
+    if (ext === 'bin') return null;
     return { blob: new Blob([bytes], { type: mime }), ext, mime };
   } catch {
     return null;
@@ -405,23 +447,23 @@ function dataUrlToBlob(dataUrl: string): { blob: Blob; ext: string; mime: string
 
 /**
  * Mengunggah gambar soal/opsi terkompresi (data:image/...) ke Supabase Storage bucket
- * agar tabel `questions` hanya menyimpan URL CDN pendek (<100 byte) bukan Base64 puluhan KB.
- * Pada mode Supabase live, fungsi ini TIDAK melakukan fallback ke Base64 agar database
- * tidak membengkak; upload wajib menggunakan sesi privileged (Service Role Key / authenticated).
+ * agar tabel `questions` hanya menyimpan URL CDN pendek (<120 byte) bukan Base64 puluhan KB.
+ * Menggunakan Service Role Key bila aktif, atau tiket upload sementara terverifikasi via RPC
+ * `staff_issue_image_upload_ticket` untuk staf Bank Soal yang login tanpa Service Role Key.
  */
 export async function uploadQuestionImageToStorage(
   dataUrl: string,
   prefix = 'q'
 ): Promise<string> {
-  const trimmed = (dataUrl || '').trim();
-  if (!trimmed || !trimmed.startsWith('data:image/')) {
-    return trimmed;
+  const normalized = normalizeQuestionImageUrl(dataUrl);
+  if (!normalized || !normalized.startsWith('data:image/')) {
+    return normalized;
   }
   if (!isLiveSupabaseConfigured()) {
-    return trimmed;
+    return normalized;
   }
 
-  const parsed = dataUrlToBlob(trimmed);
+  const parsed = dataUrlToBlob(normalized);
   if (!parsed) {
     throw new Error('Format gambar tidak valid. Gunakan file PNG, JPG, WEBP, atau GIF.');
   }
@@ -430,10 +472,34 @@ export async function uploadQuestionImageToStorage(
     throw new Error('Ukuran gambar melebihi batas maksimal 2 MB setelah kompresi.');
   }
 
-  const client = getSupabaseAdminClient() || getSupabaseClient();
-  const rand = Math.random().toString(36).slice(2, 8);
-  const safePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, '') || 'q';
-  const filePath = `${safePrefix}/${Date.now()}-${rand}.${parsed.ext}`;
+  const adminClient = getSupabaseAdminClient();
+  const safePrefix = ['q', 'opt', 'match-l', 'match-r'].includes(prefix)
+    ? prefix
+    : 'q';
+
+  let client = adminClient || getSupabaseClient();
+  let filePath = '';
+  let ticketErrorHint = '';
+  let ticketRpcMissing = false;
+
+  if (adminClient) {
+    const rand = Math.random().toString(36).slice(2, 10);
+    filePath = `${safePrefix}/${Date.now()}-${rand}.${parsed.ext}`;
+  } else {
+    if (registeredTicketRequester) {
+      const ticketRes = await registeredTicketRequester(safePrefix, parsed.ext);
+      if (ticketRes.path) {
+        filePath = ticketRes.path;
+      } else {
+        ticketErrorHint = ticketRes.error || '';
+        ticketRpcMissing = Boolean(ticketRes.rpcMissing);
+      }
+    }
+    if (!filePath) {
+      const rand = Math.random().toString(36).slice(2, 10);
+      filePath = `${safePrefix}/${Date.now()}-${rand}.${parsed.ext}`;
+    }
+  }
 
   const { error: uploadErr } = await client.storage
     .from(QUESTION_IMAGES_BUCKET)
@@ -448,8 +514,18 @@ export async function uploadQuestionImageToStorage(
     const isAuthPolicyErr =
       /row-level security|not authorized|unauthorized|permission|403|forbidden/i.test(msg);
     if (isAuthPolicyErr && !hasSupabaseServiceRoleKey()) {
+      if (ticketRpcMissing) {
+        throw new Error(
+          'Upload gambar ditolak oleh policy Storage Supabase karena fungsi SQL terbaru belum dijalankan. Jalankan skrip migrasi terbaru di Tab Database & SQL (atau masukkan Service Role Key) agar fitur upload gambar aktif.'
+        );
+      }
+      if (ticketErrorHint) {
+        throw new Error(
+          `Upload gambar ke Supabase Storage gagal (${ticketErrorHint}). Pastikan akun Anda memiliki izin Bank Soal dan skrip SQL terbaru sudah dijalankan.`
+        );
+      }
       throw new Error(
-        'Upload gambar ke Supabase Storage memerlukan hak akses Admin/Service Role Key (policy anon dinonaktifkan demi keamanan). Masukkan Service Role Key di Tab Database terlebih dahulu atau gunakan URL gambar HTTPS.'
+        'Upload gambar ke Supabase Storage ditolak oleh policy keamanan. Jalankan skrip SQL terbaru pada Tab Database & SQL (untuk tiket upload staf) atau aktifkan Service Role Key.'
       );
     }
     throw new Error(`Gagal mengunggah gambar soal ke Supabase Storage: ${msg}`);

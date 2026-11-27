@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeftRight,
@@ -14,8 +14,10 @@ import {
   FileText,
   Grid3X3,
   ImagePlus,
+  Languages,
   Link2,
   ListChecks,
+  Loader2,
   Pencil,
   Plus,
   RefreshCw,
@@ -27,7 +29,12 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { MathText } from '@/src/components/MathText';
+import { containsArabicScript, MathText } from '@/src/components/MathText';
+import { QuestionImage } from '@/src/components/QuestionImage';
+import {
+  ArabicKeyboardPanel,
+  type TextDirectionMode,
+} from '@/src/components/admin/ArabicKeyboardPanel';
 import { QuestionCoverageMatrix } from '@/src/components/admin/QuestionCoverageMatrix';
 import {
   ALL_CLASSES,
@@ -63,6 +70,7 @@ import {
 import {
   hasSupabaseServiceRoleKey,
   isLiveSupabaseConfigured,
+  normalizeQuestionImageUrl,
   uploadQuestionImageToStorage,
 } from '@/src/lib/supabase';
 import { usePersistedState } from '@/src/lib/usePersistedState';
@@ -516,6 +524,15 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   );
   const [formError, setFormError] = useState('');
   const [isSavingQuestion, setIsSavingQuestion] = useState(false);
+  const [showArabicKeyboard, setShowArabicKeyboard] = useState(false);
+  const [textDirectionMode, setTextDirectionMode] = useState<TextDirectionMode>('auto');
+  const [uploadingImageTarget, setUploadingImageTarget] = useState<string | null>(null);
+  const [activeEditorTarget, setActiveEditorTarget] = useState<
+    | { kind: 'question' }
+    | { kind: 'option'; key: OptionKey }
+    | { kind: 'match'; index: number; side: 'left' | 'right' }
+  >({ kind: 'question' });
+  const editorRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
 
   const scheduleById = useMemo(
     () => new Map(schedules.map((s) => [s.id, s])),
@@ -973,14 +990,18 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   const handleUploadQuestionImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setFormError('');
+    setUploadingImageTarget('question');
     try {
       const compressed = await compressQuestionImage(file, 820);
       const uploadedUrl = await uploadQuestionImageToStorage(compressed, 'q');
       setQForm((prev) => ({ ...prev, questionImageUrl: uploadedUrl }));
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Gagal memproses gambar soal.');
+    } finally {
+      setUploadingImageTarget(null);
+      e.target.value = '';
     }
-    e.target.value = '';
   };
 
   const handleUploadOptionImage = async (
@@ -989,6 +1010,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   ) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setFormError('');
+    setUploadingImageTarget(`opt-${key}`);
     try {
       const compressed = await compressQuestionImage(file, 480);
       const uploadedUrl = await uploadQuestionImageToStorage(compressed, 'opt');
@@ -1001,8 +1024,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       }));
     } catch (err) {
       setFormError(err instanceof Error ? err.message : `Gagal memproses gambar opsi ${key}.`);
+    } finally {
+      setUploadingImageTarget(null);
+      e.target.value = '';
     }
-    e.target.value = '';
   };
 
   const activeQuestionType: QuestionType = qForm.questionType || 'multiple_choice';
@@ -1013,6 +1038,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
   const handleChangeQuestionType = (nextType: QuestionType) => {
     setFormError('');
+    setActiveEditorTarget({ kind: 'question' });
     setQForm((prev) => {
       const safePairs =
         Array.isArray(prev.matchingPairs) && prev.matchingPairs.length >= 2
@@ -1042,6 +1068,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
   ) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setFormError('');
+    setUploadingImageTarget(`match-${pairIndex}-${side}`);
     try {
       const compressed = await compressQuestionImage(file, 420);
       const uploadedUrl = await uploadQuestionImageToStorage(
@@ -1063,13 +1091,21 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       });
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Gagal memproses gambar pasangan.');
+    } finally {
+      setUploadingImageTarget(null);
+      e.target.value = '';
     }
-    e.target.value = '';
   };
+
+  const normalizeMultilineText = (raw: string): string =>
+    raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
 
   const buildQuestionPayloadFromForm = (): Question | null => {
     const qType = activeQuestionType;
-    if (qType !== 'matching' && !qForm.questionText.trim() && !qForm.questionImageUrl.trim()) {
+    const cleanQuestionText = normalizeMultilineText(qForm.questionText);
+    const cleanQuestionImageUrl = normalizeQuestionImageUrl(qForm.questionImageUrl);
+
+    if (qType !== 'matching' && !cleanQuestionText && !cleanQuestionImageUrl) {
       setFormError('Masukkan teks pertanyaan atau lampirkan gambar soal.');
       return null;
     }
@@ -1106,8 +1142,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
         subject: targetSubject,
         targetClasses: [...qForm.targetClasses],
         questionType: 'true_false',
-        questionText: qForm.questionText.trim(),
-        questionImageUrl: qForm.questionImageUrl.trim() || undefined,
+        questionText: cleanQuestionText,
+        questionImageUrl: cleanQuestionImageUrl || undefined,
         options: TRUE_FALSE_DEFAULT_OPTIONS.map((o) => ({ ...o })),
         correctAnswer: tfCorrect,
         points: basePoints,
@@ -1123,8 +1159,12 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       }
       for (let i = 0; i < rawPairs.length; i++) {
         const pair = rawPairs[i];
-        const hasLeft = Boolean(pair.leftText.trim() || pair.leftImageUrl?.trim());
-        const hasRight = Boolean(pair.rightText.trim() || pair.rightImageUrl?.trim());
+        const hasLeft = Boolean(
+          normalizeMultilineText(pair.leftText) || normalizeQuestionImageUrl(pair.leftImageUrl)
+        );
+        const hasRight = Boolean(
+          normalizeMultilineText(pair.rightText) || normalizeQuestionImageUrl(pair.rightImageUrl)
+        );
         if (!hasLeft || !hasRight) {
           setFormError(
             `Pasangan ke-${i + 1} belum lengkap. Isi teks atau gambar untuk sisi kiri (soal) dan kanan (jawaban).`
@@ -1135,10 +1175,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
       const normalizedPairs: MatchingPair[] = rawPairs.map((pair, idx) => ({
         id: pair.id || `L${idx + 1}`,
-        leftText: pair.leftText.trim(),
-        leftImageUrl: pair.leftImageUrl?.trim() || undefined,
-        rightText: pair.rightText.trim(),
-        rightImageUrl: pair.rightImageUrl?.trim() || undefined,
+        leftText: normalizeMultilineText(pair.leftText),
+        leftImageUrl: normalizeQuestionImageUrl(pair.leftImageUrl) || undefined,
+        rightText: normalizeMultilineText(pair.rightText),
+        rightImageUrl: normalizeQuestionImageUrl(pair.rightImageUrl) || undefined,
       }));
       const builtMatching = buildMatchingQuestionData(normalizedPairs);
 
@@ -1148,9 +1188,9 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
         targetClasses: [...qForm.targetClasses],
         questionType: 'matching',
         questionText:
-          qForm.questionText.trim() ||
+          cleanQuestionText ||
           'Jodohkan pernyataan di kolom kiri dengan pasangan jawaban yang tepat di kolom kanan.',
-        questionImageUrl: qForm.questionImageUrl.trim() || undefined,
+        questionImageUrl: cleanQuestionImageUrl || undefined,
         options: [],
         matchingPairs: builtMatching.matchingPairs,
         matchingData: builtMatching.matchingData,
@@ -1163,7 +1203,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     // Default: multiple_choice
     for (const key of OPTION_KEYS) {
       const opt = qForm.options[key];
-      if (!opt.text.trim() && !opt.imageUrl.trim()) {
+      if (!normalizeMultilineText(opt.text) && !normalizeQuestionImageUrl(opt.imageUrl)) {
         setFormError(`Opsi ${key} harus diisi teks atau dilampirkan gambar.`);
         return null;
       }
@@ -1171,8 +1211,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
     const builtOptions: QuestionOption[] = OPTION_KEYS.map((key) => ({
       key,
-      text: qForm.options[key].text.trim(),
-      imageUrl: qForm.options[key].imageUrl.trim() || undefined,
+      text: normalizeMultilineText(qForm.options[key].text),
+      imageUrl: normalizeQuestionImageUrl(qForm.options[key].imageUrl) || undefined,
     }));
 
     const mcCorrect: OptionKey = ['A', 'B', 'C', 'D'].includes(qForm.correctAnswer)
@@ -1184,8 +1224,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
       subject: targetSubject,
       targetClasses: [...qForm.targetClasses],
       questionType: 'multiple_choice',
-      questionText: qForm.questionText.trim(),
-      questionImageUrl: qForm.questionImageUrl.trim() || undefined,
+      questionText: cleanQuestionText,
+      questionImageUrl: cleanQuestionImageUrl || undefined,
       options: builtOptions,
       correctAnswer: mcCorrect,
       points: basePoints,
@@ -1195,8 +1235,12 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
   const handleSaveQuestionModal = async (goToNext = false) => {
     setFormError('');
-    const payload = buildQuestionPayloadFromForm();
-    if (!payload) return;
+    if (uploadingImageTarget) {
+      setFormError('Tunggu proses upload gambar selesai terlebih dahulu sebelum menyimpan soal.');
+      return;
+    }
+    const rawPayload = buildQuestionPayloadFromForm();
+    if (!rawPayload) return;
 
     const currentIdx = goToNext && qForm.id
       ? filteredQuestions.findIndex((item) => item.id === qForm.id)
@@ -1208,6 +1252,13 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
     setIsSavingQuestion(true);
     try {
+      // Pastikan tidak ada sisa data:image/ Base64 saat mode Supabase live (unggah otomatis ke Storage CDN)
+      let payload = rawPayload;
+      if (isLiveSupabaseConfigured()) {
+        const [optimized] = await optimizeImportedQuestionImages([rawPayload]);
+        if (optimized) payload = optimized;
+      }
+
       const writeRes = await onUpsertQuestions([payload]);
       if (writeRes && !writeRes.synced && writeRes.error) {
         setFormError(
@@ -1227,6 +1278,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
         return;
       }
       setQuestionModalOpen(false);
+    } catch (err) {
+      setFormError(
+        err instanceof Error ? err.message : 'Gagal menyimpan soal atau mengunggah gambar soal.'
+      );
     } finally {
       setIsSavingQuestion(false);
     }
@@ -1246,11 +1301,111 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
     return base;
   }, [availableSubjects, qForm.subject, isRestrictedBySubject]);
 
+  const getEditorFieldKey = (target: typeof activeEditorTarget): string => {
+    if (target.kind === 'question') return 'question';
+    if (target.kind === 'option') return `option-${target.key}`;
+    return `match-${target.index}-${target.side}`;
+  };
+
+  const activeEditorLabel = useMemo(() => {
+    if (activeEditorTarget.kind === 'question') return 'Teks Pertanyaan';
+    if (activeEditorTarget.kind === 'option') return `Opsi ${activeEditorTarget.key}`;
+    return `Pasangan #${activeEditorTarget.index + 1} (${
+      activeEditorTarget.side === 'left' ? 'Kiri' : 'Kanan'
+    })`;
+  }, [activeEditorTarget]);
+
+  const updateActiveEditorValue = (
+    transform: (
+      currentValue: string,
+      selStart: number,
+      selEnd: number
+    ) => { nextValue: string; nextCaret: number }
+  ) => {
+    const fieldKey = getEditorFieldKey(activeEditorTarget);
+    const el = editorRefs.current[fieldKey];
+    let targetCaret = 0;
+
+    setQForm((prev) => {
+      const applyOn = (currentVal: string) => {
+        const start =
+          el && typeof el.selectionStart === 'number' ? el.selectionStart : currentVal.length;
+        const end =
+          el && typeof el.selectionEnd === 'number' ? el.selectionEnd : start;
+        const { nextValue, nextCaret } = transform(currentVal, start, end);
+        targetCaret = nextCaret;
+        return nextValue;
+      };
+
+      if (activeEditorTarget.kind === 'question') {
+        return { ...prev, questionText: applyOn(prev.questionText || '') };
+      }
+      if (activeEditorTarget.kind === 'option') {
+        const optKey = activeEditorTarget.key;
+        return {
+          ...prev,
+          options: {
+            ...prev.options,
+            [optKey]: {
+              ...prev.options[optKey],
+              text: applyOn(prev.options[optKey]?.text || ''),
+            },
+          },
+        };
+      }
+      const pairs =
+        Array.isArray(prev.matchingPairs) && prev.matchingPairs.length >= 2
+          ? [...prev.matchingPairs]
+          : createDefaultMatchingPairs();
+      const idx = activeEditorTarget.index;
+      if (!pairs[idx]) return prev;
+      if (activeEditorTarget.side === 'left') {
+        pairs[idx] = { ...pairs[idx], leftText: applyOn(pairs[idx].leftText || '') };
+      } else {
+        pairs[idx] = { ...pairs[idx], rightText: applyOn(pairs[idx].rightText || '') };
+      }
+      return { ...prev, matchingPairs: pairs };
+    });
+
+    if (el) {
+      requestAnimationFrame(() => {
+        el.focus();
+        try {
+          el.setSelectionRange(targetCaret, targetCaret);
+        } catch {
+          // Ignore selection range errors on detached elements
+        }
+      });
+    }
+  };
+
+  const insertTextAtActiveCursor = (snippet: string) => {
+    updateActiveEditorValue((currentValue, start, end) => {
+      const nextValue = currentValue.slice(0, start) + snippet + currentValue.slice(end);
+      return { nextValue, nextCaret: start + snippet.length };
+    });
+  };
+
+  const backspaceAtActiveCursor = () => {
+    updateActiveEditorValue((currentValue, start, end) => {
+      if (start !== end) {
+        return {
+          nextValue: currentValue.slice(0, start) + currentValue.slice(end),
+          nextCaret: start,
+        };
+      }
+      if (start <= 0) {
+        return { nextValue: currentValue, nextCaret: 0 };
+      }
+      return {
+        nextValue: currentValue.slice(0, start - 1) + currentValue.slice(end),
+        nextCaret: start - 1,
+      };
+    });
+  };
+
   const insertLatexSnippet = (snippet: string) => {
-    setQForm((prev) => ({
-      ...prev,
-      questionText: prev.questionText ? `${prev.questionText} ${snippet}` : snippet,
-    }));
+    insertTextAtActiveCursor(snippet);
   };
 
   const currentEditingListIndex = useMemo(() => {
@@ -2107,10 +2262,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   </div>
 
                   {q.questionImageUrl && (
-                    <img
+                    <QuestionImage
                       src={q.questionImageUrl}
                       alt={`Gambar Soal No. ${q.orderIndex}`}
-                      referrerPolicy="no-referrer"
+                      compact
                       className="max-h-32 rounded-lg border border-slate-200 object-contain bg-white p-1"
                     />
                   )}
@@ -2138,10 +2293,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                 </div>
                               )}
                               {pair.leftImageUrl && (
-                                <img
+                                <QuestionImage
                                   src={pair.leftImageUrl}
                                   alt={`Soal Pasangan ${idx + 1}`}
-                                  referrerPolicy="no-referrer"
+                                  compact
                                   className="max-h-16 rounded border border-slate-200 bg-white object-contain p-0.5"
                                 />
                               )}
@@ -2163,10 +2318,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                 </div>
                               )}
                               {pair.rightImageUrl && (
-                                <img
+                                <QuestionImage
                                   src={pair.rightImageUrl}
                                   alt={`Jawaban Pasangan ${idx + 1}`}
-                                  referrerPolicy="no-referrer"
+                                  compact
                                   className="max-h-16 rounded border border-emerald-200 bg-white object-contain p-0.5"
                                 />
                               )}
@@ -2211,10 +2366,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                   </div>
                                 )}
                                 {opt.imageUrl && (
-                                  <img
+                                  <QuestionImage
                                     src={opt.imageUrl}
                                     alt={`Gambar Opsi ${opt.key}`}
-                                    referrerPolicy="no-referrer"
+                                    compact
                                     className="max-h-20 rounded border border-slate-200 bg-white object-contain p-0.5"
                                   />
                                 )}
@@ -2326,7 +2481,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     : 'Buat Soal Baru'}
                 </h3>
                 <p className="text-xs text-emerald-100/85">
-                  Pilih jenis soal (Pilihan Ganda, Benar/Salah, atau Menjodohkan), atur target kelas, rumus LaTeX, serta gambar.
+                  Mendukung penulisan huruf Arab &amp; harakat, tekan Enter untuk baris baru, rumus LaTeX ($...$), serta upload gambar CDN.
                 </p>
               </div>
               <button
@@ -2503,20 +2658,32 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                 />
               </div>
 
-              {/* Teks Pertanyaan / Instruksi + LaTeX */}
-              <div className="space-y-2">
+              {/* Teks Pertanyaan / Instruksi + LaTeX + Huruf Arab + Multi-baris */}
+              <div className="space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <label className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
                     <Sigma className="w-3.5 h-3.5 text-emerald-700" />
                     <span>
                       {activeQuestionType === 'matching'
-                        ? 'Instruksi / Pengantar Soal Menjodohkan (Opsional, mendukung $...$ LaTeX)'
+                        ? 'Instruksi Soal Menjodohkan (Enter = Baris Baru, Arab & $LaTeX$)'
                         : activeQuestionType === 'true_false'
-                          ? 'Teks Pernyataan Benar/Salah (Gunakan $...$ untuk rumus LaTeX)'
-                          : 'Teks Pertanyaan (Gunakan $...$ untuk rumus LaTeX)'}
+                          ? 'Teks Pernyataan Benar/Salah (Enter = Baris Baru, Arab & $LaTeX$)'
+                          : 'Teks Pertanyaan (Enter = Baris Baru, Arab & $LaTeX$)'}
                     </span>
                   </label>
-                  <div className="flex flex-wrap gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowArabicKeyboard((v) => !v)}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold cursor-pointer transition-colors ${
+                        showArabicKeyboard
+                          ? 'bg-[#064e3b] border-[#064e3b] text-white'
+                          : 'bg-emerald-50 border-emerald-300 text-emerald-900 hover:bg-emerald-100'
+                      }`}
+                    >
+                      <Languages className="w-3.5 h-3.5" />
+                      <span>Huruf Arab (عربي)</span>
+                    </button>
                     {[
                       { label: 'Pecahan', code: '$\\frac{a}{b}$' },
                       { label: 'Akar', code: '$\\sqrt{x}$' },
@@ -2527,6 +2694,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                       <button
                         key={s.label}
                         type="button"
+                        onMouseDown={(e) => e.preventDefault()}
                         onClick={() => insertLatexSnippet(s.code)}
                         className="px-2 py-1 rounded bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-900 text-xs font-medium cursor-pointer"
                       >
@@ -2535,25 +2703,46 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     ))}
                   </div>
                 </div>
+
+                {showArabicKeyboard && (
+                  <ArabicKeyboardPanel
+                    activeFieldLabel={activeEditorLabel}
+                    directionMode={textDirectionMode}
+                    onDirectionChange={setTextDirectionMode}
+                    onInsertText={insertTextAtActiveCursor}
+                    onBackspace={backspaceAtActiveCursor}
+                    onClose={() => setShowArabicKeyboard(false)}
+                  />
+                )}
+
                 <textarea
-                  rows={activeQuestionType === 'matching' ? 2 : 3}
+                  ref={(el) => {
+                    editorRefs.current['question'] = el;
+                  }}
+                  dir={textDirectionMode}
+                  rows={activeQuestionType === 'matching' ? 3 : 4}
                   value={qForm.questionText}
+                  onFocus={() => setActiveEditorTarget({ kind: 'question' })}
                   onChange={(e) =>
                     setQForm((prev) => ({ ...prev, questionText: e.target.value }))
                   }
                   placeholder={
                     activeQuestionType === 'matching'
-                      ? 'Contoh: Jodohkan pernyataan/besaran di sebelah kiri dengan pasangan jawaban yang tepat...'
+                      ? 'Contoh: Jodohkan pernyataan/kata di sebelah kiri dengan pasangan jawaban yang tepat...\nTekan Enter untuk baris baru.'
                       : activeQuestionType === 'true_false'
-                        ? 'Contoh: Hasil dari $2^3 + 4$ adalah $12$. Tentukan apakah pernyataan tersebut Benar atau Salah!'
-                        : 'Contoh: Hitunglah nilai $x$ jika $\\frac{2x+4}{3} = 6$...'
+                        ? 'Contoh: Hasil dari $2^3 + 4$ adalah $12$.\nTekan Enter untuk membuat baris baru atau klik Huruf Arab (عربي).'
+                        : 'Contoh: Bacalah ayat berikut dengan cermat:\nبِسْمِ اللَّهِ الرَّحْمٰنِ الرَّحِيْمِ\nTekan Enter untuk membuat baris baru...'
                   }
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  className={`w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-700 whitespace-pre-wrap ${
+                    textDirectionMode === 'rtl' || containsArabicScript(qForm.questionText)
+                      ? 'font-arabic text-base leading-[2]'
+                      : 'text-sm leading-relaxed'
+                  }`}
                 />
                 {qForm.questionText.trim() && (
-                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm">
-                    <div className="text-[11px] font-semibold text-slate-500 mb-1">
-                      Pratinjau Render LaTeX:
+                  <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 text-sm">
+                    <div className="text-[11px] font-semibold text-slate-500 mb-1.5">
+                      Pratinjau Tampilan Soal (Baris Baru, Huruf Arab &amp; LaTeX):
                     </div>
                     <MathText text={qForm.questionText} className="text-slate-900" />
                   </div>
@@ -2563,7 +2752,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
               {/* Gambar Pertanyaan */}
               <div className="space-y-2">
                 <label className="block text-xs font-semibold text-slate-600">
-                  Gambar Pertanyaan (Opsional — Upload Langsung atau Tempel URL)
+                  Gambar Pertanyaan (Opsional — Upload Langsung ke CDN atau Tempel URL)
                 </label>
                 <div className="flex flex-col sm:flex-row gap-2">
                   <div className="relative flex-1">
@@ -2571,19 +2760,38 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     <input
                       type="text"
                       value={qForm.questionImageUrl}
-                      onChange={(e) =>
-                        setQForm((prev) => ({ ...prev, questionImageUrl: e.target.value }))
-                      }
-                      placeholder="URL gambar soal (https://...) atau upload"
+                      onChange={(e) => {
+                        setFormError('');
+                        setQForm((prev) => ({
+                          ...prev,
+                          questionImageUrl: normalizeQuestionImageUrl(e.target.value),
+                        }));
+                      }}
+                      placeholder="URL gambar soal (https://... atau link Google Drive) atau klik Upload"
                       className="w-full pl-9 pr-3 py-2 rounded-xl border border-slate-300 text-xs sm:text-sm"
                     />
                   </div>
-                  <label className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-semibold cursor-pointer whitespace-nowrap">
-                    <ImagePlus className="w-4 h-4" />
-                    <span>Upload Gambar Soal</span>
+                  <label
+                    className={`inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl border text-xs font-semibold whitespace-nowrap ${
+                      uploadingImageTarget === 'question'
+                        ? 'bg-emerald-100 text-emerald-900 border-emerald-300 cursor-wait opacity-80'
+                        : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border-emerald-200 cursor-pointer'
+                    }`}
+                  >
+                    {uploadingImageTarget === 'question' ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <ImagePlus className="w-4 h-4" />
+                    )}
+                    <span>
+                      {uploadingImageTarget === 'question'
+                        ? 'Mengunggah...'
+                        : 'Upload Gambar Soal'}
+                    </span>
                     <input
                       type="file"
-                      accept="image/*"
+                      accept="image/png,image/jpeg,image/webp,image/gif,image/*"
+                      disabled={uploadingImageTarget !== null}
                       onChange={handleUploadQuestionImage}
                       className="sr-only"
                     />
@@ -2598,13 +2806,16 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                     </button>
                   )}
                 </div>
+                <p className="text-[11px] text-slate-500">
+                  File gambar otomatis dikompresi (WebP/JPEG ringan) dan diunggah ke Supabase Storage CDN agar tidak membebani server saat 1.000 peserta mengunduh soal.
+                </p>
                 {qForm.questionImageUrl && (
                   <div className="p-2 rounded-xl border border-slate-200 bg-slate-50 inline-block">
-                    <img
+                    <QuestionImage
                       src={qForm.questionImageUrl}
                       alt="Pratinjau Gambar Soal"
-                      referrerPolicy="no-referrer"
-                      className="max-h-36 object-contain rounded-lg"
+                      lazy={false}
+                      className="max-h-40 object-contain rounded-lg"
                     />
                   </div>
                 )}
@@ -2614,12 +2825,18 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
               {activeQuestionType === 'multiple_choice' && (
                 <div className="space-y-3">
                   <div className="text-xs font-semibold text-slate-700">
-                    Opsi Jawaban A–D (Mendukung Teks LaTeX &amp; Upload Gambar Per Opsi)
+                    Opsi Jawaban A–D (Mendukung Baris Baru/Enter, Huruf Arab, LaTeX &amp; Upload Gambar)
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     {OPTION_KEYS.map((key) => {
                       const optVal = qForm.options[key];
                       const isKey = qForm.correctAnswer === key;
+                      const isUploadingOpt = uploadingImageTarget === `opt-${key}`;
+                      const showOptPreview =
+                        Boolean(optVal.text.trim()) &&
+                        (optVal.text.includes('\n') ||
+                          optVal.text.includes('$') ||
+                          containsArabicScript(optVal.text));
                       return (
                         <div
                           key={key}
@@ -2634,12 +2851,29 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                               Opsi {key} {isKey ? '(Kunci)' : ''}
                             </span>
                             <div className="flex items-center gap-1.5">
-                              <label className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 text-slate-700 hover:text-emerald-900 text-[11px] font-semibold cursor-pointer">
-                                <ImagePlus className="w-3.5 h-3.5" />
-                                <span>{optVal.imageUrl ? 'Ganti Gambar' : 'Upload Gambar'}</span>
+                              <label
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-semibold ${
+                                  isUploadingOpt
+                                    ? 'bg-emerald-100 border-emerald-300 text-emerald-900 cursor-wait'
+                                    : 'bg-white hover:bg-emerald-50 border-slate-200 hover:border-emerald-300 text-slate-700 hover:text-emerald-900 cursor-pointer'
+                                }`}
+                              >
+                                {isUploadingOpt ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <ImagePlus className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {isUploadingOpt
+                                    ? 'Mengunggah...'
+                                    : optVal.imageUrl
+                                      ? 'Ganti Gambar'
+                                      : 'Upload Gambar'}
+                                </span>
                                 <input
                                   type="file"
-                                  accept="image/*"
+                                  accept="image/png,image/jpeg,image/webp,image/gif,image/*"
+                                  disabled={uploadingImageTarget !== null}
                                   onChange={(e) => void handleUploadOptionImage(key, e)}
                                   className="sr-only"
                                 />
@@ -2664,10 +2898,15 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                             </div>
                           </div>
 
-                          <input
-                            type="text"
-                            placeholder={`Teks Opsi ${key} (mendukung $LaTeX$)`}
+                          <textarea
+                            ref={(el) => {
+                              editorRefs.current[`option-${key}`] = el;
+                            }}
+                            dir={textDirectionMode}
+                            rows={2}
+                            placeholder={`Teks Opsi ${key} (Enter = baris baru, Arab / $LaTeX$)`}
                             value={optVal.text}
+                            onFocus={() => setActiveEditorTarget({ kind: 'option', key })}
                             onChange={(e) =>
                               setQForm((prev) => ({
                                 ...prev,
@@ -2677,8 +2916,18 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                 },
                               }))
                             }
-                            className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm"
+                            className={`w-full px-3 py-2 rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700 whitespace-pre-wrap ${
+                              textDirectionMode === 'rtl' || containsArabicScript(optVal.text)
+                                ? 'font-arabic text-base leading-[1.9]'
+                                : 'text-sm'
+                            }`}
                           />
+
+                          {showOptPreview && (
+                            <div className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 text-xs text-slate-800">
+                              <MathText text={optVal.text} />
+                            </div>
+                          )}
 
                           <input
                             type="text"
@@ -2689,7 +2938,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                 ...prev,
                                 options: {
                                   ...prev.options,
-                                  [key]: { ...prev.options[key], imageUrl: e.target.value },
+                                  [key]: {
+                                    ...prev.options[key],
+                                    imageUrl: normalizeQuestionImageUrl(e.target.value),
+                                  },
                                 },
                               }))
                             }
@@ -2698,10 +2950,11 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
 
                           {optVal.imageUrl && (
                             <div className="p-1.5 rounded-lg bg-white border border-slate-200 inline-block">
-                              <img
+                              <QuestionImage
                                 src={optVal.imageUrl}
                                 alt={`Pratinjau Opsi ${key}`}
-                                referrerPolicy="no-referrer"
+                                lazy={false}
+                                compact
                                 className="max-h-24 object-contain rounded"
                               />
                             </div>
@@ -2770,7 +3023,7 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                         Daftar Pasangan Soal &amp; Jawaban ({activeMatchingPairs.length} Pasangan)
                       </div>
                       <p className="text-[11px] text-slate-500 mt-0.5">
-                        Pasangan sisi kiri dan kanan diinput sejajar. Saat siswa mengerjakan ujian, posisi jawaban di sisi kanan akan otomatis diacak.
+                        Mendukung baris baru (Enter), huruf Arab, LaTeX, dan gambar per pasangan. Posisi sisi kanan otomatis diacak saat ujian.
                       </p>
                     </div>
                     <button
@@ -2805,7 +3058,10 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                   </div>
 
                   <div className="space-y-2.5">
-                    {activeMatchingPairs.map((pair, idx) => (
+                    {activeMatchingPairs.map((pair, idx) => {
+                      const isUploadingLeft = uploadingImageTarget === `match-${idx}-left`;
+                      const isUploadingRight = uploadingImageTarget === `match-${idx}-right`;
+                      return (
                       <div
                         key={pair.id || idx}
                         className="p-3 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2.5"
@@ -2838,20 +3094,40 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                               <span className="text-[11px] font-bold text-slate-600">
                                 Sisi Kiri — Soal / Pernyataan {idx + 1}
                               </span>
-                              <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-50 hover:bg-emerald-50 border border-slate-200 text-slate-600 hover:text-emerald-800 text-[10px] font-semibold cursor-pointer">
-                                <ImagePlus className="w-3 h-3" />
-                                <span>{pair.leftImageUrl ? 'Ganti' : 'Gambar'}</span>
+                              <label
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-semibold ${
+                                  isUploadingLeft
+                                    ? 'bg-emerald-100 border-emerald-300 text-emerald-900 cursor-wait'
+                                    : 'bg-slate-50 hover:bg-emerald-50 border-slate-200 text-slate-600 hover:text-emerald-800 cursor-pointer'
+                                }`}
+                              >
+                                {isUploadingLeft ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <ImagePlus className="w-3 h-3" />
+                                )}
+                                <span>
+                                  {isUploadingLeft ? 'Unggah...' : pair.leftImageUrl ? 'Ganti' : 'Gambar'}
+                                </span>
                                 <input
                                   type="file"
-                                  accept="image/*"
+                                  accept="image/png,image/jpeg,image/webp,image/gif,image/*"
+                                  disabled={uploadingImageTarget !== null}
                                   onChange={(e) => void handleUploadMatchingImage(idx, 'left', e)}
                                   className="sr-only"
                                 />
                               </label>
                             </div>
-                            <input
-                              type="text"
+                            <textarea
+                              ref={(el) => {
+                                editorRefs.current[`match-${idx}-left`] = el;
+                              }}
+                              dir={textDirectionMode}
+                              rows={2}
                               value={pair.leftText}
+                              onFocus={() =>
+                                setActiveEditorTarget({ kind: 'match', index: idx, side: 'left' })
+                              }
                               onChange={(e) => {
                                 const val = e.target.value;
                                 setQForm((prev) => {
@@ -2860,15 +3136,20 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                   return { ...prev, matchingPairs: nextPairs };
                                 });
                               }}
-                              placeholder={`Soal / pernyataan ${idx + 1} (mendukung $LaTeX$)`}
-                              className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs sm:text-sm"
+                              placeholder={`Soal / pernyataan ${idx + 1} (Enter = baris baru, Arab / $LaTeX$)`}
+                              className={`w-full px-2.5 py-1.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-700 whitespace-pre-wrap ${
+                                textDirectionMode === 'rtl' || containsArabicScript(pair.leftText)
+                                  ? 'font-arabic text-base leading-[1.9]'
+                                  : 'text-xs sm:text-sm'
+                              }`}
                             />
                             {pair.leftImageUrl && (
                               <div className="flex items-center gap-2 pt-1">
-                                <img
+                                <QuestionImage
                                   src={pair.leftImageUrl}
                                   alt={`Gambar Kiri ${idx + 1}`}
-                                  referrerPolicy="no-referrer"
+                                  lazy={false}
+                                  compact
                                   className="max-h-16 rounded border border-slate-200 object-contain"
                                 />
                                 <button
@@ -2898,20 +3179,40 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                               <span className="text-[11px] font-bold text-emerald-900">
                                 Sisi Kanan — Pasangan Jawaban {idx + 1}
                               </span>
-                              <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-white hover:bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-semibold cursor-pointer">
-                                <ImagePlus className="w-3 h-3" />
-                                <span>{pair.rightImageUrl ? 'Ganti' : 'Gambar'}</span>
+                              <label
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-semibold ${
+                                  isUploadingRight
+                                    ? 'bg-emerald-100 border-emerald-300 text-emerald-900 cursor-wait'
+                                    : 'bg-white hover:bg-emerald-50 border-emerald-200 text-emerald-800 cursor-pointer'
+                                }`}
+                              >
+                                {isUploadingRight ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <ImagePlus className="w-3 h-3" />
+                                )}
+                                <span>
+                                  {isUploadingRight ? 'Unggah...' : pair.rightImageUrl ? 'Ganti' : 'Gambar'}
+                                </span>
                                 <input
                                   type="file"
-                                  accept="image/*"
+                                  accept="image/png,image/jpeg,image/webp,image/gif,image/*"
+                                  disabled={uploadingImageTarget !== null}
                                   onChange={(e) => void handleUploadMatchingImage(idx, 'right', e)}
                                   className="sr-only"
                                 />
                               </label>
                             </div>
-                            <input
-                              type="text"
+                            <textarea
+                              ref={(el) => {
+                                editorRefs.current[`match-${idx}-right`] = el;
+                              }}
+                              dir={textDirectionMode}
+                              rows={2}
                               value={pair.rightText}
+                              onFocus={() =>
+                                setActiveEditorTarget({ kind: 'match', index: idx, side: 'right' })
+                              }
                               onChange={(e) => {
                                 const val = e.target.value;
                                 setQForm((prev) => {
@@ -2920,15 +3221,20 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                                   return { ...prev, matchingPairs: nextPairs };
                                 });
                               }}
-                              placeholder={`Jawaban pasangan ${idx + 1} (akan diacak ke siswa)`}
-                              className="w-full px-2.5 py-1.5 rounded-lg border border-emerald-300 bg-white text-xs sm:text-sm"
+                              placeholder={`Jawaban pasangan ${idx + 1} (Enter = baris baru, Arab / $LaTeX$)`}
+                              className={`w-full px-2.5 py-1.5 rounded-lg border border-emerald-300 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700 whitespace-pre-wrap ${
+                                textDirectionMode === 'rtl' || containsArabicScript(pair.rightText)
+                                  ? 'font-arabic text-base leading-[1.9]'
+                                  : 'text-xs sm:text-sm'
+                              }`}
                             />
                             {pair.rightImageUrl && (
                               <div className="flex items-center gap-2 pt-1">
-                                <img
+                                <QuestionImage
                                   src={pair.rightImageUrl}
                                   alt={`Gambar Kanan ${idx + 1}`}
-                                  referrerPolicy="no-referrer"
+                                  lazy={false}
+                                  compact
                                   className="max-h-16 rounded border border-emerald-200 bg-white object-contain"
                                 />
                                 <button
@@ -2949,7 +3255,8 @@ export const AdminQuestionsTab: React.FC<AdminQuestionsTabProps> = ({
                           </div>
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
