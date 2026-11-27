@@ -741,7 +741,10 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
                 </tr>
               ) : (
                 displayedResults.map((res) => {
-                  const answeredCount = countAnsweredEntries(res.answers);
+                  const answeredCount =
+                    typeof res.answeredCount === 'number'
+                      ? res.answeredCount
+                      : countAnsweredEntries(res.answers);
                   const pct =
                     res.totalQuestions > 0
                       ? Math.round((answeredCount / res.totalQuestions) * 100)
@@ -960,8 +963,10 @@ export const AdminDashboardTab: React.FC<AdminDashboardTabProps> = ({
                     <div>
                       Progres Tersimpan:{' '}
                       <strong className="font-mono text-emerald-800">
-                        {Object.keys(finishScope.target.answers || {}).length} /{' '}
-                        {finishScope.target.totalQuestions} soal terjawab
+                        {typeof finishScope.target.answeredCount === 'number'
+                          ? finishScope.target.answeredCount
+                          : countAnsweredEntries(finishScope.target.answers)}{' '}
+                        / {finishScope.target.totalQuestions} soal terjawab
                       </strong>
                     </div>
                   </div>

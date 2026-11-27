@@ -15,22 +15,35 @@ export const ExamCompletedView: React.FC<ExamCompletedViewProps> = ({
   result,
   onReturnLogin,
 }) => {
-  const answeredCount = countAnsweredEntries(result.answers);
+  const answeredCount = Math.max(
+    countAnsweredEntries(result.answers),
+    typeof result.answeredCount === 'number' ? result.answeredCount : 0
+  );
   const unansweredCount = Math.max(0, result.totalQuestions - answeredCount);
   const isPendingSync = result.syncStatus !== 'synced';
 
   const [isRetryingSync, setIsRetryingSync] = useState(false);
   const [retryFeedback, setRetryFeedback] = useState('');
   const [autoRetryCount, setAutoRetryCount] = useState(0);
+  const [manualCooldownSec, setManualCooldownSec] = useState(0);
   const [confirmExitWhilePending, setConfirmExitWhilePending] = useState(false);
 
-  // Otomatis mencoba ulang sinkronisasi dengan backoff bertahap + jitter acak (5s → 9s → 14s)
+  useEffect(() => {
+    if (manualCooldownSec <= 0) return;
+    const timer = window.setTimeout(() => {
+      setManualCooldownSec((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [manualCooldownSec]);
+
+  // Otomatis mencoba ulang sinkronisasi dengan backoff bertahap + jitter acak (8s → 16s → 26s → 40s)
   // agar ratusan siswa yang masuk antrean tidak membanjiri server secara bersamaan.
   useEffect(() => {
     if (!isPendingSync) {
       setConfirmExitWhilePending(false);
       setRetryFeedback('');
       setAutoRetryCount(0);
+      setManualCooldownSec(0);
       return;
     }
 
@@ -40,8 +53,8 @@ export const ExamCompletedView: React.FC<ExamCompletedViewProps> = ({
 
     const scheduleNext = () => {
       if (!active) return;
-      const baseMs = attempt === 0 ? 3500 : attempt === 1 ? 6500 : attempt === 2 ? 10_000 : 14_000;
-      const jitterMs = Math.floor(Math.random() * 3500);
+      const baseMs = attempt === 0 ? 8_000 : attempt === 1 ? 16_000 : attempt === 2 ? 26_000 : 40_000;
+      const jitterMs = Math.floor(Math.random() * 8_000);
       timerId = window.setTimeout(() => {
         timerId = null;
         if (!active) return;
@@ -61,21 +74,43 @@ export const ExamCompletedView: React.FC<ExamCompletedViewProps> = ({
 
     scheduleNext();
 
+    const handleVisibilityResume = () => {
+      if (!active || document.hidden) return;
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+      const resumeJitterMs = 1_000 + Math.floor(Math.random() * 3_000);
+      timerId = window.setTimeout(() => {
+        timerId = null;
+        if (!active || document.hidden) return;
+        attempt += 1;
+        setAutoRetryCount(attempt);
+        void flushPendingSyncQueue()
+          .catch(() => 0)
+          .finally(() => {
+            if (active) scheduleNext();
+          });
+      }, resumeJitterMs);
+    };
+
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = '';
     };
+    document.addEventListener('visibilitychange', handleVisibilityResume);
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
       active = false;
       if (timerId !== null) window.clearTimeout(timerId);
+      document.removeEventListener('visibilitychange', handleVisibilityResume);
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [isPendingSync]);
 
   const handleManualRetry = async () => {
-    if (isRetryingSync) return;
+    if (isRetryingSync || manualCooldownSec > 0) return;
     setIsRetryingSync(true);
     setRetryFeedback('');
     try {
@@ -83,11 +118,13 @@ export const ExamCompletedView: React.FC<ExamCompletedViewProps> = ({
       if (syncedCount > 0) {
         setRetryFeedback('Jawaban berhasil dikirim dan dinilai oleh server.');
       } else {
+        setManualCooldownSec(5);
         setRetryFeedback(
           'Server masih sibuk atau koneksi belum stabil. Sistem akan mencoba otomatis lagi.'
         );
       }
     } catch {
+      setManualCooldownSec(5);
       setRetryFeedback('Gagal terhubung ke server. Periksa koneksi Wi-Fi / internet Anda.');
     } finally {
       setIsRetryingSync(false);
@@ -154,13 +191,17 @@ export const ExamCompletedView: React.FC<ExamCompletedViewProps> = ({
 
               <button
                 type="button"
-                disabled={isRetryingSync}
+                disabled={isRetryingSync || manualCooldownSec > 0}
                 onClick={() => void handleManualRetry()}
-                className="w-full py-2.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-60"
+                className="w-full py-2.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <RefreshCw className={`w-4 h-4 ${isRetryingSync ? 'animate-spin' : ''}`} />
                 <span>
-                  {isRetryingSync ? 'Mengirim Ulang ke Server...' : 'Kirim Ulang ke Server Sekarang'}
+                  {isRetryingSync
+                    ? 'Mengirim Ulang ke Server...'
+                    : manualCooldownSec > 0
+                      ? `Tunggu ${manualCooldownSec} detik sebelum kirim ulang...`
+                      : 'Kirim Ulang ke Server Sekarang'}
                 </span>
               </button>
             </div>

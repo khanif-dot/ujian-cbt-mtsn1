@@ -103,6 +103,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const blurTimerRef = useRef<number | null>(null);
   const progressTimerRef = useRef<number | null>(null);
   const firstDirtyProgressTsRef = useRef<number | null>(null);
+  const progressMaxWaitArmedRef = useRef(false);
   const navSaveTimerRef = useRef<number | null>(null);
   const expiryPendingRef = useRef(false);
   const expiryJitterTimerRef = useRef<number | null>(null);
@@ -162,6 +163,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       progressTimerRef.current = null;
     }
     firstDirtyProgressTsRef.current = null;
+    progressMaxWaitArmedRef.current = false;
   }, []);
 
   const clearPendingNavSaveTimer = useCallback(() => {
@@ -170,6 +172,35 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       navSaveTimerRef.current = null;
     }
   }, []);
+
+  const adoptServerStartedAt = useCallback((serverStartedAt?: string | null) => {
+    if (!serverStartedAt) return;
+    const serverStartMs = Date.parse(serverStartedAt);
+    if (!Number.isFinite(serverStartMs)) return;
+    const prev = sessionRef.current;
+    const prevStartMs = Date.parse(prev.startedAt);
+    if (Number.isFinite(prevStartMs) && Math.abs(serverStartMs - prevStartMs) < 2000) {
+      return;
+    }
+    const durationMs = Math.max(1, prev.schedule.durationMinutes) * 60 * 1000;
+    const nextEndsAt = new Date(serverStartMs + durationMs).toISOString();
+    const updated: ActiveExamSession = {
+      ...prev,
+      startedAt: serverStartedAt,
+      endsAt: nextEndsAt,
+    };
+    sessionRef.current = updated;
+    saveActiveSessionLocal(updated);
+    setSession(updated);
+    const endMs = computeAuthoritativeEndsAtMs(updated);
+    setRemainingSeconds(Math.max(0, Math.floor((endMs - getServerNowMs()) / 1000)));
+  }, []);
+
+  useEffect(() => {
+    if (initialSession.resultId === sessionRef.current.resultId) {
+      adoptServerStartedAt(initialSession.startedAt);
+    }
+  }, [initialSession.resultId, initialSession.startedAt, adoptServerStartedAt]);
 
   const triggerLockoutFinalize = useCallback(
     (lockedSession: ActiveExamSession) => {
@@ -280,9 +311,9 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           expiryPendingRef.current = true;
           setIsExpiryQueueing(true);
           setShowSubmitModal(false);
-          // Sebarkan expiryJitter 2 - 30 detik agar 800-1.000 siswa merata sambil tetap selesai
-          // jauh sebelum EXPIRY_GRACE_MS (75s) & ADMIN_EXPIRY_GRACE_MS (300s) meski dengan retry submit.
-          const jitterMs = 2_000 + Math.floor(Math.random() * 28_000);
+          // Sebarkan expiryJitter 4 - 58 detik agar 800-1.000 siswa merata sambil tetap selesai
+          // jauh sebelum EXPIRY_GRACE_MS (120s) & ADMIN_EXPIRY_GRACE_MS (300s) meski dengan retry submit.
+          const jitterMs = 4_000 + Math.floor(Math.random() * 54_000);
           const scheduledAtMs = Date.now() + jitterMs;
           setExpiryQueueSecondsLeft(Math.max(1, Math.ceil(jitterMs / 1000)));
           if (expiryCountdownIntervalRef.current !== null) {
@@ -422,6 +453,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           ...prev,
           tabSwitchCount: nextCount,
         };
+        sessionRef.current = updated;
         if (nextCount >= prev.schedule.maxTabSwitches) {
           lockedRef.current = true;
           setIsViolationLocked(true);
@@ -429,9 +461,11 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           setIsScreenBlurred(false);
           void triggerLockoutFinalize(updated);
         } else {
-          saveActiveSessionLocal(updated);
+          saveActiveSessionLocal(updated, { flushIdbNow: true });
           clearPendingProgressTimer();
-          void upsertExamProgress(updated, { includeQuestionIds: false });
+          void upsertExamProgress(updated, { includeQuestionIds: false }).then((res) => {
+            adoptServerStartedAt(res.startedAt);
+          });
           setViolationReason(reason);
           setCheatWarningOpen(true);
         }
@@ -478,10 +512,15 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         if (!submittingRef.current) {
           setIsScreenBlurred(true);
         }
-        // Jika ada jawaban baru yang masih menunggu debounce 10-14 detik saat tab disembunyikan/berpindah aplikasi,
-        // segera kirim via keepalive agar tetap tersimpan meskipun browser mobile menghentikan proses tab.
-        if (!submittingRef.current && !lockedRef.current && progressTimerRef.current !== null) {
-          flushExamProgressKeepalive(sessionRef.current);
+        // Pastikan sesi & jawaban terbaru tersimpan lokal secara sinkron segera saat tab disembunyikan.
+        // Hindari penulisan jaringan ganda (keepalive + upsertExamProgress dari recordViolation 150ms kemudian):
+        // jalankan keepalive langsung hanya jika pelanggaran sedang dalam masa cooldown 1,5 detik sehingga recordViolation tidak akan menembak write.
+        if (!submittingRef.current && !lockedRef.current) {
+          saveActiveSessionLocal(sessionRef.current, { flushIdbNow: true });
+          const violationInCooldown = Date.now() - lastViolationTsRef.current < 1500;
+          if (violationInCooldown && progressTimerRef.current !== null) {
+            flushExamProgressKeepalive(sessionRef.current);
+          }
         }
         window.setTimeout(() => {
           if (document.hidden && !isUnloadingRef.current) {
@@ -573,10 +612,10 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       window.visualViewport?.removeEventListener('resize', onViewportResize);
     };
-  }, [clearPendingProgressTimer, triggerLockoutFinalize]);
+  }, [adoptServerStartedAt, clearPendingProgressTimer, triggerLockoutFinalize]);
 
-  // Autosave lokal berlangsung instan (0ms), sedangkan sync cloud diberi debounce 10-14 detik
-  // (maksimal tunggu 25 detik) untuk memangkas ~70% beban tulis database saat 800-1.000+ siswa aktif serentak.
+  // Autosave lokal berlangsung instan (0ms), sedangkan sync cloud diberi debounce 28-42 detik
+  // (maksimal tunggu 55 detik) untuk memangkas ~85% beban tulis database saat 800-1.000+ siswa aktif serentak.
   const persistProgress = useCallback(
     (updated: ActiveExamSession) => {
       if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
@@ -585,24 +624,37 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
       if (firstDirtyProgressTsRef.current === null) {
         firstDirtyProgressTsRef.current = now;
       }
+
+      // Jika batas tunggu maksimal (55 detik) sudah tercapai dan timer flush sedang berjalan,
+      // jangan reset timer lagi agar klik cepat (<1,2 detik) tidak menunda autosave cloud tanpa batas.
+      if (progressMaxWaitArmedRef.current && progressTimerRef.current !== null) {
+        return;
+      }
+
       if (progressTimerRef.current !== null) {
         window.clearTimeout(progressTimerRef.current);
         progressTimerRef.current = null;
       }
 
       const elapsedDirty = now - firstDirtyProgressTsRef.current;
-      const baseDelayMs = 10_000 + Math.floor(Math.random() * 4000);
-      const delayMs = elapsedDirty >= 25_000 ? 800 : Math.min(baseDelayMs, 26_000 - elapsedDirty);
+      const hitMaxWait = elapsedDirty >= 55_000;
+      const baseDelayMs = 28_000 + Math.floor(Math.random() * 14_000);
+      const delayMs = hitMaxWait
+        ? 1200
+        : Math.max(1200, Math.min(baseDelayMs, 56_000 - elapsedDirty));
+      progressMaxWaitArmedRef.current = hitMaxWait || delayMs <= 1200;
 
       progressTimerRef.current = window.setTimeout(() => {
         progressTimerRef.current = null;
         firstDirtyProgressTsRef.current = null;
+        progressMaxWaitArmedRef.current = false;
         if (expiryPendingRef.current || submittingRef.current || lockedRef.current) return;
         void (async () => {
           try {
             const res = await upsertExamProgress(sessionRef.current || updated, {
               includeQuestionIds: false,
             });
+            adoptServerStartedAt(res.startedAt);
             setSyncIndicator(res.syncStatus === 'synced' ? 'synced' : 'offline');
           } catch {
             setSyncIndicator('offline');
@@ -610,7 +662,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         })();
       }, delayMs);
     },
-    []
+    [adoptServerStartedAt]
   );
 
   const handleSelectOption = (questionId: string, key: OptionKey) => {

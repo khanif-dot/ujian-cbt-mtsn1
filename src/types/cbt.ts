@@ -145,6 +145,7 @@ export interface ExamResult {
   answers: Record<string, string>;
   flaggedQuestions: string[];
   questionIds?: string[];
+  answeredCount?: number;
   correctCount: number;
   totalQuestions: number;
   score: number;
@@ -152,6 +153,7 @@ export interface ExamResult {
   status: ExamResultStatus;
   startedAt: string;
   submittedAt: string | null;
+  updatedAt?: string;
   syncStatus: SyncStatus;
   needsServerScoring?: boolean;
 }

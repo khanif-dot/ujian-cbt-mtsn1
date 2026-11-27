@@ -33,6 +33,7 @@ import {
   normalizeParticipantNumber,
   resetBulkExamResults,
   saveActiveSessionLocal,
+  saveLocalResultProgressSnapshot,
   saveSchoolProfile,
   setActiveStaffCredentials,
   subscribeDataChanges,
@@ -187,6 +188,20 @@ export default function App() {
   const completedResultRef = useRef(completedResult);
   completedResultRef.current = completedResult;
   const staffRevokedRef = useRef(false);
+  const initialProgressSyncTimerRef = useRef<number | null>(null);
+
+  const clearInitialProgressSyncTimer = useCallback(() => {
+    if (initialProgressSyncTimerRef.current !== null) {
+      window.clearTimeout(initialProgressSyncTimerRef.current);
+      initialProgressSyncTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearInitialProgressSyncTimer();
+    };
+  }, [clearInitialProgressSyncTimer]);
 
   const loadAllData = useCallback(async (topic?: string) => {
     await ensureInitialized();
@@ -214,7 +229,25 @@ export default function App() {
     };
 
     const applyProfile = (prof: SchoolProfile) => {
-      setProfile((prev) => (JSON.stringify(prev) === JSON.stringify(prof) ? prev : prof));
+      setProfile((prev) => {
+        if (
+          prev.updatedAt === prof.updatedAt &&
+          prev.schoolName === prof.schoolName &&
+          prev.address === prof.address &&
+          prev.academicYear === prof.academicYear &&
+          prev.principalName === prof.principalName &&
+          prev.committeeChairName === prof.committeeChairName &&
+          prev.examTitle === prof.examTitle &&
+          prev.adminPassword === prof.adminPassword &&
+          prev.logoDataUrl.length === prof.logoDataUrl.length &&
+          (prev.kemenagLogoDataUrl?.length || 0) === (prof.kemenagLogoDataUrl?.length || 0) &&
+          prev.logoDataUrl === prof.logoDataUrl &&
+          (prev.kemenagLogoDataUrl || '') === (prof.kemenagLogoDataUrl || '')
+        ) {
+          return prev;
+        }
+        return prof;
+      });
     };
 
     const fetchTopic = async (t: string): Promise<void> => {
@@ -345,9 +378,10 @@ export default function App() {
         await syncFromSupabase({
           force: false,
           currentParticipantNumber: savedInitial?.participant.participantNumber,
+          currentParticipantToken: savedInitial?.participant.token,
         });
       }
-      await loadAllData();
+      await loadAllData('supabase_pull_student');
       if (isLiveSupabaseConfigured()) {
         // Segera kirim ulang antrean hasil ujian lokal yang mungkin tertunda saat submit sebelumnya
         window.setTimeout(() => {
@@ -359,7 +393,7 @@ export default function App() {
         isAdmin: false,
       });
       if (autoFinalizedCount > 0 && mounted) {
-        await loadAllData();
+        await loadAllData('results');
       }
       const savedSession = getSavedActiveSession();
       if (mounted && savedSession && savedSession.questions.length > 0) {
@@ -389,7 +423,26 @@ export default function App() {
         } else {
           setActiveSession(savedSession);
           setRoute('exam-room');
-          void upsertExamProgress(savedSession, { includeQuestionIds: true });
+          void upsertExamProgress(savedSession, { includeQuestionIds: true }).then((res) => {
+            if (!mounted || !res?.startedAt) return;
+            const serverStartMs = Date.parse(res.startedAt);
+            const localStartMs = Date.parse(savedSession.startedAt);
+            if (
+              Number.isFinite(serverStartMs) &&
+              (!Number.isFinite(localStartMs) || Math.abs(serverStartMs - localStartMs) >= 2000)
+            ) {
+              const durationMs = Math.max(1, savedSession.schedule.durationMinutes) * 60 * 1000;
+              setActiveSession((prev) =>
+                prev && prev.resultId === savedSession.resultId
+                  ? {
+                      ...prev,
+                      startedAt: res.startedAt,
+                      endsAt: new Date(serverStartMs + durationMs).toISOString(),
+                    }
+                  : prev
+              );
+            }
+          });
         }
       }
       if (mounted) setIsReady(true);
@@ -417,7 +470,7 @@ export default function App() {
         onlineJitterTimer = null;
         void (async () => {
           const isAdminRoute = routeRef.current === 'admin';
-          await syncServerClock(true);
+          await syncServerClock(isAdminRoute);
           await flushPendingSyncQueue();
           // Jangan memicu full-table reload atau force sync saat koneksi pulih (online).
           // Khusus portal Admin/Proktor, tarik delta exam_results saja (menghormati throttle cooldown).
@@ -525,6 +578,7 @@ export default function App() {
           activeAnswers: currentSess.answers,
           activeTabSwitchCount: currentSess.tabSwitchCount,
           maxTabSwitches: currentSess.schedule.maxTabSwitches,
+          token: currentSess.participant.token,
         }
       );
       if (!active || activeSessionRef.current?.resultId !== checkedResultId) return;
@@ -560,7 +614,7 @@ export default function App() {
       }
     };
 
-    const pollMs = 60_000 + Math.floor(Math.random() * 30_000);
+    const pollMs = 90_000 + Math.floor(Math.random() * 45_000);
     const timer = window.setInterval(() => {
       void checkCloud();
     }, pollMs);
@@ -642,7 +696,8 @@ export default function App() {
     void loadExamRoomModule();
     const preflight = await verifyStudentCanStartExam(
       participant.participantNumber,
-      schedule.id
+      schedule.id,
+      { token: participant.token }
     );
     if (!preflight.ok || !preflight.participant || !preflight.schedule) {
       throw new Error(
@@ -655,7 +710,8 @@ export default function App() {
 
     const lockCheck = await checkStudentExamLock(
       freshParticipant.participantNumber,
-      freshSchedule
+      freshSchedule,
+      freshParticipant.token
     );
     if (lockCheck.locked) {
       if (lockCheck.reason === 'network_error') {
@@ -677,7 +733,11 @@ export default function App() {
       if (lockCheck.reason === 'in_progress' && lockCheck.result) {
         const safeQuestions = await getStudentQuestionsForClass(
           freshParticipant.className,
-          freshSchedule.subject
+          freshSchedule.subject,
+          {
+            participantNumber: freshParticipant.participantNumber,
+            token: freshParticipant.token,
+          }
         );
         if (safeQuestions.length === 0) {
           throw new Error(
@@ -743,10 +803,45 @@ export default function App() {
         };
 
         saveActiveSessionLocal(resumedSession);
-        await upsertExamProgress(resumedSession, { includeQuestionIds: true });
-        await loadAllData('results');
+        await saveLocalResultProgressSnapshot(resumedSession);
         setActiveSession(resumedSession);
         setRoute('exam-room');
+        // Sebarkan penulisan awal ke cloud 4-24 detik di latar belakang agar 600-800 siswa tidak menulis serentak pada detik ke-0
+        clearInitialProgressSyncTimer();
+        const staggerMs = 4_000 + Math.floor(Math.random() * 20_000);
+        const expectedResultId = resumedSession.resultId;
+        initialProgressSyncTimerRef.current = window.setTimeout(() => {
+          initialProgressSyncTimerRef.current = null;
+          if (
+            routeRef.current !== 'exam-room' ||
+            activeSessionRef.current?.resultId !== expectedResultId
+          ) {
+            return;
+          }
+          void upsertExamProgress(activeSessionRef.current, { includeQuestionIds: true }).then(
+            (res) => {
+              if (!res?.startedAt) return;
+              const serverStartMs = Date.parse(res.startedAt);
+              const cur = activeSessionRef.current;
+              if (!cur || cur.resultId !== expectedResultId || !Number.isFinite(serverStartMs)) {
+                return;
+              }
+              const localStartMs = Date.parse(cur.startedAt);
+              if (!Number.isFinite(localStartMs) || Math.abs(serverStartMs - localStartMs) >= 2000) {
+                const durationMs = Math.max(1, cur.schedule.durationMinutes) * 60 * 1000;
+                setActiveSession((prev) =>
+                  prev && prev.resultId === expectedResultId
+                    ? {
+                        ...prev,
+                        startedAt: res.startedAt,
+                        endsAt: new Date(serverStartMs + durationMs).toISOString(),
+                      }
+                    : prev
+                );
+              }
+            }
+          );
+        }, staggerMs);
         return;
       }
       throw new Error(
@@ -756,7 +851,11 @@ export default function App() {
 
     const safeQuestions = await getStudentQuestionsForClass(
       freshParticipant.className,
-      freshSchedule.subject
+      freshSchedule.subject,
+      {
+        participantNumber: freshParticipant.participantNumber,
+        token: freshParticipant.token,
+      }
     );
     if (safeQuestions.length === 0) {
       throw new Error(
@@ -799,24 +898,62 @@ export default function App() {
     };
 
     saveActiveSessionLocal(session);
-    await upsertExamProgress(session, { includeQuestionIds: true });
-    await loadAllData('results');
+    await saveLocalResultProgressSnapshot(session);
     setActiveSession(session);
     setRoute('exam-room');
+    // Sebarkan penulisan awal in_progress ke cloud 1,5-10 detik agar 800-1.000 siswa tidak membuat badai WRITE pada detik ke-0
+    // namun tetap memperkecil jendela sesi ganda lintas perangkat secara signifikan
+    clearInitialProgressSyncTimer();
+    const staggerMs = 1_500 + Math.floor(Math.random() * 8_500);
+    const expectedResultId = session.resultId;
+    initialProgressSyncTimerRef.current = window.setTimeout(() => {
+      initialProgressSyncTimerRef.current = null;
+      if (
+        routeRef.current !== 'exam-room' ||
+        activeSessionRef.current?.resultId !== expectedResultId
+      ) {
+        return;
+      }
+      void upsertExamProgress(activeSessionRef.current, { includeQuestionIds: true }).then(
+        (res) => {
+          if (!res?.startedAt) return;
+          const serverStartMs = Date.parse(res.startedAt);
+          const cur = activeSessionRef.current;
+          if (!cur || cur.resultId !== expectedResultId || !Number.isFinite(serverStartMs)) {
+            return;
+          }
+          const localStartMs = Date.parse(cur.startedAt);
+          if (!Number.isFinite(localStartMs) || Math.abs(serverStartMs - localStartMs) >= 2000) {
+            const durationMs = Math.max(1, cur.schedule.durationMinutes) * 60 * 1000;
+            setActiveSession((prev) =>
+              prev && prev.resultId === expectedResultId
+                ? {
+                    ...prev,
+                    startedAt: res.startedAt,
+                    endsAt: new Date(serverStartMs + durationMs).toISOString(),
+                  }
+                : prev
+            );
+          }
+        }
+      );
+    }, staggerMs);
   };
 
   const handleExamCompleted = useCallback(
     (result: ExamResult) => {
+      clearInitialProgressSyncTimer();
       setActiveSession(null);
       setCompletedResult(result);
       setRoute('exam-completed');
       void loadAllData('results');
     },
-    [loadAllData]
+    [clearInitialProgressSyncTimer, loadAllData]
   );
 
   const handleExamLocked = useCallback(
     (lockedResult?: ExamResult) => {
+      clearInitialProgressSyncTimer();
       clearActiveSessionLocal();
       setActiveSession(null);
       if (lockedResult) {
@@ -827,7 +964,7 @@ export default function App() {
       setRoute('student-login');
       void loadAllData('results');
     },
-    [loadAllData]
+    [clearInitialProgressSyncTimer, loadAllData]
   );
 
   const handleForceSync = async () => {
@@ -919,6 +1056,7 @@ WHERE id = 'default';`;
         setAdminSqlUpdateRequired(false);
         setSessionNotice('');
         setRoute('admin');
+        void loadAllData();
         if (isLiveSupabaseConfigured()) {
           void syncFromSupabase({ force: true, isAdmin: true }).then(() => loadAllData());
         }

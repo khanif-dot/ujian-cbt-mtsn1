@@ -406,7 +406,8 @@ function dataUrlToBlob(dataUrl: string): { blob: Blob; ext: string; mime: string
 /**
  * Mengunggah gambar soal/opsi terkompresi (data:image/...) ke Supabase Storage bucket
  * agar tabel `questions` hanya menyimpan URL CDN pendek (<100 byte) bukan Base64 puluhan KB.
- * Jika offline atau bucket belum tersedia, otomatis fallback ke dataUrl asli tanpa error.
+ * Pada mode Supabase live, fungsi ini TIDAK melakukan fallback ke Base64 agar database
+ * tidak membengkak; upload wajib menggunakan sesi privileged (Service Role Key / authenticated).
  */
 export async function uploadQuestionImageToStorage(
   dataUrl: string,
@@ -421,33 +422,85 @@ export async function uploadQuestionImageToStorage(
   }
 
   const parsed = dataUrlToBlob(trimmed);
-  if (!parsed) return trimmed;
+  if (!parsed) {
+    throw new Error('Format gambar tidak valid. Gunakan file PNG, JPG, WEBP, atau GIF.');
+  }
+
+  if (parsed.blob.size > 2 * 1024 * 1024) {
+    throw new Error('Ukuran gambar melebihi batas maksimal 2 MB setelah kompresi.');
+  }
 
   const client = getSupabaseAdminClient() || getSupabaseClient();
   const rand = Math.random().toString(36).slice(2, 8);
   const safePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, '') || 'q';
   const filePath = `${safePrefix}/${Date.now()}-${rand}.${parsed.ext}`;
 
-  try {
-    const { error: uploadErr } = await client.storage
-      .from(QUESTION_IMAGES_BUCKET)
-      .upload(filePath, parsed.blob, {
-        contentType: parsed.mime,
-        cacheControl: '31536000',
-        upsert: false,
-      });
-    if (uploadErr) {
-      return trimmed;
+  const { error: uploadErr } = await client.storage
+    .from(QUESTION_IMAGES_BUCKET)
+    .upload(filePath, parsed.blob, {
+      contentType: parsed.mime,
+      cacheControl: '31536000',
+      upsert: false,
+    });
+
+  if (uploadErr) {
+    const msg = uploadErr.message || 'Upload ke Storage ditolak.';
+    const isAuthPolicyErr =
+      /row-level security|not authorized|unauthorized|permission|403|forbidden/i.test(msg);
+    if (isAuthPolicyErr && !hasSupabaseServiceRoleKey()) {
+      throw new Error(
+        'Upload gambar ke Supabase Storage memerlukan hak akses Admin/Service Role Key (policy anon dinonaktifkan demi keamanan). Masukkan Service Role Key di Tab Database terlebih dahulu atau gunakan URL gambar HTTPS.'
+      );
     }
-    const { data: pub } = client.storage
-      .from(QUESTION_IMAGES_BUCKET)
-      .getPublicUrl(filePath);
-    if (pub?.publicUrl) {
-      return pub.publicUrl;
-    }
-  } catch {
-    // Graceful fallback to compressed data URL
+    throw new Error(`Gagal mengunggah gambar soal ke Supabase Storage: ${msg}`);
   }
-  return trimmed;
+
+  const { data: pub } = client.storage
+    .from(QUESTION_IMAGES_BUCKET)
+    .getPublicUrl(filePath);
+
+  if (!pub?.publicUrl) {
+    throw new Error('Gagal mendapatkan URL publik gambar dari Supabase Storage.');
+  }
+
+  return pub.publicUrl;
 }
+
+/**
+ * Memeriksa apakah ada URL gambar Base64 (data:image/...) yang belum diunggah ke Storage
+ * pada field gambar pertanyaan, opsi, atau pasangan menjodohkan.
+ */
+export function questionContainsBase64Image(q: {
+  questionImageUrl?: string;
+  options?: Array<{ imageUrl?: string }>;
+  matchingPairs?: Array<{ leftImageUrl?: string; rightImageUrl?: string }>;
+  matchingData?: {
+    leftItems?: Array<{ imageUrl?: string }>;
+    rightItems?: Array<{ imageUrl?: string }>;
+  };
+}): boolean {
+  const isB64 = (val?: string) => typeof val === 'string' && /^\s*data:image\//i.test(val);
+  if (isB64(q.questionImageUrl)) return true;
+  if (Array.isArray(q.options) && q.options.some((o) => isB64(o?.imageUrl))) return true;
+  if (
+    Array.isArray(q.matchingPairs) &&
+    q.matchingPairs.some((p) => isB64(p?.leftImageUrl) || isB64(p?.rightImageUrl))
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(q.matchingData?.leftItems) &&
+    q.matchingData.leftItems.some((i) => isB64(i?.imageUrl))
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(q.matchingData?.rightItems) &&
+    q.matchingData.rightItems.some((i) => isB64(i?.imageUrl))
+  ) {
+    return true;
+  }
+  return false;
+}
+
 

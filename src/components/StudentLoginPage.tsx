@@ -55,9 +55,18 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
   const [errorMsg, setErrorMsg] = useState('');
   const [isChecking, setIsChecking] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [busyCooldownSec, setBusyCooldownSec] = useState(0);
   const startingRef = useRef(false);
   const adminTapCountRef = useRef(0);
   const adminTapTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (busyCooldownSec <= 0) return;
+    const timer = window.setTimeout(() => {
+      setBusyCooldownSec((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [busyCooldownSec]);
 
   useEffect(() => {
     return () => {
@@ -176,9 +185,10 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
       if (res.status === 'server_busy') {
         setVerifiedParticipant(null);
         setCloudSyncedResults(null);
+        setBusyCooldownSec(5);
         setErrorMsg(
           res.errorMessage ||
-            'Server ujian sedang padat memproses antrean peserta lain. Mohon tunggu 3–5 detik lalu klik Cek Data & Masuk kembali.'
+            'Server ujian sedang padat memproses antrean peserta lain. Mohon tunggu 5 detik lalu klik Validasi Nomor & Token kembali.'
         );
         return;
       }
@@ -192,7 +202,13 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
         return;
       }
 
-      const freshResults = await syncStudentResultsFromCloud(res.participant.participantNumber);
+      const freshResults =
+        res.bundledResults !== undefined
+          ? res.bundledResults
+          : await syncStudentResultsFromCloud(
+              res.participant.participantNumber,
+              res.participant.token
+            );
       setCloudSyncedResults(freshResults);
       setVerifiedParticipant(res.participant);
       setValidationSource(res.source);
@@ -596,6 +612,7 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                 disabled={
                   isChecking ||
                   isStarting ||
+                  (!verifiedParticipant && busyCooldownSec > 0) ||
                   Boolean(verifiedParticipant && activeSelectedSchedule && isSelectedSubjectLocked)
                 }
                 className="w-full py-3.5 px-5 rounded-xl bg-[#0369a1] hover:bg-[#075985] text-white font-semibold text-sm sm:text-base flex items-center justify-center gap-2.5 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed transition-all cursor-pointer"
@@ -628,7 +645,13 @@ export const StudentLoginPage: React.FC<StudentLoginPageProps> = ({
                 ) : (
                   <>
                     <CheckCircle2 className="w-4 h-4" />
-                    <span>{isChecking ? 'Memvalidasi...' : 'Validasi Nomor & Token'}</span>
+                    <span>
+                      {isChecking
+                        ? 'Memvalidasi...'
+                        : busyCooldownSec > 0
+                          ? `Coba lagi (${busyCooldownSec}d)`
+                          : 'Validasi Nomor & Token'}
+                    </span>
                   </>
                 )}
               </button>

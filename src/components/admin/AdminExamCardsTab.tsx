@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react';
-import { FileDown, Printer, Search } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { ChevronLeft, ChevronRight, FileDown, Printer, Search } from 'lucide-react';
 import { exportExamCardsPdf } from '@/src/lib/importers';
 import { KEMENAG_HEADER_TITLE, KEMENAG_LOGO_DATA_URL } from '@/src/lib/seedData';
 import { ALL_CLASSES, type Participant, type SchoolProfile } from '@/src/types/cbt';
@@ -8,6 +8,8 @@ interface AdminExamCardsTabProps {
   profile: SchoolProfile;
   participants: Participant[];
 }
+
+const SHEETS_PER_PREVIEW_CHUNK = 5; // 5 lembar A4 = 50 kartu per halaman pratinjau layar
 
 function chunkIntoPages<T>(items: T[], perPage = 10): T[][] {
   const pages: T[][] = [];
@@ -24,6 +26,9 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
   const [classFilter, setClassFilter] = useState('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [previewChunkIdx, setPreviewChunkIdx] = useState(0);
+  const [showAllPreview, setShowAllPreview] = useState(false);
+  const [isPrintingAll, setIsPrintingAll] = useState(false);
 
   const filteredParticipants = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -46,6 +51,35 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
     [filteredParticipants]
   );
 
+  const totalPreviewChunks = Math.max(1, Math.ceil(pages.length / SHEETS_PER_PREVIEW_CHUNK));
+  const safePreviewChunkIdx = Math.min(previewChunkIdx, totalPreviewChunks - 1);
+
+  useEffect(() => {
+    setPreviewChunkIdx(0);
+    setShowAllPreview(false);
+  }, [classFilter, searchQuery]);
+
+  useEffect(() => {
+    const onBeforePrint = () => setIsPrintingAll(true);
+    const onAfterPrint = () => setIsPrintingAll(false);
+    window.addEventListener('beforeprint', onBeforePrint);
+    window.addEventListener('afterprint', onAfterPrint);
+    return () => {
+      window.removeEventListener('beforeprint', onBeforePrint);
+      window.removeEventListener('afterprint', onAfterPrint);
+    };
+  }, []);
+
+  const visiblePages = useMemo(() => {
+    if (isPrintingAll || showAllPreview || pages.length <= SHEETS_PER_PREVIEW_CHUNK) {
+      return pages.map((cards, idx) => ({ pageIdx: idx, cards }));
+    }
+    const start = safePreviewChunkIdx * SHEETS_PER_PREVIEW_CHUNK;
+    return pages
+      .slice(start, start + SHEETS_PER_PREVIEW_CHUNK)
+      .map((cards, offset) => ({ pageIdx: start + offset, cards }));
+  }, [pages, isPrintingAll, showAllPreview, safePreviewChunkIdx]);
+
   const handleExportPdf = async () => {
     if (filteredParticipants.length === 0) return;
     setIsExportingPdf(true);
@@ -57,7 +91,12 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
   };
 
   const handlePrint = () => {
-    window.print();
+    setIsPrintingAll(true);
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        window.print();
+      });
+    });
   };
 
   return (
@@ -140,12 +179,62 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
           Tidak ada peserta yang sesuai dengan filter kelas atau pencarian nama.
         </div>
       ) : (
-        <div className="print-only-container space-y-6 print:space-y-0 overflow-x-auto pb-4 print:pb-0">
-          {pages.map((pageCards, pageIdx) => (
-            <div
-              key={pageIdx}
-              className="print-a4-page mx-auto bg-white shadow-md border border-slate-300 grid grid-cols-2 grid-rows-5 w-[794px] print:w-full"
-            >
+        <>
+          {pages.length > SHEETS_PER_PREVIEW_CHUNK && (
+            <div className="no-print bg-white rounded-2xl border border-slate-200 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+              <span className="text-xs text-slate-600 font-medium">
+                {showAllPreview
+                  ? `Menampilkan seluruh ${pages.length} lembar A4 (${filteredParticipants.length} kartu)`
+                  : `Pratinjau lembar A4 ${safePreviewChunkIdx * SHEETS_PER_PREVIEW_CHUNK + 1}–${Math.min(
+                      pages.length,
+                      (safePreviewChunkIdx + 1) * SHEETS_PER_PREVIEW_CHUNK
+                    )} dari ${pages.length} lembar (PDF & Print Langsung tetap mencetak semua kartu)`}
+              </span>
+              <div className="flex items-center gap-2">
+                {!showAllPreview && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewChunkIdx((prev) => Math.max(0, prev - 1))}
+                      disabled={safePreviewChunkIdx <= 0}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer disabled:opacity-40"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      <span>Sebelumnya</span>
+                    </button>
+                    <span className="text-xs font-mono text-slate-700 tabular-nums px-1">
+                      {safePreviewChunkIdx + 1}/{totalPreviewChunks}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPreviewChunkIdx((prev) => Math.min(totalPreviewChunks - 1, prev + 1))
+                      }
+                      disabled={safePreviewChunkIdx >= totalPreviewChunks - 1}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer disabled:opacity-40"
+                    >
+                      <span>Berikutnya</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowAllPreview((prev) => !prev)}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-semibold cursor-pointer"
+                >
+                  {showAllPreview ? 'Mode Ringan (5 Lembar)' : 'Tampilkan Semua'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="print-only-container space-y-6 print:space-y-0 overflow-x-auto pb-4 print:pb-0">
+            {visiblePages.map(({ pageIdx, cards: pageCards }) => (
+              <div
+                key={pageIdx}
+                className="print-a4-page mx-auto bg-white shadow-md border border-slate-300 grid grid-cols-2 grid-rows-5 w-[794px] print:w-full"
+              >
               {pageCards.map((student) => (
                 <article
                   key={student.id}
@@ -243,6 +332,7 @@ export const AdminExamCardsTab: React.FC<AdminExamCardsTabProps> = ({
             </div>
           ))}
         </div>
+        </>
       )}
     </div>
   );

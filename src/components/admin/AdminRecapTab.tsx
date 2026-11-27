@@ -512,7 +512,7 @@ export const AdminRecapTab: React.FC<AdminRecapTabProps> = ({
         : 0;
     const highest =
       completedEntries.length > 0
-        ? Math.max(...completedEntries.map((e) => e.score))
+        ? completedEntries.reduce((max, e) => (e.score > max ? e.score : max), 0)
         : 0;
 
     return {
